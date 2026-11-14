@@ -1,0 +1,7 @@
+# Inserts the dynamic-memory plugin row. The profile's base bundle already
+# provides storage, storage-json and storage-domain, so no extra rows are needed.
+- insert:
+    - id: dynamic-memory
+      name: '@local/dynamic-memory'
+      config:
+        recentExchanges: 3
