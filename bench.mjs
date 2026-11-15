@@ -27,7 +27,7 @@ const rows = readdirSync(dir)
       return undefined;
     }
   })
-  .filter(row => row && typeof row.assistant === 'string' && row.assistant.trim())
+  .filter(row => row && (String(row.user || '').trim() || String(row.assistant || '').trim() || String(row.summary || '').trim()))
   .map(row => ({ ...row, user: cleanUserText(row.user) }));
 
 const queries = [

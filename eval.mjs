@@ -44,7 +44,7 @@ if (fixtureMode) {
         return undefined;
       }
     })
-    .filter(row => row && typeof row.user === 'string' && typeof row.assistant === 'string' && row.assistant.trim())
+    .filter(row => row && (String(row.user || '').trim() || String(row.assistant || '').trim() || String(row.summary || '').trim()))
     .map(row => ({ ...row, user: cleanUserText(row.user) }));
 }
 
@@ -83,7 +83,7 @@ function baselineRank(query, limit) {
 function hitRank(list, expectContains) {
   const needle = expectContains.toLowerCase();
   for (let index = 0; index < list.length; index += 1) {
-    if (`${list[index].user}\n${list[index].assistant}`.toLowerCase().includes(needle)) return index + 1;
+    if (`${list[index].user || ''}\n${list[index].assistant || ''}\n${list[index].summary || ''}`.toLowerCase().includes(needle)) return index + 1;
   }
   return 0;
 }
