@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts, mentionOf, buildReflectProposals, findCrossLayerDuplicates, detectLocale, packFor } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts, mentionOf, buildReflectProposals, findCrossLayerDuplicates, detectLocale, packFor, extractiveSummary } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -636,4 +636,10 @@ check('i18n: non-Latin word scripts are tokenized', () => {
   const result = rankExchanges(rows, { query: 'مرحبا', limit: 3 });
   assert.ok(result.matches.length >= 1, 'Arabic query matches Arabic memory');
 });
+check('summary: extractive summary is cheap and bounded', () => {
+  const s = extractiveSummary('请帮我修一下登录跳转的问题。', '已修复登录后跳转的竞态。');
+  assert.ok(s.length > 0 && s.length <= 160);
+  assert.ok(extractiveSummary('', '只有助手回复').length > 0);
+});
+
 console.log(`\n${passed} checks passed`);

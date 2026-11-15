@@ -44,6 +44,20 @@ const DEFAULT_ARCHIVE_AFTER_DAYS = 730;
 const DEFAULT_GAP_DAYS = 30;
 const DEFAULT_FRESH_DAYS = 180;
 const KINDS = ['episodic', 'semantic', 'procedural'];
+
+/** Cheap, language-neutral extractive summary: no LLM call, fills the cross-session digest. */
+export function extractiveSummary(user, assistant) {
+  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const pick = (text, limit) => {
+    const cut = text.slice(0, limit);
+    const dot = cut.search(/[。.!?！？\n]/);
+    return dot > 10 ? cut.slice(0, dot + 1) : cut;
+  };
+  const u = clean(user);
+  const a = clean(assistant);
+  if (!u) return a.slice(0, 120);
+  return `${pick(u, 90)}${a ? ' ' + pick(a, 60) : ''}`.slice(0, 160);
+}
 const FACETS = ['habits', 'preferences', 'thinking', 'dynamics', 'psychology', 'past', 'identity'];
 const FACET_LABELS = {
   habits: '用户习惯',
@@ -341,7 +355,7 @@ const DOMAIN_SPEC = {
 
 const TOOL = {
   name: 'dynamic_memory',
-  description: 'Long-term memory outside the current context window. search (default) returns compact evidence snippets with confidence and match reasons (full=true only when quoting); recent: this session\'s exchanges; entities: entity index; deepen: write/revise an impression; portrait/learn: user portrait or target=assistant self-portrait; identity: measured speaker-continuity evidence, never a verdict; observe/correct/observations/contradict: evidence layer; reflect/review: propose and accept-or-reject consolidated patterns (proposed drafts are never injected); recompute: gather a facet\'s live sources before rewriting; duplicates: cross-layer duplicate report; archive/restore: recycle bin; export: write memory.md; stats: store health; index: index unopened sessions; repair: re-derive missing user prompts; forget: delete an impression or clear a facet.',
+  description: 'Cross-session memory: search/recent/entities (retrieval), deepen/learn/portrait (write/read), observe/correct/observations/contradict (evidence layer), identity (continuity evidence), reflect/review/recompute/duplicates, archive/restore/export/stats/index/repair/forget. search returns compact snippets with confidence; use full=true to quote. Details in README.',
   parameters: {
     type: 'object',
     properties: {
@@ -377,6 +391,7 @@ const TOOL = {
       sensitivity: { type: 'string', enum: ['normal', 'sensitive', 'private'], description: 'For observe: how sensitive this observation is; private ones are minimized in injection.' },
       status: { type: 'string', enum: OBSERVATION_STATUS, description: 'For observations: filter by status (current/withdrawn/superseded).' },
       observationScope: { type: 'string', enum: OBSERVATION_SCOPES, description: 'For observe: transient (emotional state, ~3d), situational (goal/decision/behavior/inference, ~30d) or durable (facts/preferences/constraints). Defaults derive from type; TTL only stops injection, it never deletes.' },
+      includePrivate: { type: 'boolean', description: 'For observations: reveal private observation text. Defaults to masked.' },
       mention: { type: 'string', enum: MENTION_VALUES, description: 'For observe: proactive (may raise it), if_asked (tone only, never bring it up; default for sensitive/transient/emotional), never (not injected; listable only).' },
       conditional: { type: 'boolean', description: 'For contradict: mark the pair as situationally conflicting (different contexts), so it is not counted as an unresolved contradiction.' },
       decision: { type: 'string', enum: ['accept', 'reject'], description: 'For review: accept a proposed observation (becomes current) or reject it (withdrawn).' },
@@ -1259,6 +1274,8 @@ async function start(ctx, config) {
   };
   const labelsFor = locale => ({ user: packFor(locale).labels.facets, self: packFor(locale).labels.selfFacets });
   let captureEnabled = config.capture !== false;
+  const autoSummaryEnabled = config.autoSummary !== false;
+  const identityNoticeEnabled = config.identityNotice === true;
   const archiveAfterDays = Math.max(7, Math.min(36500, Number(config.archiveAfterDays) || DEFAULT_ARCHIVE_AFTER_DAYS));
   const gapDays = Math.max(1, Math.min(36500, Number(config.gapDays) || DEFAULT_GAP_DAYS));
   const freshDays = Math.max(1, Math.min(36500, Number(config.freshDays) || DEFAULT_FRESH_DAYS));
@@ -1538,6 +1555,17 @@ async function start(ctx, config) {
     return set;
   };
 
+  const strongIdentityReport = sessionId => {
+    const report = identityReport(sessionId);
+    const baseline = report.baseline?.messages || 0;
+    const gap = report.evidence?.gapDays;
+    const strong = report.label === 'drifted'
+      && baseline >= 20
+      && Number(report.score) < 0.3
+      && (gap === null || gap === undefined || gap >= 3);
+    return strong ? report : undefined;
+  };
+
   const identityReport = sessionId => {
     const key = String(sessionId);
     const texts = (rowsBySession.get(key) || []).map(row => cleanUserText(row.user)).filter(Boolean);
@@ -1658,7 +1686,7 @@ async function start(ctx, config) {
           updatedAt: lastTime,
           user,
           assistant,
-          summary: '',
+          summary: autoSummaryEnabled ? extractiveSummary(user, assistant) : '',
           keywords: keywordsOf(user, assistant),
           entities: entitiesOf(user, assistant),
           importance: DEFAULT_IMPORTANCE,
@@ -1990,7 +2018,7 @@ async function start(ctx, config) {
       updatedAt: state.lastTime,
       user,
       assistant,
-      summary: '',
+      summary: autoSummaryEnabled ? extractiveSummary(user, assistant) : '',
       keywords: keywordsOf(user, assistant),
       entities: entitiesOf(user, assistant),
       importance: DEFAULT_IMPORTANCE,
@@ -2067,7 +2095,7 @@ async function start(ctx, config) {
         gap,
         gapDays,
         staleFacets: new Set(stale),
-        identity: identityReport(sessionKey),
+        identity: identityNoticeEnabled ? strongIdentityReport(sessionKey) : undefined,
         observations: currentObservations(20),
         locale: sessionLocaleFor(sessionKey),
         messages: packFor(sessionLocaleFor(sessionKey)).injection,
@@ -2386,7 +2414,7 @@ async function start(ctx, config) {
                 id: row.id,
                 type: row.type,
                 kind: row.kind,
-                text: row.text,
+                text: row.sensitivity === 'private' && args.includePrivate !== true ? '[private observation]' : row.text,
                 scope: scopeOf(row),
                 mention: mentionOf(row),
                 expired: observationExpired(row, Date.now(), ttlConfig),
@@ -2760,7 +2788,7 @@ async function start(ctx, config) {
             gap: computeGapState([...rowsById.values()], now),
             gapDays,
             staleFacets: staleFacetSet(now),
-            identity: identityReport(sessionId),
+            identity: identityNoticeEnabled ? strongIdentityReport(sessionId) : undefined,
             observations: currentObservations(20),
             locale: sessionLocaleFor(sessionId),
             messages: packFor(sessionLocaleFor(sessionId)).injection,

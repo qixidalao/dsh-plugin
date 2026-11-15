@@ -117,6 +117,7 @@ await new Promise(resolve => setTimeout(resolve, 5));
 const stats = await host2.tools[0].execute({ action: 'stats' });
 assert.equal(stats.exchanges, 1, 'restart recovers persisted exchange');
 assert.equal(stats.storage, 'durable', 'durable storage state');
+assert.equal(stats.withoutSummary, 0, 'auto summary fills summaries');
 
 // capture=false: events are ignored.
 const host3 = makeHost(makeStorage());

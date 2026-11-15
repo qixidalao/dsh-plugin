@@ -319,6 +319,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `locale` | auto | 运行时语言：auto / en / zh；auto 按会话最近用户消息判断 |
 | `facets` | 7 个默认 facet | 用户画像 facet 列表，可增删（例如移除 psychology） |
 | `assistantFacets` | 4 个默认 facet | 助手画像 facet 列表 |
+| `autoSummary` | true | 捕获时生成抽取式摘要（无 LLM），用于跨会话速览 |
+| `identityNotice` | false | 是否注入身份连续性提示；开启后需强证据（基线≥20、<0.3、间隔≥3天） |
 | `capture` | true | false 时不自动捕获；运行中也可用 `/dmem pause` |
 
 ## 11. 生命周期与资源 ✅
