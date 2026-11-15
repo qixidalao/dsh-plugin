@@ -118,6 +118,13 @@ const stats = await host2.tools[0].execute({ action: 'stats' });
 assert.equal(stats.exchanges, 1, 'restart recovers persisted exchange');
 assert.equal(stats.storage, 'durable', 'durable storage state');
 assert.equal(stats.withoutSummary, 0, 'auto summary fills summaries');
+const storedRow = [...storage.tables.get('exchanges').values()][0];
+assert.equal(storedRow.user, '', 'no plaintext user text stored');
+assert.equal(storedRow.assistant, '', 'no plaintext assistant text stored');
+assert.ok(storedRow.summary.length > 0, 'summary retained');
+assert.ok(typeof storedRow.textHash === 'string' && storedRow.pointer, 'hash + pointer retained');
+const found = await host2.tools[0].execute({ action: 'search', query: '部署 example.com' });
+assert.ok(found.matches.length >= 1, 'summary-only row is searchable');
 
 // capture=false: events are ignored.
 const host3 = makeHost(makeStorage());

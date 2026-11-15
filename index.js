@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -606,7 +607,7 @@ function invalidateRow(row) {
 }
 function haystackOf(row) {
   const doc = docOf(row);
-  if (doc.haystack === undefined) doc.haystack = `${cleanUserText(row.user)}\n${row.assistant}`.toLowerCase().replace(/\s+/g, '');
+  if (doc.haystack === undefined) doc.haystack = `${cleanUserText(row.user)}\n${row.assistant}\n${row.summary || ''}\n${(row.keywords || []).join(' ')}\n${(row.entities || []).join(' ')}`.toLowerCase().replace(/\s+/g, '');
   return doc.haystack;
 }
 
@@ -665,7 +666,7 @@ export function rankExchanges(rows, options = {}) {
   const to = toTimestamp(options.to);
 
   const candidates = rows.filter(row => {
-    if (!String(row.user || '').trim() && !String(row.assistant || '').trim()) return false;
+    if (!String(row.user || '').trim() && !String(row.assistant || '').trim() && !String(row.summary || '').trim()) return false;
     if (options.kind && row.kind !== options.kind) return false;
     if (row.archivedAt && !includeArchived) return false;
     if (options.workspace && options.scope !== 'all' && row.workspace && row.workspace !== options.workspace) return false;
@@ -1275,6 +1276,8 @@ async function start(ctx, config) {
   const labelsFor = locale => ({ user: packFor(locale).labels.facets, self: packFor(locale).labels.selfFacets });
   let captureEnabled = config.capture !== false;
   const autoSummaryEnabled = config.autoSummary !== false;
+  const retainText = config.retainText === true;
+  const hashText = text => createHash('sha256').update(String(text || ''), 'utf8').digest('hex').slice(0, 24);
   const identityNoticeEnabled = config.identityNotice === true;
   const archiveAfterDays = Math.max(7, Math.min(36500, Number(config.archiveAfterDays) || DEFAULT_ARCHIVE_AFTER_DAYS));
   const gapDays = Math.max(1, Math.min(36500, Number(config.gapDays) || DEFAULT_GAP_DAYS));
@@ -1387,7 +1390,7 @@ async function start(ctx, config) {
 
   if (table) {
     for (const [, row] of table.entries()) {
-      if (row && typeof row === 'object' && (String(row.assistant || '').trim() || cleanUserText(row.user))) addRow(row);
+      if (row && typeof row === 'object' && (String(row.assistant || '').trim() || cleanUserText(row.user) || String(row.summary || '').trim())) addRow(row);
     }
   }
   if (portraitTable) {
@@ -1684,8 +1687,10 @@ async function start(ctx, config) {
           kind: 'episodic',
           time: lastTime,
           updatedAt: lastTime,
-          user,
-          assistant,
+          user: retainText ? user : '',
+          assistant: retainText ? assistant : '',
+          textHash: hashText(`${user}\n${assistant}`),
+          pointer: { sessionId: key, time: lastTime },
           summary: autoSummaryEnabled ? extractiveSummary(user, assistant) : '',
           keywords: keywordsOf(user, assistant),
           entities: entitiesOf(user, assistant),
@@ -2016,8 +2021,10 @@ async function start(ctx, config) {
       kind: 'episodic',
       time: state.lastTime,
       updatedAt: state.lastTime,
-      user,
-      assistant,
+      user: retainText ? user : '',
+      assistant: retainText ? assistant : '',
+      textHash: hashText(`${user}\n${assistant}`),
+      pointer: { sessionId: key, time: state.lastTime },
       summary: autoSummaryEnabled ? extractiveSummary(user, assistant) : '',
       keywords: keywordsOf(user, assistant),
       entities: entitiesOf(user, assistant),
@@ -2187,7 +2194,7 @@ async function start(ctx, config) {
             const workspace = currentWorkspaceOf(agent);
             const pool = args.allSessions ? [...rowsById.values()] : own;
             const filtered = pool
-              .filter(row => cleanUserText(row.user))
+              .filter(row => cleanUserText(row.user) || String(row.summary || '').trim())
               .filter(row => !row.archivedAt)
               .filter(row => scope === 'all' || !row.workspace || row.workspace === workspace)
               .sort((left, right) => left.time - right.time);
@@ -2210,7 +2217,42 @@ async function start(ctx, config) {
               storage: storageState,
             };
           }
-          if (action === 'search') return search(args, currentWorkspaceOf(agent));
+          if (action === 'search') {
+            const result = search(args, currentWorkspaceOf(agent));
+            if (result.matches?.length && sessionQuery) {
+              const full = args.full === true;
+              const chars = Math.max(80, Math.min(4000, Number(args.snippetChars) || snippetChars));
+              for (const match of result.matches) {
+                if (cleanUserText(match.user) || match.assistant) { match.sourceAvailable = true; continue; }
+                try {
+                  const read = await sessionQuery.readSession(match.sessionId);
+                  const events = Array.isArray(read?.events) ? read.events : [];
+                  const target = Date.parse(match.time) || 0;
+                  let best = null;
+                  let delta = Infinity;
+                  for (const event of events) {
+                    if (event.type !== 'user/message') continue;
+                    const time = Number(event.time) || 0;
+                    const distance = Math.abs(time - target);
+                    if (distance < delta) { delta = distance; best = event; }
+                  }
+                  if (!best) throw new Error('no user message');
+                  const index = events.indexOf(best);
+                  let assistantText = '';
+                  for (let i = index + 1; i < events.length; i += 1) {
+                    if (events[i].type === 'assistant/message') { assistantText = messageText(events[i].data?.message); break; }
+                  }
+                  const userText = messageText(best.data);
+                  match.user = full ? userText : truncate(userText, chars);
+                  match.assistant = full ? assistantText : truncate(assistantText, chars);
+                  match.sourceAvailable = true;
+                } catch {
+                  match.sourceAvailable = false;
+                }
+              }
+            }
+            return result;
+          }
           if (action === 'index') {
             try {
               return await indexUnseen(Number(args.limit) || 10);

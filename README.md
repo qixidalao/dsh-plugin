@@ -46,6 +46,12 @@ node eval.mjs --fixture# 合成评测（不需要真实数据）
 - 若只需要"偶尔翻历史"，官方 session search + `notes.md` 更省；本插件适合需要跨会话连续性、可纠正画像、证据链的场景。
 - `private` 观察在工具输出中默认打码，需 `includePrivate: true` 才显示原文。
 
+## 索引化捕获（v2.1）
+
+- 默认 `retainText: false`：新记忆不存 user/assistant 原文，只存摘要、关键词、实体与指向本地会话的 pointer；
+- search 命中后通过本地 sessionQuery 回读片段（`full=true` 取整段），失败标 `sourceAvailable:false`；
+- 旧数据仍在（含原文），迁移命令与面板在下一步。
+
 ## 已知限制
 
 - 无向量检索：同义改述仍可能漏；检索为字面（中文二字组 + 词脚本 + 实体）。

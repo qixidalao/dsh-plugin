@@ -1,6 +1,13 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。当前为 **2.0.3**（测试版）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。当前为 **2.1.0**（测试版）。
+
+## 2.1.0 — 索引化捕获（第一步）
+
+- 新增 `retainText`（默认 false）：捕获时不再写 user/assistant 原文，只写摘要、关键词、实体、时间、textHash 与 pointer（sessionId+时间）；
+- 检索 haystack 支持无原文记录（summary/keywords/entities）；search 命中后用本地 sessionQuery 按时间回读片段，失败标 sourceAvailable:false；
+- 加载与 recent 允许仅摘要记录；host fixture 断言存储无明文、摘要存在、可检索；
+- 旧数据迁移（/dmem migrate strip）与面板留待下一步；测试 52，host 16。
 
 ## 2.0.3 — 低开销与首次安装体验（2026-11-16）
 
