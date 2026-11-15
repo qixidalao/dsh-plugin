@@ -2144,6 +2144,7 @@ async function start(ctx, config) {
         conditional: [...observations.values()].filter(row => (row.conditionalContradicts || []).length).length,
         expired: [...observations.values()].filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
       },
+      plaintextRows: [...rowsById.values()].filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length,
       portraitFacets: [...portrait.values()].filter(row => row.content.trim()).length,
       assistantFacets: [...selfPortrait.values()].filter(row => row.content.trim()).length,
       entities: buildEntityIndex([...rowsById.values()]).size,
@@ -2559,6 +2560,35 @@ async function start(ctx, config) {
               pairs,
               total: pairs.length,
               note: 'Cross-layer duplicates between portrait facets and current observations. Review manually; nothing is deleted automatically.',
+            };
+          }
+          if (action === 'migrate') {
+            if (args.mode !== 'strip') return { error: 'Only mode=strip is supported.' };
+            if (args.confirm !== true) return { error: 'migrate strip is destructive: pass confirm=true. An export is written first.' };
+            const exported = await exportMarkdown().catch(() => null);
+            let stripped = 0;
+            let bytesFreed = 0;
+            for (const row of rowsById.values()) {
+              if (!String(row.user || '').trim() && !String(row.assistant || '').trim()) continue;
+              const user = cleanUserText(row.user);
+              const assistant = String(row.assistant || '');
+              const before = user.length + assistant.length;
+              if (!row.summary) row.summary = extractiveSummary(user, assistant);
+              row.textHash = row.textHash || hashText(`${user}\n${assistant}`);
+              row.pointer = row.pointer || { sessionId: row.sessionId, time: row.time };
+              row.user = '';
+              row.assistant = '';
+              row.updatedAt = Date.now();
+              invalidateRow(row);
+              await persist(row);
+              stripped += 1;
+              bytesFreed += before;
+            }
+            return {
+              stripped,
+              bytesFreed,
+              exportPath: exported?.path || null,
+              note: 'Plaintext removed; search hydrates from local sessions. Keep the exported file to roll back.',
             };
           }
           if (action === 'export') {
