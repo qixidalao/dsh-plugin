@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：2.0.0（`@local/dynamic-memory`）
+> 版本：2.0.1（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -81,6 +81,8 @@
 | `package.json` | 包清单，`dsh.bundle.patch` 指向 `cordis.patch.yml` |
 | `cordis.patch.yml` | 向 profile 插入插件行（`id: dynamic-memory`） |
 | `locale/zh.json`、`locale/en.json` | 插件列表里的标题与描述 |
+| `locale/messages.zh.json`、`locale/messages.en.json` | 运行时语言包：注入文案、facet 标签、工具描述、命令基础文案、词表/短语/停用词 |
+| `README.zh-CN.md` | 中文 README（英文为主版本） |
 | `icon.svg` | 插件图标 |
 | `README.md` | 面向使用者的说明（功能、配置、验证记录） |
 | `DOCS.md` | 本文档：设计原则、架构与记忆逻辑、已知缺陷、升级规范 |
@@ -314,6 +316,11 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `warmup` | true | 启动 5 秒后预热缓存 |
 | `exportPath` | `$DSH_HOME/storages/dynamic_memory/memory.md` | 导出路径 |
 
+| `locale` | auto | 运行时语言：auto / en / zh；auto 按会话最近用户消息判断 |
+| `facets` | 7 个默认 facet | 用户画像 facet 列表，可增删（例如移除 psychology） |
+| `assistantFacets` | 4 个默认 facet | 助手画像 facet 列表 |
+| `capture` | true | false 时不自动捕获；运行中也可用 `/dmem pause` |
+
 ## 11. 生命周期与资源 ✅
 
 - 插件激活：打开存储域（失败则降级内存模式，`storage` 字段说明原因）→ 载入 4 表 → 计算间隔 → 必要时自动归档 → 注册工具/命令/注入 → 3 秒后台索引 → 5 秒预热。
@@ -324,7 +331,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
-| `node test.mjs` | 49 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL（无关编辑不续期）、印证引文校验、推断置信度衰减与复习重置、mention 派生、reflect 草稿、跨层重复、标签 lint | ✅ 49/49 |
+| `node test.mjs` | 51 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint | ✅ 51/51 |
+| `node test-host.mjs` | 16 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源） | ✅ 16/16 |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ❌ 需要本机记忆库 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
@@ -378,6 +386,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | v1.12.3 | 发布可靠性：卸载时 flush → close 等待在途写入；删除 exchange 级联清理 facet/observation 引用并标待重算；`capture: false` 与 `/dmem pause`；README/DOCS 统一；真实评测数据本地化（gitignore + 合成 fixture 供 CI）；内存版 mock host 夹具 | ✅ |
 | v1.13（并入 1.14.0） | 画像版本绑定自己的来源集合；`mention`（默认值由 scope + type + sensitivity 派生）；校准/误注入率指标 | ✅ |
 | v1.14 | `reflect`（`status: proposed`，≥3 个会话才起草）；`recompute`；跨层重复检测 | ✅ v1.14.0 |
+| v2.0 | 运行时国际化、词表/短语数据化、语言中立分词、facet 可配置、英文 README | ✅ v2.0.0（文档 2.0.1） |
 | 之后 | 看指标再决定联想检索等增强；npm 发布等包名/许可证确定 | 📐 |
 
 **明确不做 / 推迟**：
@@ -523,6 +532,16 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 1. **lint**：人格标签词出现在 `learn` 内容时，要求至少一个真实存在的 `sourceObservationIds`（或 `sourceIds`），**不再用情境词放行**；情境词只用于 `observe` 的提示。词表可配置。
 2. **加密**（可选，默认关闭）：用 `node:crypto` 的 AES-256-GCM，密钥由环境变量中的口令经 scrypt 派生；至少加密 `sensitivity=private` 的观察，可选加密全部 exchanges（检索时在内存中解密）。不新增依赖，Termux 可用。代价：口令丢失则不可恢复。
 
+### 14.1 v2.0 多语言与开放预设（✅）
+
+- **运行时国际化**：注入文案、facet 标签、工具描述、命令基础文案由 `locale/messages.{zh,en}.json` 提供；`locale: auto` 按**会话**最近用户消息判断（避免被工具结果/英文系统提示带偏），可强制 `en`/`zh`。
+- **去关键词化**：人格标签词表、身份自述短语、实体停用词全部是 locale 数据；核心 lint/身份逻辑不内建中文词表。
+- **语言中立分词**：中文二字组 + 拉丁词之外，为阿拉伯/西里尔/希腊/泰/天城文增加词级回退。
+- **预设可配置**：`facets`/`assistantFacets` 可增删；持久化 schema 不再限定固定 facet。
+- **文档语言**：README 英文为主版本，中文为 `README.zh-CN.md`；注释与本文档可继续用中文。
+
+**边界**：英文/其他语言为功能性可用，仍需母语润色；命令输出只本地化了基础文案；facet 只是可配置，尚未做到从数据自动发现。
+
 ### 实施依赖
 
 ```
@@ -539,6 +558,8 @@ v1.12.3 可靠性（✅）─► v1.13 mention + 画像来源集合 + 冻结评�
 
 | 版本 | 内容 |
 |---|---|
+| 2.0.1 | 文档发布版：补齐 v2.0 多语言/开放预设章节、配置项（locale/facets/assistantFacets/capture）、测试数（51 + host 16）、路线状态；README.zh-CN 重写；CHANGELOG 更新 |
+| 2.0.0 | 运行时国际化（locale/messages 包，auto 按会话语言）、词表/短语/停用词数据化、语言中立分词回退、facet 可配置、README 英文主版本 + 中文翻译；测试 49 → 51 |
 | 1.14.0 | 画像版本来源绑定（不跨版本累积，旧版本来源存入 history）；`mention` 披露策略（proactive/if_asked/never，默认由 sensitivity+scope+type 派生）；`reflect` 巩固草稿（≥3 会话，proposed 不注入）+ `review`；`recompute`；`duplicates` 跨层重复报告；eval 增加 calibration 分桶；测试 45 → 49；host fixture 16 项 |
 | 1.12.3 | 发布可靠性：卸载清理改为 async，先等在途写入（`pendingWrites`）、再 flush、再 close；待执行的整合在卸载时执行而不是丢弃；删除 exchange 时级联清理 facet `sourceExchangeIds` 与 observation `sourceIds` 并标 `needsRecompute`；新增 `capture: false` 与 `/dmem pause|resume|capture`；README/DOCS 修正过时的“访问强化”；真实评测数据移出仓库（`eval-queries.local.json` / `eval-drafts.local.md`，gitignore），CI 改用 `eval-queries.fixture.json` 合成数据；新增内存 mock host 夹具；包保持 `private: true` |
 | 1.12.2 | 补印证入口两个缺口：`corroborates` 必须带 `quote`，插件在当前会话用户消息里做子串校验（防止模型看到自己的推断后自我强化）；推断置信度与 TTL 的衰减锚点改为 `lastCorroboratedAt`（复习重置遗忘曲线）；`learn target=user facet=psychology` 必须带 `sourceObservationIds`；助手“喜好”去重；新增评测草稿。测试 43 → 45 |
