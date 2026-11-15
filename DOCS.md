@@ -27,7 +27,7 @@
 ### 2.1 `exchanges`：一问一答的原文记忆
 
 ```json
-{ "id": "uuid", "sessionId": "session-...", "workspace": "C:\\Users\\one",
+{ "id": "uuid", "sessionId": "session-...", "workspace": "C:\\Users\\<you>",
   "kind": "episodic", "time": 1763000000000, "updatedAt": 1763000000000,
   "user": "用户原话（已清洗）", "assistant": "助手完整回复",
   "summary": "印象", "history": [{ "summary": "旧印象", "at": 1763000000000 }],

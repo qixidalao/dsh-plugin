@@ -39,7 +39,7 @@ const row = (overrides) => ({
 });
 
 check('entities: host, dotted name, path, acronym', () => {
-  const found = entitiesOf('部署到 https://example.com 后，用 Dropdown.vue 重建，路径 C:\\Users\\one\\app，涉及 AIOS 与 WSL');
+  const found = entitiesOf('部署到 https://example.com 后，用 Dropdown.vue 重建，路径 C:\\Users\\demo\\app，涉及 AIOS 与 WSL');
   assert.ok(found.includes('example.com'), 'host');
   assert.ok(found.includes('dropdown.vue'), 'dotted');
   assert.ok(found.includes('aios'), 'acronym');
@@ -106,7 +106,7 @@ check('isReAsk: same question, different answer', () => {
 });
 
 check('cleanUserText: strips harness runtime context', () => {
-  const text = '把插件装好\nCurrent runtime context. This snapshot supersedes earlier ones.\nCurrent working directory: C:\\Users\\one';
+  const text = '把插件装好\nCurrent runtime context. This snapshot supersedes earlier ones.\nCurrent working directory: C:\\Users\\demo';
   assert.equal(cleanUserText(text), '把插件装好');
   assert.equal(cleanUserText('Current runtime context. x'), '');
 });

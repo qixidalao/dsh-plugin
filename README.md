@@ -145,13 +145,13 @@ result size: compact 3.5 KB vs full 14.7 KB (24%)
 
 ## 数据位置
 
-`$DSH_HOME/storages/dynamic_memory/`（默认 `C:\Users\<you>\.dsh\storages\dynamic_memory`）：
+`$DSH_HOME/storages/dynamic_memory/`（默认 `%USERPROFILE%\.dsh\storages\dynamic_memory`）：
 
 - `exchanges/r_<id>.json`：
 
 ```json
 { "version": 1, "record": {
-  "id": "...", "sessionId": "...", "workspace": "C:\\Users\\one", "kind": "episodic",
+  "id": "...", "sessionId": "...", "workspace": "C:\\Users\\<you>", "kind": "episodic",
   "time": 1763000000000, "updatedAt": 1763000000000,
   "user": "用户原话", "assistant": "助手完整回复",
   "summary": "当前印象", "history": [{ "summary": "旧印象", "at": 1763000000000 }],
@@ -228,8 +228,8 @@ result size: compact 3.5 KB vs full 14.7 KB (24%)
 ## 测试与评测
 
 ```powershell
-node C:\Users\<you>\dynamic-memory\test.mjs   # 纯函数测试（10 项）
-node C:\Users\<you>\dynamic-memory\eval.mjs   # 检索评测（10 条真实问题）
+node test.mjs   # 纯函数测试（27 项）
+node eval.mjs   # 检索评测（10 条真实问题）
 ```
 
 纯函数测试覆盖：实体抽取与索引、实体-only 查询、失效降权、重要度加权、时间排序与时间窗、访问强化、重问判定、上下文清洗。
