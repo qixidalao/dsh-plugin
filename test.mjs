@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts, mentionOf, buildReflectProposals, findCrossLayerDuplicates } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts, mentionOf, buildReflectProposals, findCrossLayerDuplicates, detectLocale, packFor } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -614,4 +614,26 @@ check('duplicates: cross-layer report only lists similar pairs', () => {
   assert.equal(pairs[0].observationId, 'dup');
 });
 
+
+check('i18n: locale detection and English injection pack', () => {
+  assert.equal(detectLocale('hello world'), 'en');
+  assert.equal(detectLocale('你好，世界'), 'zh');
+  const text = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: 'hello',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    messages: packFor('en').injection,
+    facetList: ['preferences'],
+    userLabels: packFor('en').labels.facets,
+    observations: [{ id: 'o', kind: 'self_reported', type: 'explicit_preference', text: 'prefers concise answers', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [] }],
+  });
+  assert.ok(text.includes('## Observations (evidence layer)'), text.slice(0, 120));
+});
+
+check('i18n: non-Latin word scripts are tokenized', () => {
+  const rows = [row({ id: 'ar', user: 'مرحبا بالعالم', assistant: 'مرحبا', time: Date.now() })];
+  const result = rankExchanges(rows, { query: 'مرحبا', limit: 3 });
+  assert.ok(result.matches.length >= 1, 'Arabic query matches Arabic memory');
+});
 console.log(`\n${passed} checks passed`);

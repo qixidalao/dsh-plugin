@@ -1,6 +1,6 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "1.14.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, portrait versions with own sources, layered injection with disclosure policy, consolidation drafts, calibrated retrieval confidence and recycle bin",
@@ -18,12 +18,34 @@
     "long-term-memory",
     "memory"
   ],
-  "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
-  "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "CHANGELOG.md", "eval.mjs", "eval-queries.fixture.json", "test.mjs", "test-host.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "DOCS.md",
+    "CHANGELOG.md",
+    "eval.mjs",
+    "eval-queries.fixture.json",
+    "test.mjs",
+    "test-host.mjs",
+    "bench.mjs",
+    "locale/*.json",
+    "icon.svg"
+  ],
   "scripts": {
     "test": "node test.mjs",
     "test:host": "node test-host.mjs",
     "eval": "node eval.mjs --fixture"
   },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
 }
