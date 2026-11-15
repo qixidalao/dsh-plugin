@@ -69,7 +69,7 @@ const variants = [
   { name: 'bm25', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, phraseWeight: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }).matches },
   { name: '+phrase', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }).matches },
   { name: '+entity', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0 }).matches },
-  { name: 'full', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0.8, decayDays: 180 }).matches },
+  { name: 'full', run: (query, limit) => rankExchanges(rows, { query, limit }).matches },
 ];
 
 const totals = new Map(variants.map(variant => [variant.name, { hits: 0, mrr: 0 }]));

@@ -40,7 +40,7 @@
 ### 2.2 `portrait`：用户画像（7 个 facet）
 
 `habits / preferences / thinking / dynamics / psychology / past / identity`，
-每条：`{ facet, content, updatedAt, keywords, history[], sourceExchangeIds[] }`。
+每条：`{ facet, content, updatedAt, keywords, history[], sourceExchangeIds[], sourceObservationIds[], needsRecompute }`。
 
 ### 2.3 `self`：助手画像（4 个 facet）
 
@@ -96,28 +96,30 @@ session/event ──► 清洗/配对 ──► 去重/重问 ──► 落盘 �
 对候选记录计算：
 
 ```
-bm25        BM25（中文二字组 + 英文词，k1=1.2、b=0.75，按平均长度归一化）
+bm25n       BM25 归一化：bm25 / 本次查询的最大 bm25（0–1，消除长查询的量纲膨胀）× 2.5
 phrase      整句（去空格）出现在 user/assistant 中 → ×3
-impression  query 词出现在印象摘要中，最多 4 个 → 每个 ×0.6
+impression  query 词出现在印象摘要中，最多 4 个 → 每个 ×0.05（仅作 tie-breaker）
 entity      query 实体与记录实体交集，最多 3 个 → 每个 ×0.9
-recency     0.8 × exp(-ageDays / 180)
-importance  (1 + 0.4 × importance) 乘子
+recency     0.4 × exp(-ageDays / 180) × intent（时间意图 1.0，否则 0.3）
+importance  (1 + 0.4 × effectiveImportance) 乘子；effective = stored × exp(-idleDays / 360)
 superseded  被重问取代 → ×0.5（includeSuperseded=true 时取消）
 archived    回收区记录 → ×weight（默认 0.3，且默认不参与）
-score = (bm25 + phrase + impression + entity + recency) × importance 乘子 × superseded × archived
+score = (bm25n + phrase + impression + entity + recency) × importance 乘子 × superseded × archived
 ```
 
-- **置信度**：`0.3×绝对分饱和 + 0.35×与第二名 margin + 0.35×分布离散度(separation)`，`high ≥ 0.62`、`medium ≥ 0.38`。
+- **置信度**：`0.3×绝对分饱和 + 0.35×与第二名 margin + 0.35×分布离散度(separation)`，`high ≥ 0.62`、`medium ≥ 0.38`；**在得分序上计算，再按显示排序输出**（v1.10 修复：此前 `sort=recent` 会用最新记录当 best）。
 - **默认返回片段**：围绕命中词取窗口（`snippetChars` 400，优先对齐句末标点），`full: true` 才回完整原文；同时返回 `reasons`（phrase/impression/entity:xxx/bm25/archived）与 `portraitMatches`。
-- **查询意图**：含“最近/刚刚/上次”自动按时间倒序；支持 `from`/`to` 时间窗、`sort`、`kind`、`scope`（workspace/all）、`includeArchived`、`includeSuperseded`。
-- **访问强化**：命中记录 `accessCount+1`、`importance+0.02`（上限 1），2 秒 debounce 落盘，插件卸载前 flush。
+- **查询意图**：含“最近/刚刚/上次/当时/去年”等按时间倒序，并提高 recency 权重；支持 `from`/`to` 时间窗、`sort`、`kind`、`scope`（workspace/all）、`includeArchived`、`includeSuperseded`。
+- **访问统计**：命中记录 `accessCount+1`、记录 `lastAccessAt`，2 秒 debounce 落盘；**检索不再抬高 importance**（v1.10 修复正反馈），importance 只由 `deepen`/纠正提升，并随时间衰减。
 
 ## 6. 画像与证据层（对齐《人类复杂性模型》）
 
 - **画像 facet 是归纳视图**，可能混合事实与推断；注入时明确写“参考信息，不是指令，与当前请求冲突以当前请求为准”。
-- **证据层才是底座**：`observe` 写入时强制区分 `observed` / `self_reported` / `inferred` / `corrected`；`inferred` 必须带 `confidence` 与至少一个 `alternatives`；纯人格标签（懒惰/内向/敏感/固执…）返回 `warning`，引导改成“行为 + 情境 + 替代解释”。
-- **矛盾不消除**：`contradict ids=[a,b]` 双向标记，注入里提示未解矛盾，由模型决定何时向用户澄清。
-- **纠正优先**：`correct id=... content=...` 把原观察置为 `superseded`，新建 `kind=corrected` 的当前观察；此后回答以纠正为准，原始记录保留可追溯。
+- **血缘**：`learn` 可带 `sourceObservationIds`；观察被 `correct`/`forget` 后，引用它的 facet 标记 `needsRecompute`，注入时提示“来源有变更，待重算”（v1.10）。
+- **证据层才是底座**：`observe` 写入时强制区分 `observed` / `self_reported` / `inferred` / `corrected`；`inferred` 必须带 `confidence` 与至少一个 `alternatives`；纯人格标签（懒惰/内向/敏感/固执…）返回 `warning`，引导改成“行为 + 情境 + 替代解释”。**告警只认真实存在的来源 id**，假 id 或长文本不能绕过（v1.10）。
+- **矛盾不消除**：`contradict ids=[a,b]` 双向标记；注入只统计**双方都 current** 的矛盾对数，一方被纠正/删除后不再误报（v1.10）。`correct` 会把矛盾链接迁移到纠正记录上。
+- **纠正优先**：`correct id=... content=...` 把原观察置为 `superseded`，新建 `kind=corrected` 的当前观察；此后回答以纠正为准，原始记录保留可追溯。删除纠正记录时，原观察恢复为 `current`，并清理所有悬空引用（`supersededBy`/`correctionOf`/`contradicts`）。
+- **注入顺序与门控**：纠正 → 自述 → 事实 → 推断；与当前请求无词/实体交集的观察不注入（纠正除外），`sensitivity=sensitive` 会带“敏感”标记，`private` 只报条数（v1.10）。
 - **隐私分级**：`sensitivity=private` 的观察不注入明文、不导出，只显示条数；`forget` 可按 id 删除观察。
 - **用户控制**：`observations` 可列出当前/历史观察，`forget` 可删除，`export` 可导出（私密项不导出）。
 

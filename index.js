@@ -32,6 +32,15 @@ const OBSERVATION_TYPES = [
 const OBSERVATION_KINDS = ['observed', 'self_reported', 'inferred', 'corrected'];
 const OBSERVATION_STATUS = ['current', 'withdrawn', 'superseded'];
 const TRAIT_LABEL_PATTERN = /(懒惰|内向|固执|敏感|焦虑|抑郁|自恋|社恐|讨好型|完美主义|强迫|回避型|依赖型|玻璃心|脾气差|人格|性格)/;
+const TRAIT_CONTEXT_HINT = /(当时|因为|情境|场景|那次|反复|跨情境|context)/;
+/** Trait adjectives are fine only with real evidence or an explicit situation; length is not an excuse. */
+export function lintTraitLabel(text, knownSourceIds = []) {
+  const value = String(text || '');
+  if (!TRAIT_LABEL_PATTERN.test(value)) return null;
+  if (Array.isArray(knownSourceIds) && knownSourceIds.some(id => typeof id === 'string' && id)) return null;
+  if (TRAIT_CONTEXT_HINT.test(value)) return null;
+  return '这更像人格标签而不是证据：建议记录“具体行为 + 当时情境 + 至少一个替代解释”，或改用 observe epistemic=inferred 并附 context/alternatives；用户本人纠正过的内容应优先。';
+}
 const SELF_LABELS = {
   habits: '助手习惯',
   preferences: '助手喜好',
@@ -98,6 +107,8 @@ const DOMAIN_SPEC = {
             ...value,
             history,
             sourceExchangeIds: Array.isArray(value.sourceExchangeIds) ? value.sourceExchangeIds.filter(id => typeof id === 'string') : [],
+            sourceObservationIds: Array.isArray(value.sourceObservationIds) ? value.sourceObservationIds.filter(id => typeof id === 'string') : [],
+            needsRecompute: value.needsRecompute === true,
           };
         },
       },
@@ -119,6 +130,8 @@ const DOMAIN_SPEC = {
             ...value,
             history,
             sourceExchangeIds: Array.isArray(value.sourceExchangeIds) ? value.sourceExchangeIds.filter(id => typeof id === 'string') : [],
+            sourceObservationIds: Array.isArray(value.sourceObservationIds) ? value.sourceObservationIds.filter(id => typeof id === 'string') : [],
+            needsRecompute: value.needsRecompute === true,
           };
         },
       },
@@ -173,7 +186,8 @@ const TOOL = {
       to: { type: 'string', description: 'Search upper time bound, ISO date or epoch ms.' },
       sort: { type: 'string', enum: ['relevance', 'recent', 'oldest'], description: 'Search order; defaults to relevance, or recent for "latest/最近" queries.' },
       includeHistory: { type: 'boolean', description: 'For portrait: include previous versions.' },
-      sourceIds: { type: 'array', items: { type: 'string' }, description: 'For learn: exchange ids this conclusion came from.' },
+      sourceIds: { type: 'array', items: { type: 'string' }, description: 'For learn/observe: exchange ids this conclusion came from.' },
+      sourceObservationIds: { type: 'array', items: { type: 'string' }, description: 'For learn: observation ids the facet was summarized from; correcting/deleting one marks the facet for recompute.' },
       kind: { type: 'string', enum: KINDS, description: 'Search layer filter.' },
       scope: { type: 'string', enum: ['workspace', 'all'], description: 'Search scope; default workspace.' },
       includeSuperseded: { type: 'boolean', description: 'Search: also rank exchanges superseded by a re-ask.' },
@@ -393,6 +407,28 @@ function haystackOf(row) {
   return doc.haystack;
 }
 
+export function confidenceFromScores(values) {
+  const scores = [...values].sort((left, right) => right - left);
+  if (!scores.length) return { score: 0, label: 'none' };
+  const best = scores[0];
+  const mean = scores.reduce((sum, value) => sum + value, 0) / scores.length;
+  const variance = scores.reduce((sum, value) => sum + (value - mean) ** 2, 0) / scores.length;
+  const deviation = Math.sqrt(variance);
+  const spread = deviation > 1e-6 ? (best - mean) / deviation : (scores.length === 1 ? 2 : 0);
+  const separation = Math.max(0, Math.min(1, spread / 2));
+  const absolute = best / (best + 4);
+  const runnerUp = scores[1] || 0;
+  const margin = scores.length > 1 ? (best - runnerUp) / Math.max(1e-6, best) : 1;
+  const blended = Math.max(0, Math.min(1, 0.3 * absolute + 0.35 * margin + 0.35 * separation));
+  const label = blended >= 0.62 ? 'high' : blended >= 0.38 ? 'medium' : 'low';
+  return {
+    score: Number(blended.toFixed(2)),
+    label,
+    margin: Number(margin.toFixed(2)),
+    separation: Number(separation.toFixed(2)),
+  };
+}
+
 /**
  * Pure ranking function; also used by the offline evaluation script.
  * Options: query, from, to, sort, limit, kind, workspace, scope, now, timeBoost,
@@ -407,10 +443,10 @@ export function rankExchanges(rows, options = {}) {
   const sort = sortRequested || (wantsLatest ? 'recent' : 'relevance');
   const limit = Math.max(1, Math.min(50, Number(options.limit) || 10));
   const now = Number.isFinite(options.now) ? options.now : Date.now();
-  const timeBoost = Number.isFinite(options.timeBoost) ? options.timeBoost : 0.8;
+  const timeBoost = Number.isFinite(options.timeBoost) ? options.timeBoost : 0.4;
   const decayDays = Number.isFinite(options.decayDays) ? options.decayDays : 180;
   const phraseWeight = Number.isFinite(options.phraseWeight) ? options.phraseWeight : 3;
-  const impressionWeight = Number.isFinite(options.impressionWeight) ? options.impressionWeight : 0.6;
+  const impressionWeight = Number.isFinite(options.impressionWeight) ? options.impressionWeight : 0.05;
   const entityWeight = Number.isFinite(options.entityWeight) ? options.entityWeight : 0.9;
   const importanceWeight = Number.isFinite(options.importanceWeight) ? options.importanceWeight : 0.4;
   const includeSuperseded = options.includeSuperseded === true;
@@ -451,7 +487,9 @@ export function rankExchanges(rows, options = {}) {
     const df = documentFrequency.get(term) || 0;
     return Math.log(1 + (total - df + 0.5) / (df + 0.5));
   };
-  const phrase = query.toLowerCase().replace(/\s+/g, '');
+const phrase = query.toLowerCase().replace(/\s+/g, '');
+const timeIntent = wantsLatest || /(当时|以前|去年|上周|上个月|那天|之前|过去|\d{4}[-/年])/i.test(query);
+const recencyWeight = timeIntent ? 1 : 0.3;
 
   const scored = [];
   for (const doc of docs) {
@@ -480,13 +518,20 @@ export function rankExchanges(rows, options = {}) {
     const ageDays = Math.max(0, (now - row.time) / 86400000);
     const recency = timeBoost * Math.exp(-ageDays / decayDays);
     const importance = Math.max(0, Math.min(1, Number(row.importance) || DEFAULT_IMPORTANCE));
+    // Importance decays when the memory has not been touched for a long time;
+    // retrieval no longer raises it (see touch below), so no self-reinforcing loop.
+    const lastSeen = Math.max(Number(row.lastAccessAt) || 0, Number(row.updatedAt) || 0, Number(row.time) || 0);
+    const idleDays = Math.max(0, (now - lastSeen) / 86400000);
+    const effectiveImportance = importance * Math.exp(-idleDays / (decayDays * 2));
     const supersededFactor = row.supersededBy && !includeSuperseded ? 0.5 : 1;
     const archivedFactor = row.archivedAt ? (Number.isFinite(row.weight) ? row.weight : archivedWeight) : 1;
-    const base = bm25 + phraseHit * phraseWeight + Math.min(4, impressionHit) * impressionWeight + entityHit * entityWeight + recency;
-    const score = base * (1 + importanceWeight * importance) * supersededFactor * archivedFactor;
     scored.push({
       row,
-      score,
+      bm25,
+      phraseHit,
+      impressionHit,
+      entityHit,
+      recency,
       reasons,
       signals: {
         bm25: Number(bm25.toFixed(3)),
@@ -494,44 +539,43 @@ export function rankExchanges(rows, options = {}) {
         impression: impressionHit,
         entity: entityHit,
         recency: Number(recency.toFixed(3)),
-        importance: Number(importance.toFixed(2)),
+        importance: Number(effectiveImportance.toFixed(2)),
       },
       matchedEntities,
+      supersededFactor,
+      archivedFactor,
+      effectiveImportance,
     });
   }
+
+  // Normalise BM25 across this query before mixing with bounded signals, so a long
+  // query with many terms cannot dwarf recency/importance (review issue: mixed scales).
+  const maxBm25 = scored.reduce((max, item) => Math.max(max, item.bm25), 0) || 1;
+  for (const item of scored) {
+    const base = 2.5 * (item.bm25 / maxBm25)
+      + item.phraseHit * phraseWeight
+      + Math.min(4, item.impressionHit) * impressionWeight
+      + item.entityHit * entityWeight
+      + item.recency * recencyWeight;
+    item.score = base * (1 + importanceWeight * item.effectiveImportance) * item.supersededFactor * item.archivedFactor;
+  }
+
+  // Confidence is computed on the score order, before any time-based display sort.
+  const byScore = [...scored].sort((left, right) => right.score - left.score || right.row.time - left.row.time);
+  const confidence = confidenceFromScores(byScore.map(item => item.score));
 
   if (sort === 'recent') scored.sort((left, right) => right.row.time - left.row.time || right.score - left.score);
   else if (sort === 'oldest') scored.sort((left, right) => left.row.time - right.row.time || right.score - left.score);
   else scored.sort((left, right) => right.score - left.score || right.row.time - left.row.time);
 
   const top = scored.slice(0, limit);
-  const confidence = (() => {
-    if (!scored.length) return { score: 0, label: 'none' };
-    const scores = scored.map(item => item.score);
-    const best = scores[0];
-    const mean = scores.reduce((sum, value) => sum + value, 0) / scores.length;
-    const variance = scores.reduce((sum, value) => sum + (value - mean) ** 2, 0) / scores.length;
-    const deviation = Math.sqrt(variance);
-    const spread = deviation > 1e-6 ? (best - mean) / deviation : (scores.length === 1 ? 2 : 0);
-    const separation = Math.max(0, Math.min(1, spread / 2));
-    const absolute = best / (best + 4);
-    const runnerUp = scores[1] || 0;
-    const margin = scores.length > 1 ? (best - runnerUp) / Math.max(1e-6, best) : 1;
-    const blended = Math.max(0, Math.min(1, 0.3 * absolute + 0.35 * margin + 0.35 * separation));
-    const label = blended >= 0.62 ? 'high' : blended >= 0.38 ? 'medium' : 'low';
-    return {
-      score: Number(blended.toFixed(2)),
-      label,
-      margin: Number(margin.toFixed(2)),
-      separation: Number(separation.toFixed(2)),
-    };
-  })();
   if (options.touch) {
     const touchedAt = Date.now();
     for (const item of top) {
+      // Access is recorded for retrieval statistics only; importance is raised by
+      // deepen/correction, not by being searched repeatedly.
       item.row.accessCount = (item.row.accessCount || 0) + 1;
       item.row.lastAccessAt = touchedAt;
-      item.row.importance = Math.min(1, (item.row.importance || DEFAULT_IMPORTANCE) + 0.02);
     }
   }
 
@@ -720,15 +764,10 @@ export function speakerContinuity(currentTexts, baseline, { gapDays } = {}) {
   };
 }
 
-export function lintTraitLabel(text, sourceIds) {
-  if (!TRAIT_LABEL_PATTERN.test(String(text || ''))) return null;
-  if (Array.isArray(sourceIds) && sourceIds.length) return null;
-  if (String(text || '').length > 60) return null;
-  return '这更像人格标签而不是证据：建议记录“具体行为 + 当时情境 + 至少一个替代解释”，或改用 observe epistemic=inferred 并附 context/alternatives；用户本人纠正过的内容应优先。';
-}
-
 export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget }) {
   const sections = [];
+  const userTokens = new Set(tokensOf(lastUserText || ''));
+  const userEntities = new Set(entitiesOf(lastUserText || ''));
   if (gap && gap.gapDays !== null && gap.gapDays >= (gapDays || DEFAULT_GAP_DAYS)) {
     sections.push(
       '## 时间分界（注意）',
@@ -739,23 +778,41 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   const obs = Array.isArray(observations) ? observations.filter(row => row && row.status === 'current') : [];
   if (obs.length) {
     const kindLabel = { observed: '事实', self_reported: '自述', inferred: '推断', corrected: '纠正' };
+    const kindOrder = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
+    const ordered = [...obs].sort((left, right) => (kindOrder[left.kind] ?? 4) - (kindOrder[right.kind] ?? 4) || right.updatedAt - left.updatedAt);
+    const obsById = new Map(obs.map(row => [row.id, row]));
+    const relevant = row => {
+      if (row.kind === 'corrected') return true; // user corrections always take precedence
+      if (!lastUserText) return true;
+      const haystack = `${row.text} ${(row.alternatives || []).join(' ')}`;
+      if (tokensOf(haystack).some(token => userTokens.has(token))) return true;
+      return entitiesOf(haystack).some(entity => userEntities.has(entity));
+    };
     let remaining = observationBudget;
     const lines = [];
     let privateHidden = 0;
-    let unresolved = 0;
-    for (const row of obs) {
+    let gatedOut = 0;
+    const pairs = new Set();
+    for (const row of ordered) {
+      for (const peer of row.contradicts || []) {
+        if (obsById.has(peer)) pairs.add([row.id, peer].sort().join('|'));
+      }
       if (row.sensitivity === 'private') {
         privateHidden += 1;
         continue;
       }
+      if (!relevant(row)) {
+        gatedOut += 1;
+        continue;
+      }
       if (remaining <= 40 || lines.length >= 6) break;
       const label = kindLabel[row.kind] || row.kind;
+      const sensitivity = row.sensitivity === 'sensitive' ? '敏感·' : '';
       const confidence = row.kind === 'inferred' && row.confidence !== null ? ` ${row.confidence.toFixed(2)}` : '';
       const alternatives = row.alternatives?.length ? `（也可能：${row.alternatives.slice(0, 2).join('、')}）` : '';
-      const line = `- ${label}${confidence}：${truncate(row.text, observationChars)}${alternatives}`;
+      const line = `- ${sensitivity}${label}${confidence}：${truncate(row.text, observationChars)}${alternatives}`;
       lines.push(line);
       remaining -= line.length + 1;
-      if (row.contradicts?.length) unresolved += 1;
     }
     if (lines.length) {
       sections.push(
@@ -763,7 +820,8 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
         '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。',
         lines.join('\n'),
         privateHidden ? `（另有 ${privateHidden} 条私密观察未展示）` : '',
-        unresolved ? `（有 ${unresolved} 条观察标记了未解矛盾）` : '',
+        pairs.size ? `（有 ${pairs.size} 对未解矛盾）` : '',
+        gatedOut ? `（${gatedOut} 条与当前话题无关，未展示）` : '',
         '',
       );
     }
@@ -781,7 +839,13 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   }
   const portraitLines = FACETS
     .map(facet => ({ facet, row: portraitRows.get(facet) }))
-    .filter(({ row }) => row && row.content.trim());
+    .filter(({ row }) => row && row.content.trim())
+    .filter(({ facet, row }) => {
+      if (!lastUserText) return true;
+      if (facet === 'identity') return true; // short and always useful for addressing
+      const content = row.content;
+      return tokensOf(content).some(token => userTokens.has(token)) || entitiesOf(content).some(entity => userEntities.has(entity));
+    });
   if (portraitLines.length) {
     let remaining = portraitBudget;
     const rendered = [];
@@ -789,7 +853,7 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
       const label = `- ${FACET_LABELS[facet]}：`;
       if (remaining <= label.length + 20) break;
       const text = truncate(row.content, Math.min(portraitChars, remaining - label.length - 2));
-      const line = `${label}${text}`;
+      const line = `${label}${text}${row.needsRecompute ? '（来源有变更，待重算）' : ''}`;
       rendered.push(line);
       remaining -= line.length + 1;
     }
@@ -883,7 +947,7 @@ async function start(ctx, config) {
   const maxPerSession = Math.max(50, Number(config.maxExchangesPerSession) || 1000);
   const dedupeJaccard = Math.max(0.5, Math.min(1, Number(config.dedupeJaccard) || 0.95));
   const decayDays = Math.max(7, Number(config.timeDecayDays) || 180);
-  const timeBoost = Math.max(0, Math.min(3, Number(config.timeBoost) || 0.8));
+  const timeBoost = Math.max(0, Math.min(3, Number(config.timeBoost) || 0.4));
   const injectRecentExchanges = config.injectRecentExchanges === true;
   const digestImpressions = Math.max(0, Math.min(10, Number(config.digestImpressions) || 2));
   const digestChars = Math.max(40, Math.min(500, Number(config.digestChars) || 100));
@@ -1017,10 +1081,32 @@ async function start(ctx, config) {
     if (!observationsTable) return;
     await observationsTable.put(`o_${row.id}`, row).catch(error => logger.warn(`dynamic-memory: cannot persist observation: ${String(error)}`));
   };
+  const OBSERVATION_PRIORITY = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
   const currentObservations = (limit = 20) => [...observations.values()]
     .filter(row => row.status === 'current')
-    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .sort((left, right) => (OBSERVATION_PRIORITY[left.kind] ?? 4) - (OBSERVATION_PRIORITY[right.kind] ?? 4) || right.updatedAt - left.updatedAt)
     .slice(0, limit);
+  const liveObservation = id => {
+    const row = observations.get(id);
+    return Boolean(row && row.status === 'current');
+  };
+  /** Remove an id from every observation/portrait reference so no dangling links remain. */
+  const dropObservationReferences = async id => {
+    for (const row of observations.values()) {
+      if (row.id === id) continue;
+      if (Array.isArray(row.contradicts) && row.contradicts.includes(id)) {
+        row.contradicts = row.contradicts.filter(peer => peer !== id);
+        row.updatedAt = Date.now();
+        await persistObservation(row);
+      }
+      if (row.correctionOf === id) {
+        row.correctionOf = null;
+        row.updatedAt = Date.now();
+        await persistObservation(row);
+      }
+    }
+    await markFacetsStale(id);
+  };
   const addObservation = async (args, kind) => {
     const at = Date.now();
     const row = {
@@ -1109,7 +1195,7 @@ async function start(ctx, config) {
     };
   };
 
-  const writeFacet = async (map, targetTable, keyPrefix, validFacets, facet, content, extraKeywords, sourceIds) => {
+  const writeFacet = async (map, targetTable, keyPrefix, validFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds) => {
     if (!validFacets.includes(facet)) throw new Error(`facet must be one of ${validFacets.join(', ')}`);
     const previous = map.get(facet);
     const next = content.trim().slice(0, 4000);
@@ -1117,24 +1203,39 @@ async function start(ctx, config) {
     const history = previous && previous.content !== next
       ? [...(previous.history || []), { content: previous.content, at: previous.updatedAt }].slice(-HISTORY_LIMIT)
       : (previous?.history || []);
-    const known = (sourceIds || []).filter(id => rowsById.has(id));
+    const knownExchanges = (sourceIds || []).filter(id => rowsById.has(id));
+    const knownObservations = (sourceObservationIds || []).filter(id => observations.has(id));
     const row = {
       facet,
       content: next,
       updatedAt: at,
       keywords: [...new Set([...keywordsOf(extraKeywords || [], content), ...(previous?.keywords || [])])].slice(0, MAX_KEYWORDS),
       history,
-      sourceExchangeIds: [...new Set([...(previous?.sourceExchangeIds || []), ...known])].slice(-100),
+      sourceExchangeIds: [...new Set([...(previous?.sourceExchangeIds || []), ...knownExchanges])].slice(-100),
+      sourceObservationIds: [...new Set([...(previous?.sourceObservationIds || []), ...knownObservations])].slice(-100),
+      needsRecompute: false,
     };
     map.set(facet, row);
     if (targetTable) await targetTable.put(`${keyPrefix}${facet}`, row);
     return row;
   };
 
-  const writePortrait = (facet, content, extraKeywords, sourceIds) =>
-    writeFacet(portrait, portraitTable, 'p_', FACETS, facet, content, extraKeywords, sourceIds);
-  const writeSelf = (facet, content, extraKeywords, sourceIds) =>
-    writeFacet(selfPortrait, selfTable, 's_', SELF_FACETS, facet, content, extraKeywords, sourceIds);
+  const writePortrait = (facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
+    writeFacet(portrait, portraitTable, 'p_', FACETS, facet, content, extraKeywords, sourceIds, sourceObservationIds);
+  const writeSelf = (facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
+    writeFacet(selfPortrait, selfTable, 's_', SELF_FACETS, facet, content, extraKeywords, sourceIds, sourceObservationIds);
+
+  /** Mark every facet that cited this observation as needing a rewrite. */
+  const markFacetsStale = async observationId => {
+    for (const [map, table, prefix] of [[portrait, portraitTable, 'p_'], [selfPortrait, selfTable, 's_']]) {
+      for (const [facet, row] of map) {
+        if (!Array.isArray(row.sourceObservationIds) || !row.sourceObservationIds.includes(observationId)) continue;
+        row.needsRecompute = true;
+        row.sourceObservationIds = row.sourceObservationIds.filter(id => id !== observationId);
+        if (table) await table.put(`${prefix}${facet}`, row).catch(() => {});
+      }
+    }
+  };
 
   const facetsOf = target => (target === ASSISTANT_TARGET ? SELF_FACETS : FACETS);
   const mapOf = target => (target === ASSISTANT_TARGET ? selfPortrait : portrait);
@@ -1608,6 +1709,7 @@ async function start(ctx, config) {
       gapDays: gap.gapDays === null ? null : Number(gap.gapDays.toFixed(1)),
       lastActivityAt: gap.lastActivityAt ? new Date(gap.lastActivityAt).toISOString() : null,
       staleFacets: stale,
+      facetsNeedingRecompute: [...portrait.values(), ...selfPortrait.values()].filter(row => row.needsRecompute).length,
       observations: {
         current: [...observations.values()].filter(row => row.status === 'current').length,
         inferred: [...observations.values()].filter(row => row.kind === 'inferred').length,
@@ -1734,7 +1836,8 @@ async function start(ctx, config) {
               return { error: 'inferred observations need an approximate confidence (0-1)' };
             }
             const row = await addObservation({ ...args, content: text }, epistemic);
-            const lint = lintTraitLabel(text, args.sourceIds);
+            const knownSources = (args.sourceIds || []).filter(id => rowsById.has(id) || observations.has(id));
+            const lint = lintTraitLabel(text, knownSources);
             return {
               id: row.id,
               type: row.type,
@@ -1747,9 +1850,11 @@ async function start(ctx, config) {
           if (action === 'correct') {
             const original = typeof args.id === 'string' ? observations.get(args.id) : undefined;
             if (!original) return { error: 'Unknown observation id.' };
+            if (original.status !== 'current') return { error: 'Only current observations can be corrected.' };
             const text = String(args.content || args.text || '').trim();
             if (!text) return { error: 'content is required for action=correct' };
             const at = Date.now();
+            const inheritedContradictions = (original.contradicts || []).filter(id => liveObservation(id));
             const correction = {
               id: uuid(),
               type: 'correction',
@@ -1760,7 +1865,7 @@ async function start(ctx, config) {
               quote: typeof args.quote === 'string' ? args.quote : null,
               alternatives: [],
               sourceIds: Array.isArray(args.sourceIds) ? args.sourceIds : [],
-              contradicts: [],
+              contradicts: inheritedContradictions,
               correctionOf: original.id,
               sensitivity: original.sensitivity,
               status: 'current',
@@ -1768,11 +1873,21 @@ async function start(ctx, config) {
               updatedAt: at,
             };
             observations.set(correction.id, correction);
+            // Move contradiction links to the correction, so they stay live.
+            for (const peerId of inheritedContradictions) {
+              const peer = observations.get(peerId);
+              if (!peer) continue;
+              peer.contradicts = [...new Set([...(peer.contradicts || []).filter(id => id !== original.id), correction.id])];
+              peer.updatedAt = at;
+              await persistObservation(peer);
+            }
+            original.contradicts = [];
             original.status = 'superseded';
             original.updatedAt = at;
             original.supersededBy = correction.id;
             await persistObservation(correction);
             await persistObservation(original);
+            await markFacetsStale(original.id);
             return {
               corrected: original.id,
               correctionId: correction.id,
@@ -1853,9 +1968,10 @@ async function start(ctx, config) {
             if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
             if (typeof args.content !== 'string' || !args.content.trim()) return { error: 'content is required for action=learn' };
             const row = target === ASSISTANT_TARGET
-              ? await writeSelf(args.facet, args.content, args.keywords || [], args.sourceIds || [])
-              : await writePortrait(args.facet, args.content, args.keywords || [], args.sourceIds || []);
-            const lint = lintTraitLabel(args.content, args.sourceIds);
+              ? await writeSelf(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || [])
+              : await writePortrait(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || []);
+            const knownSources = (args.sourceIds || []).filter(id => rowsById.has(id) || observations.has(id));
+            const lint = lintTraitLabel(args.content, knownSources);
             return {
               target,
               updated: {
@@ -1864,6 +1980,7 @@ async function start(ctx, config) {
                 content: row.content,
                 keywords: row.keywords.slice(0, 24),
                 sourceExchangeIds: row.sourceExchangeIds,
+                sourceObservationIds: row.sourceObservationIds,
                 previousVersions: row.history.length,
               },
               ...(lint ? { warning: lint } : {}),
@@ -1909,8 +2026,20 @@ async function start(ctx, config) {
               return { clearedFacet: args.facet, target: forgetTarget, label: labelsOf(forgetTarget)[args.facet] };
             }
             if (typeof args.id === 'string' && observations.has(args.id)) {
+              const target = observations.get(args.id);
+              // If the deleted record was itself a correction, the original becomes current again.
+              if (target.correctionOf) {
+                const original = observations.get(target.correctionOf);
+                if (original && original.status === 'superseded' && original.supersededBy === target.id) {
+                  original.status = 'current';
+                  original.supersededBy = null;
+                  original.updatedAt = Date.now();
+                  await persistObservation(original);
+                }
+              }
               observations.delete(args.id);
               if (observationsTable) await observationsTable.delete(`o_${args.id}`);
+              await dropObservationReferences(args.id);
               return { forgotten: args.id, kind: 'observation' };
             }
             const row = typeof args.id === 'string' ? rowsById.get(args.id) : undefined;

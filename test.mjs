@@ -92,11 +92,12 @@ check('rank: sort=oldest and time window', () => {
   assert.equal(window.matches[0].id, 'newer');
 });
 
-check('rank: touch increments access and importance', () => {
+check('rank: touch records access but does not raise importance', () => {
   const target = row({ id: 'touch', assistant: 'alpha beta' });
   rankExchanges([target], { query: 'alpha', limit: 5, touch: true });
   assert.equal(target.accessCount, 1);
-  assert.ok(target.importance > 0.35);
+  assert.ok(target.lastAccessAt > 0);
+  assert.equal(target.importance, 0.35);
 });
 
 check('isReAsk: same question, different answer', () => {
@@ -324,6 +325,66 @@ check('lint: trait labels get a warning, evidence-backed ones do not', () => {
   assert.ok(lintTraitLabel('用户比较懒惰', []));
   assert.equal(lintTraitLabel('用户比较懒惰', ['exchange-1']), null);
   assert.equal(lintTraitLabel('连续三次推迟了任务，当时在做别的项目', []), null);
+  // A long label is not an excuse (no length bypass).
+  assert.ok(lintTraitLabel('用户比较懒惰，'.repeat(30), []));
+  // Context description is accepted without evidence ids.
+  assert.equal(lintTraitLabel('用户比较固执，当时在赶交付', []), null);
+});
+
+check('confidence: stable regardless of display sort order', () => {
+  const now = Date.now();
+  const rows = [
+    row({ id: 'a', assistant: 'example.com 部署完成 200', time: now }),
+    row({ id: 'b', assistant: 'example.com 部署记录', time: now - 86400000 }),
+    row({ id: 'c', assistant: '无关内容', time: now - 9 * 86400000 }),
+  ];
+  const byRelevance = rankExchanges(rows, { query: 'example.com 部署', sort: 'relevance', limit: 3 });
+  const byRecent = rankExchanges(rows, { query: 'example.com 部署', sort: 'recent', limit: 3 });
+  const byOldest = rankExchanges(rows, { query: 'example.com 部署', sort: 'oldest', limit: 3 });
+  assert.equal(byRelevance.confidence.score, byRecent.confidence.score);
+  assert.equal(byRelevance.confidence.label, byRecent.confidence.label);
+  assert.equal(byRelevance.confidence.score, byOldest.confidence.score);
+  assert.ok(byRelevance.confidence.margin >= 0);
+});
+
+check('contradictions: only counted while both sides are current', () => {
+  const base = {
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(),
+  };
+  const live = { id: 'l1', type: 'behavior_observation', kind: 'observed', text: '行为一', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: ['dead'] };
+  const dead = { id: 'dead', type: 'behavior_observation', kind: 'observed', text: '行为二', status: 'superseded', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: ['l1'] };
+  const text = renderContext({ ...base, observations: [live, dead] });
+  assert.ok(!text.includes('未解矛盾'), text.slice(0, 120));
+});
+
+check('observations: corrections render before inferences', () => {
+  const base = {
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(),
+  };
+  const corrected = { id: 'c', kind: 'corrected', type: 'correction', text: '纠正内容', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [] };
+  const inferred = { id: 'i', kind: 'inferred', type: 'inferred_motivation', text: '推断内容', status: 'current', confidence: 0.4, alternatives: ['备选'], sensitivity: 'normal', contradicts: [] };
+  const text = renderContext({ ...base, observations: [inferred, corrected] });
+  assert.ok(text.indexOf('纠正内容') < text.indexOf('推断内容'), 'corrected first');
+});
+
+check('observations: unrelated ones are gated out of injection', () => {
+  const base = {
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100,
+    gap: null, gapDays: 30, staleFacets: new Set(),
+  };
+  const psychology = { id: 'p', kind: 'inferred', type: 'emotional_state', text: '用户可能压力很大', status: 'current', confidence: 0.4, alternatives: ['只是忙'], sensitivity: 'normal', contradicts: [] };
+  const relevant = renderContext({ ...base, lastUserText: 'pressure 压力', observations: [psychology] });
+  assert.ok(relevant.includes('用户可能压力很大'), relevant.slice(0, 120));
+  const unrelated = renderContext({ ...base, lastUserText: '帮我修一下 index.js 的语法', observations: [psychology] });
+  assert.ok(!unrelated.includes('用户可能压力很大'), unrelated.slice(0, 120));
 });
 
 console.log(`\n${passed} checks passed`);
