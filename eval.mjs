@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Offline retrieval evaluation over the real memory store.
 // Usage: node eval.mjs [--dir <exchanges dir>] [--k 3]
+// Positive queries report hit@k and MRR; negative queries (negative: true) report
+// how often the retriever claims medium/high confidence for something not in memory.
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -31,6 +33,8 @@ const rows = readdirSync(dir)
   .map(row => ({ ...row, user: cleanUserText(row.user) }));
 
 const queries = JSON.parse(readFileSync(new URL('./eval-queries.json', import.meta.url), 'utf8'));
+const positives = queries.filter(query => !query.negative);
+const negatives = queries.filter(query => query.negative);
 
 function tokens(text) {
   const out = [];
@@ -65,18 +69,18 @@ function hitRank(list, expectContains) {
 }
 
 const variants = [
-  { name: 'baseline', run: (query, limit) => baselineRank(query, limit) },
-  { name: 'bm25', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, phraseWeight: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }).matches },
-  { name: '+phrase', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }).matches },
-  { name: '+entity', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0 }).matches },
-  { name: 'full', run: (query, limit) => rankExchanges(rows, { query, limit }).matches },
+  { name: 'baseline', run: (query, limit) => ({ matches: baselineRank(query, limit), confidence: { label: 'n/a' } }) },
+  { name: 'bm25', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, phraseWeight: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }) },
+  { name: '+phrase', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0, entityWeight: 0, importanceWeight: 0 }) },
+  { name: '+entity', run: (query, limit) => rankExchanges(rows, { query, limit, timeBoost: 0, impressionWeight: 0 }) },
+  { name: 'full', run: (query, limit) => rankExchanges(rows, { query, limit }) },
 ];
 
-const totals = new Map(variants.map(variant => [variant.name, { hits: 0, mrr: 0 }]));
+const totals = new Map(variants.map(variant => [variant.name, { hits: 0, mrr: 0, falsePositives: 0 }]));
 const lines = [];
 
-for (const query of queries) {
-  const ranks = variants.map(variant => ({ name: variant.name, rank: hitRank(variant.run(query.query, k), query.expectContains) }));
+for (const query of positives) {
+  const ranks = variants.map(variant => ({ name: variant.name, rank: hitRank(variant.run(query.query, k).matches, query.expectContains) }));
   for (const { name, rank } of ranks) {
     const total = totals.get(name);
     if (rank) {
@@ -84,14 +88,25 @@ for (const query of queries) {
       total.mrr += 1 / rank;
     }
   }
-  lines.push(`${query.query.padEnd(26, ' ')} | ${ranks.map(({ name, rank }) => `${name}: ${rank ? `#${rank}` : '-'}`).join(' | ')}`);
+  lines.push(`${query.query.padEnd(24, ' ')} | ${ranks.map(({ name, rank }) => `${name}: ${rank ? `#${rank}` : '-'}`).join(' | ')}`);
 }
 
-const n = queries.length;
-console.log(`memory rows: ${rows.length}, queries: ${n}, k=${k}`);
+for (const query of negatives) {
+  const verdicts = variants.map(variant => {
+    const result = variant.run(query.query, k);
+    const label = result.confidence?.label ?? 'n/a';
+    const isFalsePositive = label === 'medium' || label === 'high';
+    if (isFalsePositive) totals.get(variant.name).falsePositives += 1;
+    return `${variant.name}: ${isFalsePositive ? 'FP' : 'ok'}`;
+  });
+  lines.push(`${query.query.padEnd(24, ' ')} | ${verdicts.join(' | ')}  [negative]`);
+}
+
+console.log(`memory rows: ${rows.length}, positive: ${positives.length}, negative: ${negatives.length}, k=${k}`);
 console.log(lines.join('\n'));
 console.log('');
+const n = positives.length;
 for (const variant of variants) {
   const total = totals.get(variant.name);
-  console.log(`${variant.name.padEnd(9, ' ')} hit@${k}: ${total.hits}/${n}  MRR: ${(total.mrr / n).toFixed(3)}`);
+  console.log(`${variant.name.padEnd(9, ' ')} hit@${k}: ${total.hits}/${n}  MRR: ${(total.mrr / n).toFixed(3)}  false-positive: ${total.falsePositives}/${negatives.length}`);
 }

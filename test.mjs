@@ -381,10 +381,61 @@ check('observations: unrelated ones are gated out of injection', () => {
     gap: null, gapDays: 30, staleFacets: new Set(),
   };
   const psychology = { id: 'p', kind: 'inferred', type: 'emotional_state', text: '用户可能压力很大', status: 'current', confidence: 0.4, alternatives: ['只是忙'], sensitivity: 'normal', contradicts: [] };
-  const relevant = renderContext({ ...base, lastUserText: 'pressure 压力', observations: [psychology] });
+  const relevant = renderContext({ ...base, lastUserText: '最近压力 很大，晚上睡不好', observations: [psychology] });
   assert.ok(relevant.includes('用户可能压力很大'), relevant.slice(0, 120));
   const unrelated = renderContext({ ...base, lastUserText: '帮我修一下 index.js 的语法', observations: [psychology] });
   assert.ok(!unrelated.includes('用户可能压力很大'), unrelated.slice(0, 120));
+});
+
+check('injection layering: resident preferences survive a one-word message', () => {
+  const portrait = new Map([
+    ['preferences', { facet: 'preferences', content: '回答要简短，先给结论', keywords: [], history: [], sourceExchangeIds: [] }],
+    ['psychology', { facet: 'psychology', content: '对评价比较敏感', keywords: [], history: [], sourceExchangeIds: [] }],
+  ]);
+  const text = renderContext({
+    portraitRows: portrait, portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '继续',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: [
+      { id: 'r', kind: 'self_reported', type: 'explicit_preference', text: '偏好极简依赖', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [] },
+      { id: 'c', kind: 'inferred', type: 'inferred_motivation', text: '可能担心失败', status: 'current', confidence: 0.4, alternatives: ['只是忙'], sensitivity: 'normal', contradicts: [] },
+    ],
+  });
+  assert.ok(text.includes('回答要简短'), 'resident preference facet kept');
+  assert.ok(!text.includes('对评价比较敏感'), 'cue facet dropped on a short message');
+  assert.ok(text.includes('偏好极简依赖'), 'resident observation kept');
+  assert.ok(!text.includes('可能担心失败'), 'cue observation dropped on a short message');
+});
+
+check('scoring: absolute match quality lowers confidence for weak matches', () => {
+  const base = Date.now();
+  const rows = [
+    row({ id: 'a', user: 'aria2 断点续传怎么配置', assistant: 'aria2c --continue=true 即可断点续传', time: base }),
+    row({ id: 'b', user: '计算一下这个公式', assistant: '计算结果如下', time: base - 86400000 }),
+    row({ id: 'c', user: '量子计算新闻', assistant: '今天的新闻', time: base - 2 * 86400000 }),
+  ];
+  const strong = rankExchanges(rows, { query: 'aria2 断点续传', limit: 3 });
+  const weak = rankExchanges(rows, { query: '量子计算最新进展', limit: 3 });
+  assert.ok(strong.confidence.score > weak.confidence.score, `${strong.confidence.score} vs ${weak.confidence.score}`);
+  assert.notEqual(weak.confidence.label, 'high', `weak label=${weak.confidence.label}`);
+  assert.ok(strong.matches[0].coverage >= weak.matches[0].coverage);
+});
+
+check('contradictions: counts are complete even when the display budget truncates', () => {
+  const obs = [];
+  for (let index = 0; index < 10; index += 1) {
+    obs.push({ id: `o${index}`, kind: 'inferred', type: 'inferred_motivation', text: `推断内容${index}`, status: 'current', confidence: 0.3, alternatives: ['备选'], sensitivity: 'normal', contradicts: index < 4 ? [`o${index + 5}`] : [] });
+  }
+  for (let index = 5; index < 9; index += 1) obs[index].contradicts = [`o${index - 5}`];
+  const text = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: obs, observationChars: 20, observationBudget: 60,
+  });
+  assert.ok(text.includes('4 对未解矛盾'), text.slice(0, 200));
 });
 
 console.log(`\n${passed} checks passed`);

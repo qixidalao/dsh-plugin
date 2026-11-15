@@ -407,9 +407,9 @@ function haystackOf(row) {
   return doc.haystack;
 }
 
-export function confidenceFromScores(values) {
+export function confidenceFromScores(values, coverage = 1) {
   const scores = [...values].sort((left, right) => right - left);
-  if (!scores.length) return { score: 0, label: 'none' };
+  if (!scores.length) return { score: 0, label: 'none', margin: 0, separation: 0, coverage: 0 };
   const best = scores[0];
   const mean = scores.reduce((sum, value) => sum + value, 0) / scores.length;
   const variance = scores.reduce((sum, value) => sum + (value - mean) ** 2, 0) / scores.length;
@@ -420,12 +420,18 @@ export function confidenceFromScores(values) {
   const runnerUp = scores[1] || 0;
   const margin = scores.length > 1 ? (best - runnerUp) / Math.max(1e-6, best) : 1;
   const blended = Math.max(0, Math.min(1, 0.3 * absolute + 0.35 * margin + 0.35 * separation));
-  const label = blended >= 0.62 ? 'high' : blended >= 0.38 ? 'medium' : 'low';
+  // Low query coverage means the top hit is probably accidental; push confidence down.
+  const coverageFactor = Math.min(1, Math.max(0, coverage) / 0.6);
+  const adjusted = blended * coverageFactor;
+  // A high/medium claim also requires that at least half the query's IDF mass matched.
+  const enoughCoverage = coverage >= 0.5;
+  const label = adjusted >= 0.62 && enoughCoverage ? 'high' : adjusted >= 0.38 && enoughCoverage ? 'medium' : 'low';
   return {
-    score: Number(blended.toFixed(2)),
+    score: Number(adjusted.toFixed(2)),
     label,
     margin: Number(margin.toFixed(2)),
     separation: Number(separation.toFixed(2)),
+    coverage: Number(Math.max(0, Math.min(1, coverage)).toFixed(2)),
   };
 }
 
@@ -487,6 +493,13 @@ export function rankExchanges(rows, options = {}) {
     const df = documentFrequency.get(term) || 0;
     return Math.log(1 + (total - df + 0.5) / (df + 0.5));
   };
+  // Upper bound a perfect match could reach: every query term saturated (k1+1=2.2).
+  // Using this instead of "max score seen" keeps absolute match quality, so a query
+  // that only shares one common bigram cannot look like a strong hit (K2).
+  const maxPossible = terms.reduce((sum, term) => sum + idfOf(term) * 2.2, 0) || 1;
+  const totalIdf = terms.reduce((sum, term) => sum + idfOf(term), 0);
+  const avgIdf = terms.length ? totalIdf / terms.length : 1;
+  const totalUnits = totalIdf + queryEntities.size * avgIdf;
 const phrase = query.toLowerCase().replace(/\s+/g, '');
 const timeIntent = wantsLatest || /(当时|以前|去年|上周|上个月|那天|之前|过去|\d{4}[-/年])/i.test(query);
 const recencyWeight = timeIntent ? 1 : 0.3;
@@ -506,6 +519,13 @@ const recencyWeight = timeIntent ? 1 : 0.3;
     const matchedEntities = rowEntities(row).filter(entity => queryEntities.has(entity));
     const entityHit = Math.min(3, matchedEntities.length);
     if (!matched && !entityHit) continue;
+    const bm25n = (2.5 * bm25) / maxPossible;
+    const matchedIdf = terms.reduce((sum, term) => sum + (doc.freq.get(term) ? idfOf(term) : 0), 0);
+    // IDF-weighted coverage: sharing only common bigrams ("所有", "练习") does not count as
+    // knowing what the query is about, so weak matches keep a low confidence.
+    const coverage = totalUnits
+      ? Math.min(1, (matchedIdf + new Set(matchedEntities).size * avgIdf) / totalUnits)
+      : 0;
     const haystack = haystackOf(row);
     const phraseHit = phrase.length >= 2 && haystack.includes(phrase) ? 1 : 0;
     const impressionHit = terms.reduce((sum, term) => sum + ((row.summary || '').toLowerCase().includes(term) ? 1 : 0), 0);
@@ -528,6 +548,8 @@ const recencyWeight = timeIntent ? 1 : 0.3;
     scored.push({
       row,
       bm25,
+      bm25n,
+      coverage,
       phraseHit,
       impressionHit,
       entityHit,
@@ -539,6 +561,7 @@ const recencyWeight = timeIntent ? 1 : 0.3;
         impression: impressionHit,
         entity: entityHit,
         recency: Number(recency.toFixed(3)),
+        coverage: Number(coverage.toFixed(2)),
         importance: Number(effectiveImportance.toFixed(2)),
       },
       matchedEntities,
@@ -548,11 +571,8 @@ const recencyWeight = timeIntent ? 1 : 0.3;
     });
   }
 
-  // Normalise BM25 across this query before mixing with bounded signals, so a long
-  // query with many terms cannot dwarf recency/importance (review issue: mixed scales).
-  const maxBm25 = scored.reduce((max, item) => Math.max(max, item.bm25), 0) || 1;
   for (const item of scored) {
-    const base = 2.5 * (item.bm25 / maxBm25)
+    const base = item.bm25n
       + item.phraseHit * phraseWeight
       + Math.min(4, item.impressionHit) * impressionWeight
       + item.entityHit * entityWeight
@@ -562,7 +582,8 @@ const recencyWeight = timeIntent ? 1 : 0.3;
 
   // Confidence is computed on the score order, before any time-based display sort.
   const byScore = [...scored].sort((left, right) => right.score - left.score || right.row.time - left.row.time);
-  const confidence = confidenceFromScores(byScore.map(item => item.score));
+  const topCoverage = byScore[0]?.coverage ?? 1;
+  const confidence = confidenceFromScores(byScore.map(item => item.score), topCoverage);
 
   if (sort === 'recent') scored.sort((left, right) => right.row.time - left.row.time || right.score - left.score);
   else if (sort === 'oldest') scored.sort((left, right) => left.row.time - right.row.time || right.score - left.score);
@@ -580,13 +601,14 @@ const recencyWeight = timeIntent ? 1 : 0.3;
   }
 
   return {
-    matches: top.map(({ row, score, signals, matchedEntities, reasons }) => ({
+    matches: top.map(({ row, score, signals, matchedEntities, reasons, coverage }) => ({
       id: row.id,
       sessionId: row.sessionId,
       workspace: row.workspace || null,
       kind: row.kind || 'episodic',
       time: new Date(row.time).toISOString(),
       score: Number(score.toFixed(3)),
+      coverage: Number(coverage.toFixed(2)),
       signals,
       reasons,
       entities: matchedEntities.slice(0, 6),
@@ -764,10 +786,32 @@ export function speakerContinuity(currentTexts, baseline, { gapDays } = {}) {
   };
 }
 
-export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget }) {
+const RESIDENT_FACETS = new Set(['preferences', 'habits', 'thinking', 'identity']);
+const RESIDENT_OBSERVATION_TYPES = new Set(['explicit_preference', 'habit_pattern', 'constraint', 'correction']);
+const CUE_ONLY_TYPES = new Set(['emotional_state', 'relationship_context']);
+
+export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords }) {
   const sections = [];
   const userTokens = new Set(tokensOf(lastUserText || ''));
   const userEntities = new Set(entitiesOf(lastUserText || ''));
+  const stopSet = stopwords instanceof Set ? stopwords : new Set();
+  const chineseChars = (String(lastUserText || '').match(/[\u3400-\u9fff]/g) || []).length;
+  const shortMessage = Boolean(lastUserText) && chineseChars < 6 && userEntities.size === 0;
+  // Cue test: at least 2 shared non-stopword tokens, or one shared entity.
+  const hasCue = text => {
+    if (!text) return false;
+    if (!lastUserText) return true;
+    if (shortMessage) return false;
+    let shared = 0;
+    const seen = new Set();
+    for (const token of tokensOf(text)) {
+      if (seen.has(token) || !userTokens.has(token) || stopSet.has(token)) continue;
+      seen.add(token);
+      shared += 1;
+      if (shared >= 2) return true;
+    }
+    return entitiesOf(text).some(entity => userEntities.has(entity));
+  };
   if (gap && gap.gapDays !== null && gap.gapDays >= (gapDays || DEFAULT_GAP_DAYS)) {
     sections.push(
       '## 时间分界（注意）',
@@ -781,31 +825,37 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     const kindOrder = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
     const ordered = [...obs].sort((left, right) => (kindOrder[left.kind] ?? 4) - (kindOrder[right.kind] ?? 4) || right.updatedAt - left.updatedAt);
     const obsById = new Map(obs.map(row => [row.id, row]));
+    const resident = row =>
+      row.kind === 'corrected'
+      || RESIDENT_OBSERVATION_TYPES.has(row.type)
+      || (row.kind === 'self_reported' && !CUE_ONLY_TYPES.has(row.type) && row.sensitivity !== 'sensitive' && row.sensitivity !== 'private');
     const relevant = row => {
-      if (row.kind === 'corrected') return true; // user corrections always take precedence
-      if (!lastUserText) return true;
-      const haystack = `${row.text} ${(row.alternatives || []).join(' ')}`;
-      if (tokensOf(haystack).some(token => userTokens.has(token))) return true;
-      return entitiesOf(haystack).some(entity => userEntities.has(entity));
+      if (resident(row)) return true; // implicit memory: applies regardless of topic
+      return hasCue(`${row.text} ${(row.alternatives || []).join(' ')}`);
     };
-    let remaining = observationBudget;
-    const lines = [];
-    let privateHidden = 0;
-    let gatedOut = 0;
+    // Pre-pass: count contradictions and hidden items over the whole set,
+    // so a budget break cannot make the numbers too small (K5).
     const pairs = new Set();
+    let privateHidden = 0;
     for (const row of ordered) {
       for (const peer of row.contradicts || []) {
         if (obsById.has(peer)) pairs.add([row.id, peer].sort().join('|'));
       }
-      if (row.sensitivity === 'private') {
-        privateHidden += 1;
-        continue;
-      }
+      if (row.sensitivity === 'private') privateHidden += 1;
+    }
+    let remaining = observationBudget;
+    const lines = [];
+    let gatedOut = 0;
+    for (const row of ordered) {
+      if (row.sensitivity === 'private') continue;
       if (!relevant(row)) {
         gatedOut += 1;
         continue;
       }
-      if (remaining <= 40 || lines.length >= 6) break;
+      if (remaining <= 40 || lines.length >= 6) {
+        if (!resident(row)) gatedOut += 1;
+        continue;
+      }
       const label = kindLabel[row.kind] || row.kind;
       const sensitivity = row.sensitivity === 'sensitive' ? '敏感·' : '';
       const confidence = row.kind === 'inferred' && row.confidence !== null ? ` ${row.confidence.toFixed(2)}` : '';
@@ -817,11 +867,11 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     if (lines.length) {
       sections.push(
         '## 观察与推断（证据层）',
-        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。',
+        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。常驻项（偏好/习惯/约束/纠正）与话题无关也保留，其余需要线索命中。',
         lines.join('\n'),
         privateHidden ? `（另有 ${privateHidden} 条私密观察未展示）` : '',
         pairs.size ? `（有 ${pairs.size} 对未解矛盾）` : '',
-        gatedOut ? `（${gatedOut} 条与当前话题无关，未展示）` : '',
+        gatedOut ? `（${gatedOut} 条线索不足，未展示）` : '',
         '',
       );
     }
@@ -841,10 +891,8 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     .map(facet => ({ facet, row: portraitRows.get(facet) }))
     .filter(({ row }) => row && row.content.trim())
     .filter(({ facet, row }) => {
-      if (!lastUserText) return true;
-      if (facet === 'identity') return true; // short and always useful for addressing
-      const content = row.content;
-      return tokensOf(content).some(token => userTokens.has(token)) || entitiesOf(content).some(entity => userEntities.has(entity));
+      if (RESIDENT_FACETS.has(facet)) return true; // implicit memory: always in effect
+      return hasCue(row.content); // episodic memory: only with a cue
     });
   if (portraitLines.length) {
     let remaining = portraitBudget;
@@ -1168,6 +1216,33 @@ async function start(ctx, config) {
     const baseline = buildSpeakerBaseline([...rowsById.values()], { excludeSessionId: key });
     speakerBaselineCache.set(key, { size, baseline });
     return baseline;
+  };
+
+  let stopwordCache = { key: '', set: new Set() };
+  /** Tokens that appear in >30% of user messages/observations are treated as stopwords for cue matching. */
+  const stopwordsFor = () => {
+    const key = `${rowsById.size}:${observations.size}`;
+    if (stopwordCache.key === key) return stopwordCache.set;
+    const frequency = new Map();
+    let documents = 0;
+    for (const row of rowsById.values()) {
+      const text = cleanUserText(row.user);
+      if (!text) continue;
+      documents += 1;
+      for (const token of new Set(tokensOf(text))) frequency.set(token, (frequency.get(token) || 0) + 1);
+    }
+    for (const row of observations.values()) {
+      documents += 1;
+      for (const token of new Set(tokensOf(`${row.text} ${(row.alternatives || []).join(' ')}`))) {
+        frequency.set(token, (frequency.get(token) || 0) + 1);
+      }
+    }
+    const set = new Set();
+    if (documents > 20) {
+      for (const [token, count] of frequency) if (count / documents > 0.3) set.add(token);
+    }
+    stopwordCache = { key, set };
+    return set;
   };
 
   const identityReport = sessionId => {
@@ -1691,6 +1766,7 @@ async function start(ctx, config) {
         observations: currentObservations(20),
         observationChars,
         observationBudget,
+        stopwords: stopwordsFor(),
       });
       injection = { chars: text.length, digestCount: digest.filter(row => jaccard([...new Set(tokensOf(lastUserBySession.get(sessionKey) || ''))], [...new Set(tokensOf(String(row.user || ''), row.summary))]) >= 0.06).length };
     }
@@ -1873,15 +1949,15 @@ async function start(ctx, config) {
               updatedAt: at,
             };
             observations.set(correction.id, correction);
-            // Move contradiction links to the correction, so they stay live.
+            // Copy (not move) contradiction links: the original keeps its own history and
+            // regains them if the correction is later deleted.
             for (const peerId of inheritedContradictions) {
               const peer = observations.get(peerId);
               if (!peer) continue;
-              peer.contradicts = [...new Set([...(peer.contradicts || []).filter(id => id !== original.id), correction.id])];
+              peer.contradicts = [...new Set([...(peer.contradicts || []), correction.id])];
               peer.updatedAt = at;
               await persistObservation(peer);
             }
-            original.contradicts = [];
             original.status = 'superseded';
             original.updatedAt = at;
             original.supersededBy = correction.id;
@@ -2189,6 +2265,7 @@ async function start(ctx, config) {
             observations: currentObservations(20),
             observationChars,
             observationBudget,
+            stopwords: stopwordsFor(),
           });
         },
       })

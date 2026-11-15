@@ -1,9 +1,9 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "private": true,
   "type": "module",
-  "description": "Durable long-term memory: evidence-layer observations, portraits, hybrid retrieval with calibrated confidence, gap detection, recycle bin and speaker-continuity evidence",
+  "description": "Durable long-term memory: evidence-layer observations, portraits, layered injection (implicit vs cue-dependent), calibrated retrieval confidence, gap detection, recycle bin and speaker-continuity evidence",
   "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
   "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "eval.mjs", "eval-queries.json", "test.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
