@@ -808,6 +808,7 @@ const recencyWeight = timeIntent ? 1 : 0.3;
     matches: top.map(({ row, score, signals, matchedEntities, reasons, coverage }) => ({
       id: row.id,
       sessionId: row.sessionId,
+      textHash: row.textHash || null,
       workspace: row.workspace || null,
       kind: row.kind || 'episodic',
       time: new Date(row.time).toISOString(),
@@ -2229,21 +2230,29 @@ async function start(ctx, config) {
                   const read = await sessionQuery.readSession(match.sessionId);
                   const events = Array.isArray(read?.events) ? read.events : [];
                   const target = Date.parse(match.time) || 0;
-                  let best = null;
-                  let delta = Infinity;
-                  for (const event of events) {
-                    if (event.type !== 'user/message') continue;
-                    const time = Number(event.time) || 0;
-                    const distance = Math.abs(time - target);
-                    if (distance < delta) { delta = distance; best = event; }
-                  }
-                  if (!best) throw new Error('no user message');
-                  const index = events.indexOf(best);
+                  let userText = '';
                   let assistantText = '';
-                  for (let i = index + 1; i < events.length; i += 1) {
-                    if (events[i].type === 'assistant/message') { assistantText = messageText(events[i].data?.message); break; }
+                  let matched = false;
+                  for (let i = 0; i < events.length; i += 1) {
+                    if (events[i].type !== 'user/message') continue;
+                    const candidateUser = messageText(events[i].data);
+                    let candidateAssistant = '';
+                    for (let j = i + 1; j < events.length; j += 1) {
+                      if (events[j].type === 'assistant/message') { candidateAssistant = messageText(events[j].data?.message); break; }
+                      if (events[j].type === 'user/message') break;
+                    }
+                    if (match.textHash && hashText(`${cleanUserText(candidateUser)}\n${candidateAssistant}`) === match.textHash) {
+                      userText = candidateUser;
+                      assistantText = candidateAssistant;
+                      matched = true;
+                      break;
+                    }
+                    if (!matched) {
+                      const time = Number(events[i].time) || 0;
+                      if (Math.abs(time - target) < 5000) { userText = candidateUser; assistantText = candidateAssistant; }
+                    }
                   }
-                  const userText = messageText(best.data);
+                  if (!userText) throw new Error('no matching user message');
                   match.user = full ? userText : truncate(userText, chars);
                   match.assistant = full ? assistantText : truncate(assistantText, chars);
                   match.sourceAvailable = true;
