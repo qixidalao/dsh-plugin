@@ -38,6 +38,18 @@
 
 这正是预期的保守行为：同一个人的话题换了（这次在聊插件，基线里多是 AIOS/部署），词汇与实体重合自然变低，**风格相似度 0.99** 又支持是同一人 —— 综合成 `uncertain` 而不是武断下结论。判断权留给模型，必要时由模型向你确认。
 
+## v1.12 时间属性与助手画像改造
+
+| 内容 | 实现 | 验证 |
+|---|---|---|
+| P1-2 观察 TTL | `scope` 读取时按 type 派生（旧数据不回写）：`emotional_state` transient 3 天、goal/decision/behavior/inference situational 30 天、偏好/事实/约束 durable；**只停止注入，不删除**，`observations` 仍可查 | 单测：4 天前的情绪观察不再注入但报“已过期”；durable 900 天不失效 |
+| 推断置信度 | `effectiveConfidence = confidence × 0.5^(ageDays/90)`；独立会话每多 1 个 +0.1（上限 +0.2），同一会话重复不增强 | 单测：90 天后减半；2 个会话高于 1 个；重复同一会话不增 |
+| conditional 矛盾 | `contradict conditional=true` 记为“情境相关”，不计入未解矛盾 | 单测：两条 conditional 相互指向时不出现“未解矛盾” |
+| P0 遗留修复 | 常驻层 `sensitive` 检查覆盖 type 分支；线索判定改为**不重叠共享词**（“后台运行”与“后台”都算 1 个词）；常驻观察排在预算前 | 单测：敏感 constraint 需线索；`sharedCueWords` 三条断言；预算只够一行时常驻项优先 |
+| P3-3 助手画像 | `psychology → 工作方式`、`experience → 可核对经验`，内容改为可验证行为并带 `sourceIds`；旧画像导出到 `storages/dynamic_memory/archive/assistant-and-user-portrait-v1.11.md`，facet `history` 保留旧版本可回退 | 注入里显示新标签；`portrait target=assistant includeHistory=true` 可查旧版 |
+
+测试 34 → 41 项；eval 基线不变：正样本 **10/10 MRR 0.883**、负样本误报 **0/8**。
+
 ## v1.11 P0：注入分层与置信度校准
 
 按《人类复杂性模型》升级规范实现 P0 三项（测试 31 → 34，新增 8 条负样本）：

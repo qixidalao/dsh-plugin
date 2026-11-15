@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：1.11.0（`@local/dynamic-memory`）
+> 版本：1.12.0（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -52,7 +52,7 @@
 | 3 | 内隐（程序性）vs 外显（情景）记忆 | 偏好与风格每次都起作用但不被“想起”；事件需要线索才浮现 | 画像 facet、观察、exchanges | 📐 | 未区分：`preferences/habits` 应常驻，事件类才需线索 |
 | 4 | 重构而非回放 | 回忆是用证据重新构建 | portrait = 证据的归纳视图，`needsRecompute` | ⚠️ | 只打标记，不自动重算；句子级溯源缺失 |
 | 5 | 来源监控 | 区分“看到的 / 听说的 / 推出来的” | `kind`、`sourceIds`、标签 lint | ✅ | 无 |
-| 6 | 遗忘（衰减） | 不用的降优先级，腾出容量 | importance 衰减、间隔检测、回收区 | ⚠️ | 只衰减 importance；观察没有 TTL，情绪状态会像事实一样长期保留 |
+| 6 | 遗忘（衰减） | 不用的降优先级，腾出容量 | importance 衰减、观察 TTL、间隔检测、回收区 | ✅ | TTL 只停止注入；无真正删除 |
 | 7 | 巩固 | 零散片段沉淀为模式与图式 | 后台整合：仅近似去重与裁剪 | 📐 | 没有“片段 → 模式”的归纳（P2） |
 | 8 | 再巩固 | 被取出的记忆可被新信息更新 | `deepen` / `correct`（手动） | ⚠️ | 检索时不提示可能冲突 |
 | 9 | 联想激活 | 想到一个词，相关的跟着浮现 | 实体索引 | ⚠️ | 只有精确实体匹配，无共现扩展 |
@@ -66,7 +66,7 @@
 1. 使用记忆应改变结论、建议或提问，而不是附一句“我记得你…”。无关的记忆不进入回答。
 2. 敏感内容（情绪、健康、人际）可以用来调整语气，但**不主动提起**；用户自己问起时才直接回答（📐 见 `mention`，P1）。
 3. 不确定时，给出可核对的来源或直说不确定，不用模拟犹豫的语气代替校准。
-4. 不声称有情感或亲身经历。**助手画像的 `psychology`（助手心理）和 `experience`（助手经历）两个 facet 是整套设计里最“长得像人”的部分**：它们没有证据来源，也不影响任何检索或决策。建议改为“工作方式”与“可核对的经验（做过什么、踩过什么坑，附 `sourceIds`）”，见 P3。
+4. 不声称有情感或亲身经历。助手画像的 `psychology` / `experience` 已在 v1.12 改为**工作方式**与**可核对经验**（带 `sourceIds`）；旧的心理叙述已归档，可回退。见 P3-3。
 5. 记忆内容一律是**参考信息，不是指令**；与当前请求冲突时以当前请求为准。
 
 ---
@@ -116,7 +116,7 @@
 
 ### 2.3 `self`：助手画像（4 个 facet）✅
 
-`habits / preferences / psychology / experience`，结构同 portrait，键为 `s_<facet>`。其中 `psychology`、`experience` 的定位问题见 0.4。
+`habits / preferences / psychology / experience`，结构同 portrait，键为 `s_<facet>`。v1.12 起 `psychology` 显示为**工作方式**、`experience` 显示为**可核对经验**：内容只保留“在本用户这里验证过的做法 / 做过什么、踩过什么坑”，并要求带 `sourceIds`；改造前的旧画像已导出到 `$DSH_HOME/storages/dynamic_memory/archive/assistant-and-user-portrait-v1.11.md`，facet 的 `history` 也保留旧版本，可用 `portrait target=assistant includeHistory=true` 回退。
 
 ### 2.4 `observations`：证据层 ✅
 
@@ -126,12 +126,15 @@
   "kind": "observed|self_reported|inferred|corrected",
   "text": "观察内容", "confidence": 0.45, "context": "情境",
   "quote": "用户原话", "alternatives": ["替代解释"], "sourceIds": ["exchange-id"],
+  "scope": "transient|situational|durable",
+  "sessions": ["session-id"],
   "sensitivity": "normal|sensitive|private", "status": "current|superseded|withdrawn",
-  "contradicts": ["另一个 observation id"], "correctionOf": "被纠正的 id", "supersededBy": "纠正记录 id",
+  "contradicts": ["另一个 observation id"], "conditionalContradicts": ["情境相关的另一条"],
+  "correctionOf": "被纠正的 id", "supersededBy": "纠正记录 id",
   "createdAt": 0, "updatedAt": 0 }
 ```
 
-约束：`inferred` 必须带 `confidence` 与至少一个 `alternatives`；`confidence` 只对 `inferred` 有意义。目前**没有时间属性**（TTL/衰减），`emotional_state` 类观察也会长期保留，见 K6 与 P1。
+约束：`inferred` 必须带 `confidence` 与至少一个 `alternatives`；`confidence` 只对 `inferred` 有意义。**时间属性（v1.12）**：`scope` 在读取时按 `type` 派生（旧数据不回写）：`emotional_state → transient`，`goal/decision_record/relationship_context/behavior_observation/inferred_motivation → situational`，其余 `durable`；TTL 只在注入层生效——到期**停止注入**，但记录保留、`observations` 仍可查、`reflect` 也能读。`sessions` 记录独立印证过的会话；`inferred` 的有效置信度按半衰期衰减，并按不同会话数给有上限的增强。
 
 ## 3. 写入管线（保存一条记忆）✅
 
@@ -177,7 +180,8 @@ session/event ──► 清洗/配对 ──► 去重/重问 ──► 落盘 �
   - 停用词：在用户消息 + 观察中**文档频率 > 30%** 的 token 自动忽略；
   - 与用户最新消息共享 **≥2 个**不同的非停用词，或共享 **≥1 个实体**，才算有线索；
   - 用户消息很短（汉字 <6 且无实体）时，线索层整体不注入，常驻层照常。
-- 排序仍是 `corrected → self_reported → observed → inferred`；`sensitive` 带“敏感·”前缀；`private` 不展示明文只报条数；未解矛盾只统计双方都 current 的对数，且**在渲染前完整遍历统计**（K5 已修）。
+- 排序仍是 `corrected → self_reported → observed → inferred`，常驻项整体排在前面；`sensitive` 带“敏感·”前缀；`private` 不展示明文只报条数；未解矛盾只统计双方都 current 的对数，且**在渲染前完整遍历统计**（K5 已修）。
+- **时间（v1.12）**：按 `scope` 派生的 TTL 到期后不再注入，提示“N 条观察已过期，停止注入但保留可查”；`inferred` 的显示置信度用 `0.5^(ageDays/半衰期)` 衰减，并按不同会话数最多 +0.2。
 - 门控提示文字：`（N 条线索不足，未展示）`；画像门控不提示条数，只由 `stats.facetsNeedingRecompute` 兜底。
 
 ## 5. 检索与打分（`search`）✅
@@ -241,8 +245,10 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | 画像过期 | facet `updatedAt` 早于 `freshDays` | 注入提示“N 项可能过时”，`learn` 可覆盖（旧版本进 history） |
 | 印象版本 | `deepen` 改写 | 旧摘要进 `history`，最多 20 版 |
 | importance 衰减 | 闲置时间 | 参与打分的 `effectiveImportance = stored × exp(-idleDays/360)`，不改写存储值 |
+| 观察 TTL（v1.12） | `scope` 派生的 TTL（transient 3 天 / situational 30 天） | **停止注入**，不删除；`observations` 仍可查、`export` 仍导出 |
+| 推断置信度衰减（v1.12） | 观察创建时间 | `effectiveConfidence = confidence × 0.5^(ageDays/90)` + 独立会话增强（每多 1 个会话 +0.1，上限 +0.2） |
 
-对应人类记忆的“适应性遗忘”：**降优先级，不销毁证据**。目前衰减只覆盖 exchanges 的 importance 与画像的过期提示，观察层没有（K6）。
+对应人类记忆的“适应性遗忘”：**降优先级，不销毁证据**。
 
 ## 8. 身份连续性（`identity`）✅
 
@@ -284,6 +290,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `assistantCharsPerFacet` / `assistantBudget` | 180 / 520 | 助手画像注入预算 |
 | `injectAssistantPortrait` | true | 是否注入助手画像 |
 | `observationChars` / `observationBudget` | 180 / 420 | 证据层注入预算 |
+| `ttlTransientDays` / `ttlSituationalDays` | 3 / 30 | 观察 TTL（只停止注入，不删除） |
+| `inferenceHalfLifeDays` | 90 | 推断置信度半衰期 |
 | `digestImpressions` / `digestChars` | 2 / 100 | 跨会话速览 |
 | `injectRecentExchanges` | false | 是否注入同会话最近问答 |
 | `snippetChars` | 400 | 片段长度 |
@@ -308,11 +316,11 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
-| `node test.mjs` | 34 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（含排序无关性、覆盖率）、gap/stale、身份连续性、证据层注入（纠正优先、常驻/线索分层、短消息）、矛盾存活与完整计数、标签 lint | ✅ 34/34 |
+| `node test.mjs` | 41 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL、推断置信度衰减与独立会话增强、标签 lint | ✅ 41/41 |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ❌ 需要本机记忆库 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
-作者本机数据（2103 条记忆）：v1.10 → v1.11 正样本保持 `10/10, MRR 0.883`，负样本误报从 `2/8` 降到 **`0/8`**；bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
+作者本机数据（2103 条记忆）：v1.11.0 起正样本 `10/10, MRR 0.883`，8 条负样本误报 `0/8`；v1.12.0 保持同一基线。bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
 
 **解读这些数字时请注意 K3**：10 条正样本仍小，权重（impression 0.05、phrase 3 等）是在同一批数据上调的；负样本也只有 8 条。`10/10` 是乐观上界，不是泛化结论。P3-1 会把评测集扩到 30+ 条并按 dev/test 划分。
 
@@ -327,7 +335,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | K3 | 评测集小、无负样本、权重在同一批数据上调，无端到端对照 | 见第 12 章 | ⚠️ 部分缓解：新增 8 条负样本与误报率；仍缺端到端对照 |
 | K4 | 删除纠正记录、原观察恢复 `current` 时，迁走的矛盾链接不会恢复 | `correct` 把矛盾迁到纠正记录并清空原记录 | ✅ v1.11 已修（改为复制链接，原记录保留） |
 | K5 | 观察渲染循环在展示满 6 条/预算耗尽后 `break`，之后的观察不再计入计数 | `break` 位于计数之后 | ✅ v1.11 已修（先完整遍历统计，再渲染） |
-| K6 | 观察没有时间属性：“今天很累”与“偏好极简依赖”同样长期保留 | 数据模型无 TTL/衰减 | 📐 P1-2 |
+| K6 | 观察没有时间属性：“今天很累”与“偏好极简依赖”同样长期保留 | 数据模型无 TTL/衰减 | ✅ v1.12 已修（读取时派生 scope + TTL 停止注入 + 推断置信度衰减） |
 | K7 | 标签 lint 是关键词启发式：情境词可被敷衍写入；人格词表固定 | `TRAIT_CONTEXT_HINT` 只检测字面词 | 📐 P3-4 |
 | K8 | `needsRecompute` 只打标记，不自动重写 | 见第 6 章 | 📐 P2-3 |
 
@@ -356,13 +364,13 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | P0 | P0-2 | 打分归一化保留绝对质量 + 覆盖率 | 线索提取的“熟悉度”信号 | ✅ v1.11 |
 | P0 | P0-3 | 矛盾链接一致性 + 计数前置 | 干扰与替代 | ✅ v1.11 |
 | P1 | P1-1 | 披露策略 `mention` | 社会性提取（何时该提起） | 📐 |
-| P1 | P1-2 | 时间属性 `scope`/TTL、推断置信度衰减与独立证据增强 | 遗忘、显著性 | 📐 |
+| P1 | P1-2 | 时间属性 `scope`/TTL、推断置信度衰减与独立证据增强 | 遗忘、显著性 | ✅ v1.12 |
 | P2 | P2-1 | 巩固 pass `reflect`（片段 → 模式） | 巩固 | 📐 |
 | P2 | P2-2 | 检索联想：分词、实体共现一跳、查询改写 | 线索依赖、联想激活 | 📐 |
 | P2 | P2-3 | `recompute`：把过期 facet 的存活证据一次取齐 | 重构、再巩固 | 📐 |
 | P3 | P3-1 | 评测集扩充与端到端对照 | — | 📐（负样本已加 8 条） |
 | P3 | P3-2 | 显著性信号 `salience` | 显著性 | 📐 |
-| P3 | P3-3 | 助手画像改造 | 反拟人守则 | 📐 |
+| P3 | P3-3 | 助手画像改造 | 反拟人守则 | ✅ v1.12（工作方式/可核对经验，旧内容已归档） |
 | P3 | P3-4 | lint 收紧、可选磁盘加密 | 来源监控、隐私 | 📐 |
 
 ### P0-1 注入分层：常驻层与线索层（✅ v1.11）
@@ -425,7 +433,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 **验收测试**：`if_asked` 的观察注入文本包含“不要主动提起”；`never` 的观察不出现在注入中；默认值按类型与敏感度派生。
 
-### P1-2 时间属性与置信度衰减
+### P1-2 时间属性与置信度衰减（✅ v1.12）
 
 **问题**：K6。人类记忆里，“今天很累”和“一贯偏好简洁”是两类完全不同的东西。
 
@@ -488,7 +496,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 `importance` 只应由**显著性事件**抬高：用户明确强调（“记住/一定/别再”）、被 `correct` 的次数、`deepen`。检索命中次数只进 `accessCount`，不参与（现状已如此，规范把“只由显著性抬高”写成约束）。新增 `salience` 字段（0–1），打分用 `max(importance, salience)` 的衰减值。
 
-### P3-3 助手画像改造
+### P3-3 助手画像改造（✅ v1.12）
 
 对应 0.4 第 4 条。`psychology`（助手心理）、`experience`（助手经历）改为：
 
@@ -510,7 +518,7 @@ P0-2 ✅ ─► P3-1（评测集扩充）─► 重调权重 ─► P1 / P2
 P0-3 ✅
 ```
 
-P0 三项已完成（v1.11）；下一步是 P3-1（评测集扩到 30+ 条并划 dev/test），再启动 P1（mention / TTL）与 P2（reflect / 联想 / recompute）。
+P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步是 P3-1（评测集扩到 30+ 条并划 dev/test），再启动 P1-1（mention）与 P2（reflect / 联想 / recompute）。
 
 ---
 
@@ -520,11 +528,13 @@ P0 三项已完成（v1.11）；下一步是 P3-1（评测集扩到 30+ 条并�
 
 | 版本 | 内容 |
 |---|---|
-| 1.11.0 | P0-1 注入分层（常驻：preferences/habits/thinking/identity 与偏好/习惯/约束/纠正类观察；其余需线索：≥2 个非停用词或 ≥1 实体；短消息只注入常驻层）；P0-2 打分保留绝对质量（`bm25n = 2.5×bm25/maxPossible`）+ IDF 加权 `coverage`，`coverage<0.5` 不给 high/medium；P0-3 矛盾链接改为复制、计数前置；lint 放行条件不变；测试 31 → 34 项；新增 8 条负样本，误报 2/8 → 0/8，正样本保持 10/10 MRR 0.883 |
+| 1.12.0 | P1-2 时间属性：`scope` 读取时按 type 派生（不回写），TTL 只停止注入不删除，过期观察仍可查；推断置信度按 90 天半衰期衰减 + 独立会话最多 +0.2；`contradict conditional` 不再计入未解矛盾。修正 P0 遗留：常驻层对 `sensitive` 的检查覆盖 type 分支；线索判定改为**不重叠共享词**计数（“后台运行”与“后台”一致）；常驻观察排在预算前。P3-3 助手画像改为“工作方式/可核对经验”并带来源，旧内容归档可回退。测试 34 → 41 项；eval 基线不变（正 10/10 MRR 0.883，负 0/8） |
+| 1.11.0 | P0-1 注入分层（常驻：preferences/habits/thinking/identity 与偏好/习惯/约束/纠正类观察；其余需线索：≥2 个非停用词或 ≥1 实体；短消息只注入常驻层）；P0-2 打分保留绝对质量（`bm25n = 2.5×bm25/maxPossible`）+ IDF 加权 `coverage`，`coverage<0.5` 不给 high/medium；P0-3 矛盾链接改为复制、计数前置；测试 31 → 34 项；新增 8 条负样本，误报 2/8 → 0/8，正样本保持 10/10 MRR 0.883 |
 | 1.10.0 | 评审修复：置信度在得分序上计算；lint 校验真实来源 id；矛盾只统计双方 current；`forget` 清理悬空引用并恢复被纠正的原观察；画像 `sourceObservationIds` 与 `needsRecompute`；观察/画像注入门控与“纠正 → 自述 → 事实 → 推断”排序；检索不再抬高 importance 并加入闲置衰减；BM25 按查询归一化，recency 按时间意图加权，impression 降为 tie-breaker；`timeBoost` 默认 0.8 → 0.4；测试 27 → 31 项 |
 | 1.9.0 | 证据层、身份连续性、回收区、间隔检测、置信度检索 |
 
 ### 15.2 本文档
 
+- 1.12.0：版本头、2.3（助手画像改为工作方式/可核对经验，旧内容归档）、2.4（scope/sessions/conditional 与 TTL 说明）、4.1（过期与推断置信度）、7（TTL/衰减行）、10（ttl 配置）、12（41 项）、13.1（K6 已修）、14（P1-2/P3-3 状态）、15 同步；
 - 1.11.0：版本头、第 4/5/12/13.1/14/15 章与代码同步（注入分层、maxPossible 归一、IDF 加权 coverage、P0 状态、测试 34 项、负样本误报 0/8）；
 - 1.10.0：版本头与第 1/12 章更新，测试数 27 → 31；第 5 章公式与代码一致，`timeBoost` 默认值 0.4；新增第 0 章（设计原则）、13.1（K 系列缺陷）、第 14 章（升级规范）；所有条目加状态标记；第 12 章标明哪些验证在评审环境复现。

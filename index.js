@@ -31,6 +31,46 @@ const OBSERVATION_TYPES = [
 ];
 const OBSERVATION_KINDS = ['observed', 'self_reported', 'inferred', 'corrected'];
 const OBSERVATION_STATUS = ['current', 'withdrawn', 'superseded'];
+const OBSERVATION_SCOPES = ['transient', 'situational', 'durable'];
+const DEFAULT_OBSERVATION_SCOPE = {
+  emotional_state: 'transient',
+  goal: 'situational',
+  decision_record: 'situational',
+  relationship_context: 'situational',
+  behavior_observation: 'situational',
+  inferred_motivation: 'situational',
+};
+const SCOPE_TTL_DAYS = { transient: 3, situational: 30, durable: null };
+
+/** Scope is derived on read for legacy observations; nothing is written back. */
+export function scopeOf(row) {
+  if (row && OBSERVATION_SCOPES.includes(row.scope)) return row.scope;
+  return DEFAULT_OBSERVATION_SCOPE[row?.type] || 'durable';
+}
+
+export function ttlDaysOf(row) {
+  const scope = scopeOf(row);
+  return scope === 'durable' ? null : SCOPE_TTL_DAYS[scope];
+}
+
+export function observationExpired(row, now = Date.now(), ttl = SCOPE_TTL_DAYS) {
+  const scope = scopeOf(row);
+  const days = scope === 'durable' ? null : ttl[scope] ?? SCOPE_TTL_DAYS[scope];
+  if (days === null || days === undefined) return false;
+  const lastSeen = Number(row?.updatedAt) || Number(row?.createdAt) || 0;
+  return lastSeen > 0 && now - lastSeen > days * 86400000;
+}
+
+/** Inferred confidence decays with age and gets a bounded boost from independent sessions. */
+export function effectiveObservationConfidence(row, { now = Date.now(), halfLifeDays = 90 } = {}) {
+  if (row?.kind !== 'inferred' || row.confidence === null || row.confidence === undefined) return null;
+  const base = Math.max(0, Math.min(1, Number(row.confidence) || 0));
+  const ageDays = Math.max(0, (now - (Number(row.createdAt) || now)) / 86400000);
+  const decayed = base * 0.5 ** (ageDays / Math.max(1, halfLifeDays));
+  const sessions = Array.isArray(row.sessions) ? new Set(row.sessions).size : 1;
+  const boost = 0.1 * Math.min(2, Math.max(0, sessions - 1));
+  return Math.max(0, Math.min(1, decayed + boost));
+}
 const TRAIT_LABEL_PATTERN = /(懒惰|内向|固执|敏感|焦虑|抑郁|自恋|社恐|讨好型|完美主义|强迫|回避型|依赖型|玻璃心|脾气差|人格|性格)/;
 const TRAIT_CONTEXT_HINT = /(当时|因为|情境|场景|那次|反复|跨情境|context)/;
 /** Trait adjectives are fine only with real evidence or an explicit situation; length is not an excuse. */
@@ -44,8 +84,8 @@ export function lintTraitLabel(text, knownSourceIds = []) {
 const SELF_LABELS = {
   habits: '助手习惯',
   preferences: '助手喜好',
-  psychology: '助手心理',
-  experience: '助手经历',
+  psychology: '工作方式',
+  experience: '可核对经验',
 };
 const ASSISTANT_TARGET = 'assistant';
 const USER_TARGET = 'user';
@@ -155,6 +195,9 @@ const DOMAIN_SPEC = {
             alternatives: Array.isArray(value.alternatives) ? value.alternatives.filter(entry => typeof entry === 'string') : [],
             sourceIds: Array.isArray(value.sourceIds) ? value.sourceIds.filter(entry => typeof entry === 'string') : [],
             contradicts: Array.isArray(value.contradicts) ? value.contradicts.filter(entry => typeof entry === 'string') : [],
+            conditionalContradicts: Array.isArray(value.conditionalContradicts) ? value.conditionalContradicts.filter(entry => typeof entry === 'string') : [],
+            sessions: Array.isArray(value.sessions) ? value.sessions.filter(entry => typeof entry === 'string') : [],
+            scope: OBSERVATION_SCOPES.includes(value.scope) ? value.scope : undefined,
             correctionOf: typeof value.correctionOf === 'string' ? value.correctionOf : null,
             sensitivity: ['normal', 'sensitive', 'private'].includes(value.sensitivity) ? value.sensitivity : 'normal',
             createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
@@ -179,7 +222,7 @@ const TOOL = {
       keywords: { type: 'array', items: { type: 'string' }, description: 'Extra keywords to index under.' },
       limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Max results; defaults to 3 for recent, 10 for search.' },
       allSessions: { type: 'boolean', description: 'For recent: include earlier sessions.' },
-      facet: { type: 'string', enum: [...new Set([...FACETS, ...SELF_FACETS])], description: 'User facets: habits, preferences, thinking, dynamics, psychology, past, identity. Assistant facets (target=assistant): habits, preferences, psychology, experience.' },
+      facet: { type: 'string', enum: [...new Set([...FACETS, ...SELF_FACETS])], description: 'User facets: habits, preferences, thinking, dynamics, psychology, past, identity. Assistant facets (target=assistant): habits, preferences, psychology (=工作方式), experience (=可核对经验).' },
       target: { type: 'string', enum: [USER_TARGET, ASSISTANT_TARGET], description: 'For portrait/learn/forget: whose portrait, user (default) or assistant (this agent).' },
       content: { type: 'string', description: 'For learn: complete consolidated text of that facet, replacing the previous text.' },
       from: { type: 'string', description: 'Search lower time bound, ISO date or epoch ms.' },
@@ -203,6 +246,8 @@ const TOOL = {
       quote: { type: 'string', description: 'For observe: the user\'s exact words when the observation came from a direct quote.' },
       sensitivity: { type: 'string', enum: ['normal', 'sensitive', 'private'], description: 'For observe: how sensitive this observation is; private ones are minimized in injection.' },
       status: { type: 'string', enum: OBSERVATION_STATUS, description: 'For observations: filter by status (current/withdrawn/superseded).' },
+      observationScope: { type: 'string', enum: OBSERVATION_SCOPES, description: 'For observe: transient (emotional state, ~3d), situational (goal/decision/behavior/inference, ~30d) or durable (facts/preferences/constraints). Defaults derive from type; TTL only stops injection, it never deletes.' },
+      conditional: { type: 'boolean', description: 'For contradict: mark the pair as situationally conflicting (different contexts), so it is not counted as an unresolved contradiction.' },
       full: { type: 'boolean', description: 'Search/recent: return complete user and assistant paragraphs instead of snippets.' },
       snippetChars: { type: 'integer', minimum: 80, maximum: 4000, description: 'Snippet length for compact results.' },
     },
@@ -790,26 +835,52 @@ const RESIDENT_FACETS = new Set(['preferences', 'habits', 'thinking', 'identity'
 const RESIDENT_OBSERVATION_TYPES = new Set(['explicit_preference', 'habit_pattern', 'constraint', 'correction']);
 const CUE_ONLY_TYPES = new Set(['emotional_state', 'relationship_context']);
 
-export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords }) {
+/**
+ * Count shared *words* (not overlapping bigrams): a 3+ character shared Chinese word
+ * counts once, like a 2-character one. This keeps the cue rule consistent.
+ */
+export function sharedCueWords(text, userText, stopwords = new Set()) {
+  const source = String(text || '');
+  const user = String(userText || '');
+  if (!source || !user) return 0;
+  let count = 0;
+  for (const run of source.match(/[\u3400-\u9fff]+/g) || []) {
+    if (run.length < 2) continue;
+    const shared = [];
+    for (let index = 0; index + 2 <= run.length; index += 1) {
+      const bigram = run.slice(index, index + 2);
+      shared.push(user.includes(bigram) && !stopwords.has(bigram));
+    }
+    // Merge adjacent shared bigrams into one word ("后台运行" => one word, not two).
+    let runLength = 0;
+    for (const isShared of shared) {
+      if (isShared) runLength += 1;
+      else if (runLength) {
+        count += 1;
+        runLength = 0;
+      }
+    }
+    if (runLength) count += 1;
+  }
+  for (const word of source.match(/[a-z0-9_]{2,}/gi) || []) {
+    if (new RegExp(`(^|[^a-z0-9_])${word.toLowerCase()}([^a-z0-9_]|$)`, 'i').test(user)) count += 1;
+  }
+  return count;
+}
+
+export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords, ttl, halfLifeDays, now }) {
   const sections = [];
   const userTokens = new Set(tokensOf(lastUserText || ''));
   const userEntities = new Set(entitiesOf(lastUserText || ''));
   const stopSet = stopwords instanceof Set ? stopwords : new Set();
   const chineseChars = (String(lastUserText || '').match(/[\u3400-\u9fff]/g) || []).length;
   const shortMessage = Boolean(lastUserText) && chineseChars < 6 && userEntities.size === 0;
-  // Cue test: at least 2 shared non-stopword tokens, or one shared entity.
+  // Cue test: at least 2 shared non-stopword words (non-overlapping), or one shared entity.
   const hasCue = text => {
     if (!text) return false;
     if (!lastUserText) return true;
     if (shortMessage) return false;
-    let shared = 0;
-    const seen = new Set();
-    for (const token of tokensOf(text)) {
-      if (seen.has(token) || !userTokens.has(token) || stopSet.has(token)) continue;
-      seen.add(token);
-      shared += 1;
-      if (shared >= 2) return true;
-    }
+    if (sharedCueWords(text, lastUserText, stopSet) >= 2) return true;
     return entitiesOf(text).some(entity => userEntities.has(entity));
   };
   if (gap && gap.gapDays !== null && gap.gapDays >= (gapDays || DEFAULT_GAP_DAYS)) {
@@ -820,15 +891,25 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     );
   }
   const obs = Array.isArray(observations) ? observations.filter(row => row && row.status === 'current') : [];
-  if (obs.length) {
+  const clock = Number.isFinite(now) ? now : Date.now();
+  const ttlConfig = ttl || SCOPE_TTL_DAYS;
+  const active = obs.filter(row => !observationExpired(row, clock, ttlConfig));
+  const expiredHidden = obs.length - active.length;
+  if (active.length || expiredHidden) {
     const kindLabel = { observed: '事实', self_reported: '自述', inferred: '推断', corrected: '纠正' };
     const kindOrder = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
-    const ordered = [...obs].sort((left, right) => (kindOrder[left.kind] ?? 4) - (kindOrder[right.kind] ?? 4) || right.updatedAt - left.updatedAt);
-    const obsById = new Map(obs.map(row => [row.id, row]));
-    const resident = row =>
-      row.kind === 'corrected'
-      || RESIDENT_OBSERVATION_TYPES.has(row.type)
-      || (row.kind === 'self_reported' && !CUE_ONLY_TYPES.has(row.type) && row.sensitivity !== 'sensitive' && row.sensitivity !== 'private');
+    const resident = row => {
+      if (row.kind === 'corrected') return true; // user's own correction always wins
+      if (row.sensitivity === 'sensitive' || row.sensitivity === 'private') return false; // needs a cue
+      if (RESIDENT_OBSERVATION_TYPES.has(row.type)) return true;
+      return row.kind === 'self_reported' && !CUE_ONLY_TYPES.has(row.type);
+    };
+    // Residents first, so a cue-layer observation cannot push an implicit preference out of budget.
+    const ordered = [...active].sort((left, right) =>
+      (resident(left) ? 0 : 1) - (resident(right) ? 0 : 1)
+      || (kindOrder[left.kind] ?? 4) - (kindOrder[right.kind] ?? 4)
+      || right.updatedAt - left.updatedAt);
+    const obsById = new Map(active.map(row => [row.id, row]));
     const relevant = row => {
       if (resident(row)) return true; // implicit memory: applies regardless of topic
       return hasCue(`${row.text} ${(row.alternatives || []).join(' ')}`);
@@ -858,18 +939,20 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
       }
       const label = kindLabel[row.kind] || row.kind;
       const sensitivity = row.sensitivity === 'sensitive' ? '敏感·' : '';
-      const confidence = row.kind === 'inferred' && row.confidence !== null ? ` ${row.confidence.toFixed(2)}` : '';
+      const effective = row.kind === 'inferred' ? effectiveObservationConfidence(row, { now: clock, halfLifeDays }) : null;
+      const confidence = effective !== null ? ` ${effective.toFixed(2)}` : '';
       const alternatives = row.alternatives?.length ? `（也可能：${row.alternatives.slice(0, 2).join('、')}）` : '';
       const line = `- ${sensitivity}${label}${confidence}：${truncate(row.text, observationChars)}${alternatives}`;
       lines.push(line);
       remaining -= line.length + 1;
     }
-    if (lines.length) {
+    if (lines.length || expiredHidden) {
       sections.push(
         '## 观察与推断（证据层）',
-        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。常驻项（偏好/习惯/约束/纠正）与话题无关也保留，其余需要线索命中。',
+        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。常驻项（偏好/习惯/约束/纠正）与话题无关也保留，其余需要线索命中；过期观察只停止注入，仍可用 observations 查看。',
         lines.join('\n'),
         privateHidden ? `（另有 ${privateHidden} 条私密观察未展示）` : '',
+        expiredHidden ? `（${expiredHidden} 条观察已过期，停止注入但保留可查）` : '',
         pairs.size ? `（有 ${pairs.size} 对未解矛盾）` : '',
         gatedOut ? `（${gatedOut} 条线索不足，未展示）` : '',
         '',
@@ -932,7 +1015,7 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     if (rendered.length) {
       sections.push(
         '## 助手画像（自查）',
-        '这是你自己长期形成的工作习惯、偏好、心理与经历沉淀，用于保持行为一致；有新素材时用 learn target=assistant 更新。',
+        '这是你自己在本用户这里验证过的工作方式与可核对经验，用于保持行为一致；它不含没有来源的心理叙述。有新证据时用 learn target=assistant 更新（带 sourceIds）。',
         rendered.join('\n'),
         '',
       );
@@ -967,7 +1050,7 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   }
   if (!sections.length) return '';
   sections.push(
-    '同会话历史已在对话里；需要更早细节、跨会话内容或某条结论的来源时，用 `dynamic_memory` 的 search / portrait / entities / recent。search 默认返回证据片段与置信度，需要原文时加 full=true。发现长期习惯/喜好/思维/身份信息用 learn（用户画像）；自己的习惯/偏好/心理/经历有沉淀时用 learn target=assistant（助手画像）；值得记住的任务用 deepen 存印象。',
+    '同会话历史已在对话里；需要更早细节、跨会话内容或某条结论的来源时，用 `dynamic_memory` 的 search / portrait / entities / recent。search 默认返回证据片段与置信度，需要原文时加 full=true。发现长期习惯/喜好/思维/身份信息用 learn（用户画像）；自己的工作方式/可核对经验有沉淀时用 learn target=assistant（助手画像）；值得记住的任务用 deepen 存印象。',
   );
   return sections.join('\n');
 }
@@ -1002,6 +1085,12 @@ async function start(ctx, config) {
   const defaultScope = config.scope === 'all' ? 'all' : 'workspace';
   const observationBudget = Math.max(80, Math.min(2000, Number(config.observationBudget) || 420));
   const observationChars = Math.max(60, Math.min(600, Number(config.observationChars) || 180));
+  const ttlConfig = {
+    transient: Math.max(0.1, Number(config.ttlTransientDays) || SCOPE_TTL_DAYS.transient),
+    situational: Math.max(1, Number(config.ttlSituationalDays) || SCOPE_TTL_DAYS.situational),
+    durable: null,
+  };
+  const inferenceHalfLifeDays = Math.max(1, Number(config.inferenceHalfLifeDays) || 90);
   const archiveAfterDays = Math.max(7, Math.min(36500, Number(config.archiveAfterDays) || DEFAULT_ARCHIVE_AFTER_DAYS));
   const gapDays = Math.max(1, Math.min(36500, Number(config.gapDays) || DEFAULT_GAP_DAYS));
   const freshDays = Math.max(1, Math.min(36500, Number(config.freshDays) || DEFAULT_FRESH_DAYS));
@@ -1147,6 +1236,11 @@ async function start(ctx, config) {
         row.updatedAt = Date.now();
         await persistObservation(row);
       }
+      if (Array.isArray(row.conditionalContradicts) && row.conditionalContradicts.includes(id)) {
+        row.conditionalContradicts = row.conditionalContradicts.filter(peer => peer !== id);
+        row.updatedAt = Date.now();
+        await persistObservation(row);
+      }
       if (row.correctionOf === id) {
         row.correctionOf = null;
         row.updatedAt = Date.now();
@@ -1155,7 +1249,7 @@ async function start(ctx, config) {
     }
     await markFacetsStale(id);
   };
-  const addObservation = async (args, kind) => {
+  const addObservation = async (args, kind, sessionId) => {
     const at = Date.now();
     const row = {
       id: uuid(),
@@ -1168,6 +1262,9 @@ async function start(ctx, config) {
       alternatives: Array.isArray(args.alternatives) ? args.alternatives.filter(entry => typeof entry === 'string') : [],
       sourceIds: Array.isArray(args.sourceIds) ? args.sourceIds : [],
       contradicts: [],
+      conditionalContradicts: [],
+      sessions: sessionId ? [String(sessionId)] : [],
+      scope: OBSERVATION_SCOPES.includes(args.observationScope) ? args.observationScope : undefined,
       correctionOf: null,
       sensitivity: ['normal', 'sensitive', 'private'].includes(args.sensitivity) ? args.sensitivity : 'normal',
       status: 'current',
@@ -1767,6 +1864,9 @@ async function start(ctx, config) {
         observationChars,
         observationBudget,
         stopwords: stopwordsFor(),
+        ttl: ttlConfig,
+        halfLifeDays: inferenceHalfLifeDays,
+        now: Date.now(),
       });
       injection = { chars: text.length, digestCount: digest.filter(row => jaccard([...new Set(tokensOf(lastUserBySession.get(sessionKey) || ''))], [...new Set(tokensOf(String(row.user || ''), row.summary))]) >= 0.06).length };
     }
@@ -1791,6 +1891,8 @@ async function start(ctx, config) {
         inferred: [...observations.values()].filter(row => row.kind === 'inferred').length,
         corrections: [...observations.values()].filter(row => row.kind === 'corrected').length,
         contradictions: [...observations.values()].filter(row => (row.contradicts || []).length).length,
+        conditional: [...observations.values()].filter(row => (row.conditionalContradicts || []).length).length,
+        expired: [...observations.values()].filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
       },
       portraitFacets: [...portrait.values()].filter(row => row.content.trim()).length,
       assistantFacets: [...selfPortrait.values()].filter(row => row.content.trim()).length,
@@ -1911,13 +2013,14 @@ async function start(ctx, config) {
             if (epistemic === 'inferred' && !Number.isFinite(args.confidence)) {
               return { error: 'inferred observations need an approximate confidence (0-1)' };
             }
-            const row = await addObservation({ ...args, content: text }, epistemic);
+            const row = await addObservation({ ...args, content: text }, epistemic, key);
             const knownSources = (args.sourceIds || []).filter(id => rowsById.has(id) || observations.has(id));
             const lint = lintTraitLabel(text, knownSources);
             return {
               id: row.id,
               type: row.type,
               kind: row.kind,
+              scope: scopeOf(row),
               status: row.status,
               confidence: row.confidence,
               ...(lint ? { warning: lint } : {}),
@@ -1942,6 +2045,9 @@ async function start(ctx, config) {
               alternatives: [],
               sourceIds: Array.isArray(args.sourceIds) ? args.sourceIds : [],
               contradicts: inheritedContradictions,
+              conditionalContradicts: [],
+              sessions: [...new Set([...(original.sessions || []), key])],
+              scope: original.scope,
               correctionOf: original.id,
               sensitivity: original.sensitivity,
               status: 'current',
@@ -1976,13 +2082,21 @@ async function start(ctx, config) {
             const [left, right] = pair.map(id => observations.get(id));
             if (!left || !right) return { error: 'contradict needs two existing observation ids.' };
             const at = Date.now();
-            left.contradicts = [...new Set([...(left.contradicts || []), right.id])];
-            right.contradicts = [...new Set([...(right.contradicts || []), left.id])];
+            const conditional = args.conditional === true;
+            const field = conditional ? 'conditionalContradicts' : 'contradicts';
+            left[field] = [...new Set([...(left[field] || []), right.id])];
+            right[field] = [...new Set([...(right[field] || []), left.id])];
             left.updatedAt = at;
             right.updatedAt = at;
             await persistObservation(left);
             await persistObservation(right);
-            return { linked: [left.id, right.id], note: 'Contradictions are kept, not resolved. Ask the user which holds now.' };
+            return {
+              linked: [left.id, right.id],
+              conditional,
+              note: conditional
+                ? 'Marked as situationally different (different contexts), so it is not counted as an unresolved contradiction.'
+                : 'Contradictions are kept, not resolved. Ask the user which holds now.',
+            };
           }
           if (action === 'observations') {
             const status = OBSERVATION_STATUS.includes(args.status) ? args.status : 'current';
@@ -1997,13 +2111,18 @@ async function start(ctx, config) {
                 type: row.type,
                 kind: row.kind,
                 text: row.text,
+                scope: scopeOf(row),
+                expired: observationExpired(row, Date.now(), ttlConfig),
                 confidence: row.confidence,
+                effectiveConfidence: effectiveObservationConfidence(row, { halfLifeDays: inferenceHalfLifeDays }),
+                sessions: Array.isArray(row.sessions) ? new Set(row.sessions).size : 0,
                 context: row.context,
                 alternatives: row.alternatives,
                 sensitivity: row.sensitivity,
                 status: row.status,
                 updatedAt: new Date(row.updatedAt).toISOString(),
                 contradicts: row.contradicts,
+                conditionalContradicts: row.conditionalContradicts || [],
                 correctionOf: row.correctionOf,
               }));
             return { status, total: [...observations.values()].filter(row => row.status === status).length, observations: list };
@@ -2266,6 +2385,9 @@ async function start(ctx, config) {
             observationChars,
             observationBudget,
             stopwords: stopwordsFor(),
+            ttl: ttlConfig,
+            halfLifeDays: inferenceHalfLifeDays,
+            now: Date.now(),
           });
         },
       })

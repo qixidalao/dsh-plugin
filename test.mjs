@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -387,6 +387,42 @@ check('observations: unrelated ones are gated out of injection', () => {
   assert.ok(!unrelated.includes('用户可能压力很大'), unrelated.slice(0, 120));
 });
 
+check('injection layering: sensitive residents need a cue', () => {
+  const base = {
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '帮我写个排序函数',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+  };
+  const sensitiveConstraint = { id: 's', kind: 'self_reported', type: 'constraint', text: '用户有健康方面的限制', status: 'current', confidence: null, alternatives: [], sensitivity: 'sensitive', contradicts: [] };
+  const text = renderContext({ ...base, observations: [sensitiveConstraint] });
+  assert.ok(!text.includes('用户有健康方面的限制'), text.slice(0, 160));
+  const withCue = renderContext({ ...base, lastUserText: '健康 方面 限制 需要注意什么', observations: [sensitiveConstraint] });
+  assert.ok(withCue.includes('用户有健康方面的限制'), withCue.slice(0, 200));
+});
+
+check('cue: shared words are counted without overlapping-bigram inflation', () => {
+  assert.equal(sharedCueWords('后台运行总是被杀', '后台运行'), 1);
+  assert.equal(sharedCueWords('后台总是被杀', '后台'), 1);
+  assert.equal(sharedCueWords('后台进程和运行日志', '后台运行'), 2);
+});
+
+check('injection layering: resident observations render before cue ones', () => {
+  const text = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '后台运行总是被杀，帮我看看',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: [
+      { id: 'cue', kind: 'inferred', type: 'inferred_motivation', text: '线索推断：后台运行可能被限制', status: 'current', confidence: 0.4, alternatives: ['备选'], sensitivity: 'normal', contradicts: [] },
+      { id: 'res', kind: 'self_reported', type: 'explicit_preference', text: '常驻偏好', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [] },
+    ],
+    observationChars: 60, observationBudget: 80,
+  });
+  assert.ok(text.includes('常驻偏好'), text.slice(0, 200));
+  assert.ok(!text.includes('线索自述'), 'cue item should not take the budget slot');
+});
+
 check('injection layering: resident preferences survive a one-word message', () => {
   const portrait = new Map([
     ['preferences', { facet: 'preferences', content: '回答要简短，先给结论', keywords: [], history: [], sourceExchangeIds: [] }],
@@ -420,6 +456,55 @@ check('scoring: absolute match quality lowers confidence for weak matches', () =
   assert.ok(strong.confidence.score > weak.confidence.score, `${strong.confidence.score} vs ${weak.confidence.score}`);
   assert.notEqual(weak.confidence.label, 'high', `weak label=${weak.confidence.label}`);
   assert.ok(strong.matches[0].coverage >= weak.matches[0].coverage);
+});
+
+check('scope: derived on read, TTL only stops injection', () => {
+  assert.equal(scopeOf({ type: 'emotional_state' }), 'transient');
+  assert.equal(scopeOf({ type: 'goal' }), 'situational');
+  assert.equal(scopeOf({ type: 'explicit_fact' }), 'durable');
+  assert.equal(scopeOf({ type: 'emotional_state', scope: 'durable' }), 'durable');
+  const now = Date.now();
+  assert.ok(observationExpired({ type: 'emotional_state', createdAt: now - 4 * 86400000 }, now));
+  assert.ok(!observationExpired({ type: 'emotional_state', createdAt: now - 1 * 86400000 }, now));
+  assert.ok(!observationExpired({ type: 'explicit_fact', createdAt: now - 900 * 86400000 }, now));
+});
+
+check('inferred confidence: decays with age, boosted by independent sessions', () => {
+  const now = Date.now();
+  const fresh = { kind: 'inferred', confidence: 1, createdAt: now, sessions: ['s1'] };
+  const old = { kind: 'inferred', confidence: 1, createdAt: now - 90 * 86400000, sessions: ['s1'] };
+  const confirmed = { kind: 'inferred', confidence: 1, createdAt: now - 90 * 86400000, sessions: ['s1', 's2'] };
+  assert.ok(Math.abs(effectiveObservationConfidence(fresh, { now }) - 1) < 0.01);
+  assert.ok(Math.abs(effectiveObservationConfidence(old, { now }) - 0.5) < 0.01);
+  assert.ok(effectiveObservationConfidence(confirmed, { now }) > effectiveObservationConfidence(old, { now }));
+  assert.equal(effectiveObservationConfidence({ kind: 'observed', confidence: 1 }, { now }), null);
+  assert.equal(effectiveObservationConfidence({ kind: 'inferred', confidence: 1, createdAt: now, sessions: ['s1', 's1'] }, { now }), 1);
+});
+
+check('injection: expired observations are not injected but reported', () => {
+  const old = { id: 'old', kind: 'inferred', type: 'emotional_state', text: '今天很累', status: 'current', confidence: 0.6, alternatives: ['只是忙'], sensitivity: 'normal', contradicts: [], createdAt: Date.now() - 5 * 86400000 };
+  const text = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: [old], observationChars: 120, observationBudget: 300,
+  });
+  assert.ok(!text.includes('今天很累'), text.slice(0, 160));
+  assert.ok(text.includes('已过期'), text.slice(0, 200));
+});
+
+check('injection: conditional differences are not unresolved contradictions', () => {
+  const base = {
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+  };
+  const left = { id: 'a', kind: 'observed', type: 'behavior_observation', text: '在家很安静', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [], conditionalContradicts: ['b'] };
+  const right = { id: 'b', kind: 'observed', type: 'behavior_observation', text: '在公司话很多', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [], conditionalContradicts: ['a'] };
+  const text = renderContext({ ...base, observations: [left, right] });
+  assert.ok(!text.includes('未解矛盾'), text.slice(0, 160));
 });
 
 check('contradictions: counts are complete even when the display budget truncates', () => {
