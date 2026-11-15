@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -508,6 +508,20 @@ check('inferred confidence: decays with age, boosted by independent sessions', (
   assert.ok(effectiveObservationConfidence(confirmed, { now }) > effectiveObservationConfidence(old, { now }));
   assert.equal(effectiveObservationConfidence({ kind: 'observed', confidence: 1 }, { now }), null);
   assert.equal(effectiveObservationConfidence({ kind: 'inferred', confidence: 1, createdAt: now, sessions: ['s1', 's1'] }, { now }), 1);
+});
+
+check('inferred confidence: rehearsal resets the decay anchor', () => {
+  const now = Date.now();
+  const rehearsed = { kind: 'inferred', confidence: 0.6, createdAt: now - 365 * 86400000, lastCorroboratedAt: now - 1 * 86400000, sessions: ['s1', 's2'] };
+  const stale = { kind: 'inferred', confidence: 0.6, createdAt: now - 365 * 86400000, lastCorroboratedAt: now - 365 * 86400000, sessions: ['s1'] };
+  assert.ok(effectiveObservationConfidence(rehearsed, { now }) > 0.55, String(effectiveObservationConfidence(rehearsed, { now })));
+  assert.ok(effectiveObservationConfidence(stale, { now }) < 0.05, String(effectiveObservationConfidence(stale, { now })));
+});
+
+check('corroboration: quote must exist in this session and be long enough', () => {
+  assert.equal(findQuoteInTexts('容易 自我 强化', ['这对应人类记忆里的来源混淆：容易自我强化']), true);
+  assert.equal(findQuoteInTexts('不存在的引文', ['完全无关的文本']), false);
+  assert.equal(findQuoteInTexts('短', ['短']), false);
 });
 
 check('injection: expired observations are not injected but reported', () => {

@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：1.12.1（`@local/dynamic-memory`）
+> 版本：1.12.2（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -116,7 +116,7 @@
 
 ### 2.3 `self`：助手画像（4 个 facet）✅
 
-`habits / preferences / psychology / experience`，结构同 portrait，键为 `s_<facet>`。v1.12 起 `psychology` 显示为**工作方式**、`experience` 显示为**可核对经验**：内容只保留“在本用户这里验证过的做法 / 做过什么、踩过什么坑”，并要求带 `sourceIds`；改造前的旧画像已导出到 `$DSH_HOME/storages/dynamic_memory/archive/assistant-and-user-portrait-v1.11.md`，facet 的 `history` 也保留旧版本，可用 `portrait target=assistant includeHistory=true` 回退。
+`habits / preferences / psychology / experience`，结构同 portrait，键为 `s_<facet>`。v1.12 起 `psychology` 显示为**工作方式**、`experience` 显示为**可核对经验**（**facet 键名为了兼容没有改**，排查时注意键与显示标签的差异）：内容只保留“在本用户这里验证过的做法 / 做过什么、踩过什么坑”，并要求带 `sourceIds`；“助手喜好”只放助手侧的产出约定，不再重复用户偏好（中文/结论先行等留在用户画像里，避免两边各自漂移）。改造前的旧画像已导出到 `$DSH_HOME/storages/dynamic_memory/archive/assistant-and-user-portrait-v1.11.md`，facet 的 `history` 也保留旧版本，可用 `portrait target=assistant includeHistory=true` 回退。
 
 ### 2.4 `observations`：证据层 ✅
 
@@ -135,7 +135,7 @@
   "createdAt": 0, "updatedAt": 0 }
 ```
 
-约束：`inferred` 必须带 `confidence` 与至少一个 `alternatives`；`confidence` 只对 `inferred` 有意义。**时间属性（v1.12）**：`scope` 在读取时按 `type` 派生（旧数据不回写）：`emotional_state → transient`，`goal/decision_record/relationship_context/behavior_observation/inferred_motivation → situational`，其余 `durable`；TTL 只在注入层生效——到期**停止注入**，但记录保留、`observations` 仍可查、`reflect` 也能读。`sessions` 记录独立印证过的会话；`inferred` 的有效置信度按半衰期衰减，并按不同会话数给有上限的增强。
+约束：`inferred` 必须带 `confidence` 与至少一个 `alternatives`；`confidence` 只对 `inferred` 有意义。**时间属性（v1.12）**：`scope` 在读取时按 `type` 派生（旧数据不回写）：`emotional_state → transient`，`goal/decision_record/relationship_context/behavior_observation/inferred_motivation → situational`，其余 `durable`；TTL 只在注入层生效——到期**停止注入**，但记录保留、`observations` 仍可查、`reflect` 也能读。TTL 与推断衰减的锚点是 **`lastCorroboratedAt`**（v1.12.2），只有创建和独立会话印证会更新它。`sessions` 记录独立印证过的会话；独立印证必须通过 `observe corroborates=<id> quote=<当前用户消息里的原文>` 提供**可校验引文**，否则拒绝（防止模型看到自己的推断后自我强化）。引文先在本会话已提交的用户消息里查，找不到时回退到会话日志（`sessionQuery.readSession`）再校验。`inferred` 的有效置信度按锚点起算的半衰期衰减，并按不同会话数给有上限的增强。
 
 ## 3. 写入管线（保存一条记忆）✅
 
@@ -182,7 +182,7 @@ session/event ──► 清洗/配对 ──► 去重/重问 ──► 落盘 �
   - 与用户最新消息共享 **≥2 个**不同的非停用词，或共享 **≥1 个实体**，才算有线索；
   - 用户消息很短（汉字 <6 且无实体）时，线索层整体不注入，常驻层照常。
 - 排序仍是 `corrected → self_reported → observed → inferred`，常驻项整体排在前面；`sensitive` 带“敏感·”前缀；`private` 不展示明文只报条数；未解矛盾只统计双方都 current 的对数，且**在渲染前完整遍历统计**（K5 已修）。
-- **时间（v1.12）**：按 `scope` 派生的 TTL 到期后不再注入，提示“N 条观察已过期，停止注入但保留可查”；TTL 锚点是 `lastCorroboratedAt`，**无关编辑不续期**，只有独立会话 `corroborates` 印证会续期并给有上限的置信度增强；`inferred` 的显示置信度用 `0.5^(ageDays/半衰期)` 衰减。
+- **时间（v1.12）**：按 `scope` 派生的 TTL 到期后不再注入，提示“N 条观察已过期，停止注入但保留可查”；TTL 锚点是 `lastCorroboratedAt`，**无关编辑不续期**，只有带可校验 `quote` 的独立会话印证会续期并给有上限的置信度增强；`inferred` 的显示置信度从同一锚点起算 `0.5^(ageDays/半衰期)` 衰减。
 - 门控提示文字：`（N 条线索不足，未展示）`；画像门控不提示条数，只由 `stats.facetsNeedingRecompute` 兜底。
 
 ## 5. 检索与打分（`search`）✅
@@ -235,6 +235,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 - ✅ **纠正优先**：`correct id=... content=...` 把原观察置为 `superseded`，新建 `kind=corrected` 的当前观察（只能纠正 `current` 状态的观察）；原始记录保留可追溯。`forget` 删除纠正记录时，原观察恢复 `current`，并清理 `supersededBy / correctionOf / contradicts` 的悬空引用。已知小缺陷：恢复时原观察此前的矛盾链接已在 `correct` 时迁走，不会回来（K4）。
 - ✅ **隐私分级**：`sensitivity=private` 的观察不注入明文、不导出，只显示条数；`forget` 可按 id 删除观察。
 - ✅ **用户控制**：`observations` 可列出当前/历史观察，`forget` 可删除，`export` 可导出（私密项不导出）。
+- ✅ **用户心理 facet 需来源**（v1.12.2）：`learn target=user facet=psychology` 必须带至少一个真实存在的 `sourceObservationIds`，否则拒绝——心理归纳不能没有证据。
+- 📐 **评测集**：`eval-drafts.md` 是 P3-1 的 20 条草稿（10 正 + 10 负），待评审改写、grep 复核负样本后拆分 dev/test 并冻结。
 
 ## 7. 时间维度：间隔、过期、回收区 ✅
 
@@ -317,7 +319,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
-| `node test.mjs` | 43 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL（无关编辑不续期）、独立印证、推断置信度衰减与增强、标签 lint | ✅ 43/43 |
+| `node test.mjs` | 45 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL（无关编辑不续期）、印证引文校验、推断置信度衰减与复习重置、标签 lint | ✅ 45/45 |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ❌ 需要本机记忆库 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
@@ -342,6 +344,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | K9 | TTL 会被无关操作续期：`contradict`/`correct`/删除清理都刷新 `updatedAt`，而过期判定曾以它为准 | 构造 10 天前的 `emotional_state`，把 `updatedAt` 改成 1 天前即不再过期 | ✅ v1.12.1 已修（新增 `lastCorroboratedAt`，只有创建与独立会话印证会更新） |
 | K10 | 独立会话增强是死代码；`correct` 记录 scope 写成 `original.scope`（通常 undefined）→ 派生成 durable，短期纠正永久化 | 代码里只有创建与 `correct` 往 `sessions` 加元素；纠正 `emotional_state` 后 400 天不过期 | ✅ v1.12.1 已修（`observe corroborates=<id>` 显式印证；纠正用 `scopeOf(original)`） |
 | K11 | `observe` 忽略 `observationType` 参数，所有观察都落成 `behavior_observation` → scope 派生跟着错 | `emotional_state` 观察返回 `scope: situational` | ✅ v1.12.1 已修（`addObservation` 读 `observationType`） |
+| K12 | 印证入口不要求证据：模型看到注入的推断后随手 `corroborates` 就能续期/加分（来源混淆） | 代码只检查 id、状态、会话不同 | ✅ v1.12.2 已修（必须带 `quote`，插件在当前会话用户消息里子串校验） |
+| K13 | 推断置信度衰减从 `createdAt` 起算，复习过也不重置遗忘曲线 | 365 天前创建、1 天内仍被印证 → 有效置信度 0.036+0.2=0.24 | ✅ v1.12.2 已修（锚点改为 `lastCorroboratedAt`） |
 
 ### 13.2 设计取舍（有意为之）
 
@@ -368,7 +372,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | P0 | P0-2 | 打分归一化保留绝对质量 + 覆盖率 | 线索提取的“熟悉度”信号 | ✅ v1.11 |
 | P0 | P0-3 | 矛盾链接一致性 + 计数前置 | 干扰与替代 | ✅ v1.11 |
 | P1 | P1-1 | 披露策略 `mention` | 社会性提取（何时该提起） | 📐 |
-| P1 | P1-2 | 时间属性 `scope`/TTL、推断置信度衰减与独立证据增强 | 遗忘、显著性 | ✅ v1.12 / v1.12.1 修 TTL 续期与印证入口 |
+| P1 | P1-2 | 时间属性 `scope`/TTL、推断置信度衰减与独立证据增强 | 遗忘、显著性 | ✅ v1.12 / v1.12.1 / v1.12.2（引文校验 + 复习锚点） |
 | P2 | P2-1 | 巩固 pass `reflect`（片段 → 模式） | 巩固 | 📐 |
 | P2 | P2-2 | 检索联想：分词、实体共现一跳、查询改写 | 线索依赖、联想激活 | 📐 |
 | P2 | P2-3 | `recompute`：把过期 facet 的存活证据一次取齐 | 重构、再巩固 | 📐 |
@@ -532,6 +536,7 @@ P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步�
 
 | 版本 | 内容 |
 |---|---|
+| 1.12.2 | 补印证入口两个缺口：`corroborates` 必须带 `quote`，插件在当前会话用户消息里做子串校验（防止模型看到自己的推断后自我强化）；推断置信度与 TTL 的衰减锚点改为 `lastCorroboratedAt`（复习重置遗忘曲线）；`learn target=user facet=psychology` 必须带 `sourceObservationIds`；助手“喜好”去重（只留助手侧产出约定，用户偏好在用户画像）；新增 `eval-drafts.md`（20 条评测草稿，待评审改写）。测试 43 → 45 |
 | 1.12.1 | 修复 P1-2 三个实测缺陷：TTL 锚点改为 `lastCorroboratedAt`（无关编辑不续期，只有独立会话印证续期）；新增 `observe corroborates=<id>` 作为显式印证入口（同会话 no-op，不同会话给有上限的置信度增强）；`correct` 用 `scopeOf(original)` 继承派生 scope，短期观察的纠正不再永久化；`observe` 修正忽略 `observationType` 导致全部落成 `behavior_observation`；常驻判断对敏感项的豁免收紧（敏感纠正也需线索）。测试 41 → 43；运行时验证：10 天前的 `emotional_state` 编辑 `updatedAt` 后仍判过期，`corroborates` 使置信度 0.447 → 0.547，纠正 scope 为 transient |
 | 1.12.0 | P1-2 时间属性：`scope` 读取时按 type 派生（不回写），TTL 只停止注入不删除，过期观察仍可查；推断置信度按 90 天半衰期衰减 + 独立会话最多 +0.2；`contradict conditional` 不再计入未解矛盾。修正 P0 遗留：常驻层对 `sensitive` 的检查覆盖 type 分支；线索判定改为**不重叠共享词**计数（“后台运行”与“后台”一致）；常驻观察排在预算前。P3-3 助手画像改为“工作方式/可核对经验”并带来源，旧内容归档可回退。测试 34 → 41 项；eval 基线不变（正 10/10 MRR 0.883，负 0/8） |
 | 1.11.0 | P0-1 注入分层（常驻：preferences/habits/thinking/identity 与偏好/习惯/约束/纠正类观察；其余需线索：≥2 个非停用词或 ≥1 实体；短消息只注入常驻层）；P0-2 打分保留绝对质量（`bm25n = 2.5×bm25/maxPossible`）+ IDF 加权 `coverage`，`coverage<0.5` 不给 high/medium；P0-3 矛盾链接改为复制、计数前置；测试 31 → 34 项；新增 8 条负样本，误报 2/8 → 0/8，正样本保持 10/10 MRR 0.883 |
@@ -540,6 +545,7 @@ P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步�
 
 ### 15.2 本文档
 
+- 1.12.2：版本头、2.3（facet 键名与显示标签的差异、助手喜好去重）、2.4（印证引文与复习锚点）、4.1/7（锚点）、6（psychology 需来源、评测草稿）、12（45 项、eval-drafts）、13.1（K12/K13）、14、15 同步；
 - 1.12.1：版本头、2.4（`lastCorroboratedAt`）、4.1（TTL 锚点与印证）、7（TTL 行）、12（43 项）、13.1（K9–K11）、14（P1-2 状态）、15 同步；
 - 1.12.0：版本头、2.3（助手画像改为工作方式/可核对经验，旧内容归档）、2.4（scope/sessions/conditional 与 TTL 说明）、4.1（过期与推断置信度）、7（TTL/衰减行）、10（ttl 配置）、12（41 项）、13.1（K6 已修）、14（P1-2/P3-3 状态）、15 同步；
 - 1.11.0：版本头、第 4/5/12/13.1/14/15 章与代码同步（注入分层、maxPossible 归一、IDF 加权 coverage、P0 状态、测试 34 项、负样本误报 0/8）；

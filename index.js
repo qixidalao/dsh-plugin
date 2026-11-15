@@ -76,11 +76,20 @@ export function applyCorroboration(row, sessionId, now = Date.now()) {
   return true;
 }
 
+/** A corroborating quote must actually appear in this session's user messages. */
+export function findQuoteInTexts(quote, texts) {
+  const needle = String(quote || '').replace(/\s+/g, '');
+  if (needle.length < 4) return false;
+  return (Array.isArray(texts) ? texts : []).some(text => String(text || '').replace(/\s+/g, '').includes(needle));
+}
+
 /** Inferred confidence decays with age and gets a bounded boost from independent sessions. */
 export function effectiveObservationConfidence(row, { now = Date.now(), halfLifeDays = 90 } = {}) {
   if (row?.kind !== 'inferred' || row.confidence === null || row.confidence === undefined) return null;
   const base = Math.max(0, Math.min(1, Number(row.confidence) || 0));
-  const ageDays = Math.max(0, (now - (Number(row.createdAt) || now)) / 86400000);
+  // Rehearsal resets the forgetting curve: age from the last independent corroboration.
+  const anchor = Number(row.lastCorroboratedAt) || Number(row.createdAt) || now;
+  const ageDays = Math.max(0, (now - anchor) / 86400000);
   const decayed = base * 0.5 ** (ageDays / Math.max(1, halfLifeDays));
   const sessions = Array.isArray(row.sessions) ? new Set(row.sessions).size : 1;
   const boost = 0.1 * Math.min(2, Math.max(0, sessions - 1));
@@ -259,12 +268,12 @@ const TOOL = {
       confidence: { type: 'number', minimum: 0, maximum: 1, description: 'For inferred observations: rough confidence, not a calibrated probability.' },
       context: { type: 'string', description: 'For observe: the situation (time, environment, constraints) that makes the observation interpretable.' },
       alternatives: { type: 'array', items: { type: 'string' }, description: 'For inferred observations: at least one alternative explanation.' },
-      quote: { type: 'string', description: 'For observe: the user\'s exact words when the observation came from a direct quote.' },
+      quote: { type: 'string', description: 'For observe: the user\'s exact words when the observation came from a direct quote. Required for corroborates: it must appear in this session\'s user messages (>=4 chars).' },
       sensitivity: { type: 'string', enum: ['normal', 'sensitive', 'private'], description: 'For observe: how sensitive this observation is; private ones are minimized in injection.' },
       status: { type: 'string', enum: OBSERVATION_STATUS, description: 'For observations: filter by status (current/withdrawn/superseded).' },
       observationScope: { type: 'string', enum: OBSERVATION_SCOPES, description: 'For observe: transient (emotional state, ~3d), situational (goal/decision/behavior/inference, ~30d) or durable (facts/preferences/constraints). Defaults derive from type; TTL only stops injection, it never deletes.' },
       conditional: { type: 'boolean', description: 'For contradict: mark the pair as situationally conflicting (different contexts), so it is not counted as an unresolved contradiction.' },
-      corroborates: { type: 'string', description: 'For observe: id of an existing observation that a different session independently observed; appends the session, renews TTL and gives a bounded confidence boost (same session is a no-op).' },
+      corroborates: { type: 'string', description: 'For observe: id of an existing observation independently observed by another session. Requires a verifiable quote from the current user message; same session is a no-op.' },
       full: { type: 'boolean', description: 'Search/recent: return complete user and assistant paragraphs instead of snippets.' },
       snippetChars: { type: 'integer', minimum: 80, maximum: 4000, description: 'Snippet length for compact results.' },
     },
@@ -2029,7 +2038,33 @@ async function start(ctx, config) {
               const target = observations.get(args.corroborates);
               if (!target) return { error: 'Unknown observation id in corroborates.' };
               if (target.status !== 'current') return { error: 'Only current observations can be corroborated.' };
+              const quote = typeof args.quote === 'string' ? args.quote.trim() : '';
+              if (quote.length < 4) {
+                return { error: 'corroborates requires quote (>=4 chars) from the current user message; independent corroboration must be verifiable.' };
+              }
+              const state = captures.get(key);
+              let sessionTexts = [
+                ...(rowsBySession.get(key) || []).map(row => cleanUserText(row.user)),
+                lastUserBySession.get(key) || '',
+                state?.pendingUser || '',
+                state?.lastUserText || '',
+              ];
+              if (!findQuoteInTexts(quote, sessionTexts) && sessionQuery) {
+                try {
+                  const read = await sessionQuery.readSession(key);
+                  const events = Array.isArray(read?.events) ? read.events : [];
+                  sessionTexts = [...sessionTexts, ...events
+                    .filter(event => event.type === 'user/message')
+                    .map(event => cleanUserText(messageText(event.data)))];
+                } catch {
+                  // fall through to the validation error below
+                }
+              }
+              if (!findQuoteInTexts(quote, sessionTexts)) {
+                return { error: 'quote not found in this session\'s user messages; refusing to treat it as independent corroboration.' };
+              }
               const added = applyCorroboration(target, key, Date.now());
+              if (!target.quote) target.quote = quote;
               await persistObservation(target);
               return {
                 corroborated: target.id,
@@ -2037,7 +2072,7 @@ async function start(ctx, config) {
                 sessions: new Set(target.sessions || []).size,
                 effectiveConfidence: effectiveObservationConfidence(target, { halfLifeDays: inferenceHalfLifeDays }),
                 note: added
-                  ? 'Independent session recorded; TTL renewed and confidence boosted (bounded).'
+                  ? 'Independent session recorded; TTL renewed and confidence boosted (bounded). Quote verified against this session.'
                   : 'Same session already recorded; no change.',
               };
             }
@@ -2201,6 +2236,12 @@ async function start(ctx, config) {
             const valid = facetsOf(target);
             if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
             if (typeof args.content !== 'string' || !args.content.trim()) return { error: 'content is required for action=learn' };
+            if (target === USER_TARGET && args.facet === 'psychology') {
+              const known = (args.sourceObservationIds || []).filter(id => observations.has(id));
+              if (!known.length) {
+                return { error: 'learn target=user facet=psychology requires at least one existing sourceObservationIds entry: psychological summaries must be traceable to observations.' };
+              }
+            }
             const row = target === ASSISTANT_TARGET
               ? await writeSelf(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || [])
               : await writePortrait(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || []);
