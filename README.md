@@ -38,6 +38,19 @@
 
 这正是预期的保守行为：同一个人的话题换了（这次在聊插件，基线里多是 AIOS/部署），词汇与实体重合自然变低，**风格相似度 0.99** 又支持是同一人 —— 综合成 `uncertain` 而不是武断下结论。判断权留给模型，必要时由模型向你确认。
 
+## v1.12.3 发布前可靠性
+
+| 问题 | 修复 | 验证 |
+|---|---|---|
+| 卸载竞态：`flushDirty()` 与 `domain.close()` 都未等待，整合定时器被清掉而不是执行 | 清理改为 async：先执行待整合、`await flushDirty()`、等 `pendingWrites` 全部 settle，再 `await close()` | mock host 夹具断言 `put` 在 `close` 之前完成 |
+| 删除 exchange 不清理来源 | `forget` 级联清掉 facet 的 `sourceExchangeIds` 与 observation 的 `sourceIds`，并给 facet 标 `needsRecompute` | 夹具：删记录后 `stats.facetsNeedingRecompute=1`，存储里 observation 引用已清空 |
+| 没有关闭自动捕获的开关 | 配置 `capture: false`；命令 `/dmem pause` / `resume` / `capture`；`stats.capture` 可见 | 夹具：`capture:false` 下事件不落库，`stats.capture=paused` |
+| 真实评测数据会随包发布 | 真实评测集/草稿移到本地 `eval-queries.local.json`、`eval-drafts.local.md`（gitignore）；包 `files` 移除；CI 改用合成 `eval-queries.fixture.json` | CI 新增 `node eval.mjs --fixture` |
+| 无生命周期测试 | 新增 `test-host.mjs`：内存版 mock host，覆盖持久化打开、prompt/tool 注册、会话抓取、卸载顺序、重启恢复、`capture:false`、级联删除 | `node test-host.mjs` → 16 checks passed |
+| README 过时 | 移除“访问强化 0.35→0.37→0.39”等旧描述，改为“检索只记 accessCount，不提升 importance” | 文档已同步 |
+
+`private: true` 保持；npm 发布等包名与许可证确定后再做。
+
 ## v1.12.2 印证入口补强 + 评测草稿
 
 | 缺口 | 修复 | 验证 |
@@ -46,7 +59,7 @@
 | 置信度衰减从 `createdAt` 算，复习不重置遗忘曲线 | 衰减锚点改为 `lastCorroboratedAt`（与 TTL 一致）：365 天前创建、1 天内印证过 → 不再只剩 0.04 | 单测：复习后 >0.55，未复习 <0.05 |
 | 用户 `psychology` facet 没有证据要求 | `learn target=user facet=psychology` 必须带至少一个真实存在的 `sourceObservationIds` | 运行时：无 id 报错；带 id 成功 |
 | 助手“喜好”与用户偏好重复 | 助手喜好只留**助手侧产出约定**（结构、引用来源、不确定性的表达），用户偏好留在用户画像；facet 键名仍为 `psychology/experience`（兼容），文档注明 | 注入内容检查 |
-| 评测集 | 新增 `eval-drafts.md`：20 条草稿（10 正 + 10 负），负样本关键词已 grep 确认 0 次；待评审改写、拆 dev/test 并冻结 | 无打分依赖 |
+| 评测集 | 新增本地草稿 `eval-drafts.local.md`（gitignore）：20 条（10 正 + 10 负），负样本关键词已 grep 确认 0 次；待评审改写、拆 dev/test 并冻结 | 无打分依赖 |
 
 测试 43 → 45 项；eval 基线不变（正 10/10 MRR 0.883，负 0/8）。
 
@@ -194,7 +207,7 @@ result size: compact 3.5 KB vs full 14.7 KB (24%)
 | P0 | 抓取/清洗、BM25 + 短语 + 印象 + 时间衰减检索、时间窗与排序、印象与画像历史版本、来源溯源、近似去重 |
 | P1 | 后台整合（turn/end 归并裁剪）、记忆类型分层（episodic/semantic/procedural）、工作区隔离、离线评测 |
 | P2 | **实体索引**（域名/路径/标识符/缩写 → 记录）、实体加权检索、`entities` 浏览与相关记录 |
-| P3 | **重要度 + 访问强化**（检索命中加分）、**重问检测**（同一问题新答案 → 旧记录标 `supersededBy` 降权）、**Markdown 导出** |
+| P3 | **重要度**（只由 `deepen`/纠正提升，检索不再加分；v1.10 起）、**重问检测**（同一问题新答案 → 旧记录标 `supersededBy` 降权）、**Markdown 导出** |
 | P4 | **`/dmem` 命令**（stats / portrait / export / search）、`stats` 健康度、纯函数测试套件 |
 
 ## 工作原理
@@ -301,7 +314,7 @@ node test.mjs   # 纯函数测试（27 项）
 node eval.mjs   # 检索评测（10 条真实问题）
 ```
 
-纯函数测试覆盖：实体抽取与索引、实体-only 查询、失效降权、重要度加权、时间排序与时间窗、访问强化、重问判定、上下文清洗。
+纯函数测试覆盖：实体抽取与索引、实体-only 查询、失效降权、重要度加权、时间排序与时间窗、访问统计（不提升重要度）、重问判定、上下文清洗。
 
 检索评测（当前 2091 条真实记忆，k=3；随数据增长数字会变化）：
 
@@ -328,7 +341,7 @@ full      hit@3: 9/10  MRR: 0.850
 - `repair` 实测补齐 249 条缺用户原话的旧记录，`stats.missingUser` 从 249 归零；
 - `search` 默认返回片段 + `confidence {score,label,margin,separation}` + `reasons`，`full: true` 才返回完整原文；
 - `entities` 返回 Top 实体与指定实体的相关记录；实体数从 1002 增至 1600；
-- 访问强化实测：连续检索同一条记录，重要度 0.35 → 0.37 → 0.39；
+- 访问统计：连续检索只累加 `accessCount`/`lastAccessAt`，**不提升 importance**（v1.10 起移除该正反馈）；
 - `export` 写出 `memory.md`（用户画像 + **助手画像** + 最近 30 条印象 + 统计）；时间窗、排序、`deepen`/`learn` 历史版本、`sourceIds`、`forget` 均实测通过；
 - **助手画像**：4 个 facet（习惯/喜好/心理/经历）写入后立即出现在 `## 助手画像（自查）`，落盘 `self/s_<facet>.json`，`export` 与 `/dmem self` 可读；
 - **回收区**：`archive ids=[...]` 后 `stats.archived=1`，默认检索的 `total` 与 `archivedHidden` 变化、`includeArchived=true` 才能看到（带 `archived` 标记、权重 0.3）；`restore` 后回到活跃集，重载后状态仍保持；

@@ -30,6 +30,8 @@
 2. 去掉所有拟人措辞后，它还有用吗？
 3. 它在出错时（过时、误归因、过度泛化）会怎样失败，用户能发现并纠正吗？
 
+本插件的总取舍：**记忆越丰富，认知越审慎**——记住更多不等于更懂人；证据不足时宁可说“不确定”，也不用流畅的叙述掩盖猜测。
+
 ### 0.2 刻意不学的部分
 
 人类记忆有一些**缺陷**，不应复制：
@@ -83,7 +85,7 @@
 | `README.md` | 面向使用者的说明（功能、配置、验证记录） |
 | `DOCS.md` | 本文档：设计原则、架构与记忆逻辑、已知缺陷、升级规范 |
 | `test.mjs` | 纯函数测试（34 项） |
-| `eval.mjs` + `eval-queries.json` | 检索评测（需要本机真实记忆库，baseline/bm25/+phrase/+entity/full） |
+| `eval.mjs` + `eval-queries.local.json` | 检索评测（本机真实记忆库 + 本地评测数据，二者都 gitignore；CI 用 `eval-queries.fixture.json` 合成数据） |
 | `bench.mjs` | 检索性能基准（cold/warm 延迟、compact/full 体积） |
 
 ## 2. 数据模型（4 张表）
@@ -236,7 +238,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 - ✅ **隐私分级**：`sensitivity=private` 的观察不注入明文、不导出，只显示条数；`forget` 可按 id 删除观察。
 - ✅ **用户控制**：`observations` 可列出当前/历史观察，`forget` 可删除，`export` 可导出（私密项不导出）。
 - ✅ **用户心理 facet 需来源**（v1.12.2）：`learn target=user facet=psychology` 必须带至少一个真实存在的 `sourceObservationIds`，否则拒绝——心理归纳不能没有证据。
-- 📐 **评测集**：`eval-drafts.md` 是 P3-1 的 20 条草稿（10 正 + 10 负），待评审改写、grep 复核负样本后拆分 dev/test 并冻结。
+- 📐 **评测集**：真实评测数据只在本地（`eval-queries.local.json` / `eval-drafts.local.md`，gitignore）；仓库里只有合成的 `eval-queries.fixture.json` 供 CI 用。P3-1 的 20 条草稿在本地，待评审改写、grep 复核负样本后拆分 dev/test 并冻结。
 
 ## 7. 时间维度：间隔、过期、回收区 ✅
 
@@ -360,26 +362,26 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 ---
 
-## 14. 升级规范
+## 14. 升级规划（合并版）
 
-排序原则：**先修回归，再加机制**。每一项必须附带测试后才算完成；改动打分的项必须在扩充后的评测集（P3-1）上重新验证权重。
+排序原则：**先修发布可靠性，再改认知机制**；每项必须带测试；改动打分的项只在冻结评测集（test）上报告，dev 只用于调参。
 
-**P0 三项已在 v1.11 实现**（测试 34 项、负样本误报 0/8）；P1/P2/P3 仍为规范。
+**发布渠道**：Preview（GitHub `main` + tag）→ 可安装（`plugin_manager install_bundle`，本地/自托管）→ Stable（npm；当前 `private: true`，等作者定包名与许可证后再发）。
 
-| 优先级 | 编号 | 内容 | 对应人类机制 | 状态 |
-|---|---|---|---|---|
-| P0 | P0-1 | 注入分层：常驻（内隐）+ 线索（外显） | 内隐/外显记忆、注意 | ✅ v1.11 |
-| P0 | P0-2 | 打分归一化保留绝对质量 + 覆盖率 | 线索提取的“熟悉度”信号 | ✅ v1.11 |
-| P0 | P0-3 | 矛盾链接一致性 + 计数前置 | 干扰与替代 | ✅ v1.11 |
-| P1 | P1-1 | 披露策略 `mention` | 社会性提取（何时该提起） | 📐 |
-| P1 | P1-2 | 时间属性 `scope`/TTL、推断置信度衰减与独立证据增强 | 遗忘、显著性 | ✅ v1.12 / v1.12.1 / v1.12.2（引文校验 + 复习锚点） |
-| P2 | P2-1 | 巩固 pass `reflect`（片段 → 模式） | 巩固 | 📐 |
-| P2 | P2-2 | 检索联想：分词、实体共现一跳、查询改写 | 线索依赖、联想激活 | 📐 |
-| P2 | P2-3 | `recompute`：把过期 facet 的存活证据一次取齐 | 重构、再巩固 | 📐 |
-| P3 | P3-1 | 评测集扩充与端到端对照 | — | 📐（负样本已加 8 条） |
-| P3 | P3-2 | 显著性信号 `salience` | 显著性 | 📐 |
-| P3 | P3-3 | 助手画像改造 | 反拟人守则 | ✅ v1.12（工作方式/可核对经验，旧内容已归档） |
-| P3 | P3-4 | lint 收紧、可选磁盘加密 | 来源监控、隐私 | 📐 |
+**技术原则（摘要）**：先证明收益；不宣传“深度认知”；少依赖；失败可发现；用户可见/可纠正；隐私最小化；写入可回退；卸载不丢数据；评测不被调参污染；**记忆越丰富，认知越审慎**。
+
+| 版本 | 内容 | 状态 |
+|---|---|---|
+| v1.12.3 | 发布可靠性：卸载时 flush → close 等待在途写入；删除 exchange 级联清理 facet/observation 引用并标待重算；`capture: false` 与 `/dmem pause`；README/DOCS 统一；真实评测数据本地化（gitignore + 合成 fixture 供 CI）；内存版 mock host 夹具 | ✅ |
+| v1.13 | 每个画像版本绑定自己的来源集合；`mention`（默认值由 scope + type + sensitivity 派生）；冻结评测集；误注入率与校准指标；端到端对照 | 📐 |
+| v1.14 | `reflect`（复用 observation `status: proposed`，≥3 个会话才起草）；`recompute`；跨层重复检测 | 📐 |
+| 之后 | 看指标再决定联想检索等增强；npm 发布等包名/许可证确定 | 📐 |
+
+**明确不做 / 推迟**：
+
+- 不新增 Hypothesis 表：复用 observation 的 `status: proposed` + `contradictingEvidence` 字段，状态映射 `proposed → current → withdrawn`，`weakened` 用有效置信度判断；
+- Predictive learning、Meta-learning 的运行时自改先推迟（先证明 Reflect 收益；预测用户行为需要用户明确同意与全程可见）；Meta-learning 只做离线用冻结评测集调参；
+- 不使用 “2.0 Cognitive Memory System” 这类命名（与“不宣传深度认知”冲突）。
 
 ### P0-1 注入分层：常驻层与线索层（✅ v1.11）
 
@@ -521,12 +523,10 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 ### 实施依赖
 
 ```
-P0-1 ✅
-P0-2 ✅ ─► P3-1（评测集扩充）─► 重调权重 ─► P1 / P2
-P0-3 ✅
+v1.12.3 可靠性（✅）─► v1.13 mention + 画像来源集合 + 冻结评测集（📐）─► v1.14 reflect / recompute / 跨层去重（📐）
 ```
 
-P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步是 P3-1（评测集扩到 30+ 条并划 dev/test），再启动 P1-1（mention）与 P2（reflect / 联想 / recompute）。
+已完成：P0（v1.11）、P1-2（v1.12–v1.12.2）、P3-3（v1.12）、v1.12.3 发布可靠性。v1.13 起按合并版路线推进；所有打分改动只在冻结 test 集上报告。
 
 ---
 
@@ -536,7 +536,8 @@ P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步�
 
 | 版本 | 内容 |
 |---|---|
-| 1.12.2 | 补印证入口两个缺口：`corroborates` 必须带 `quote`，插件在当前会话用户消息里做子串校验（防止模型看到自己的推断后自我强化）；推断置信度与 TTL 的衰减锚点改为 `lastCorroboratedAt`（复习重置遗忘曲线）；`learn target=user facet=psychology` 必须带 `sourceObservationIds`；助手“喜好”去重（只留助手侧产出约定，用户偏好在用户画像）；新增 `eval-drafts.md`（20 条评测草稿，待评审改写）。测试 43 → 45 |
+| 1.12.3 | 发布可靠性：卸载清理改为 async，先等在途写入（`pendingWrites`）、再 flush、再 close；待执行的整合在卸载时执行而不是丢弃；删除 exchange 时级联清理 facet `sourceExchangeIds` 与 observation `sourceIds` 并标 `needsRecompute`；新增 `capture: false` 与 `/dmem pause|resume|capture`；README/DOCS 修正过时的“访问强化”；真实评测数据移出仓库（`eval-queries.local.json` / `eval-drafts.local.md`，gitignore），CI 改用 `eval-queries.fixture.json` 合成数据；新增内存 mock host 夹具；包保持 `private: true` |
+| 1.12.2 | 补印证入口两个缺口：`corroborates` 必须带 `quote`，插件在当前会话用户消息里做子串校验（防止模型看到自己的推断后自我强化）；推断置信度与 TTL 的衰减锚点改为 `lastCorroboratedAt`（复习重置遗忘曲线）；`learn target=user facet=psychology` 必须带 `sourceObservationIds`；助手“喜好”去重；新增评测草稿。测试 43 → 45 |
 | 1.12.1 | 修复 P1-2 三个实测缺陷：TTL 锚点改为 `lastCorroboratedAt`（无关编辑不续期，只有独立会话印证续期）；新增 `observe corroborates=<id>` 作为显式印证入口（同会话 no-op，不同会话给有上限的置信度增强）；`correct` 用 `scopeOf(original)` 继承派生 scope，短期观察的纠正不再永久化；`observe` 修正忽略 `observationType` 导致全部落成 `behavior_observation`；常驻判断对敏感项的豁免收紧（敏感纠正也需线索）。测试 41 → 43；运行时验证：10 天前的 `emotional_state` 编辑 `updatedAt` 后仍判过期，`corroborates` 使置信度 0.447 → 0.547，纠正 scope 为 transient |
 | 1.12.0 | P1-2 时间属性：`scope` 读取时按 type 派生（不回写），TTL 只停止注入不删除，过期观察仍可查；推断置信度按 90 天半衰期衰减 + 独立会话最多 +0.2；`contradict conditional` 不再计入未解矛盾。修正 P0 遗留：常驻层对 `sensitive` 的检查覆盖 type 分支；线索判定改为**不重叠共享词**计数（“后台运行”与“后台”一致）；常驻观察排在预算前。P3-3 助手画像改为“工作方式/可核对经验”并带来源，旧内容归档可回退。测试 34 → 41 项；eval 基线不变（正 10/10 MRR 0.883，负 0/8） |
 | 1.11.0 | P0-1 注入分层（常驻：preferences/habits/thinking/identity 与偏好/习惯/约束/纠正类观察；其余需线索：≥2 个非停用词或 ≥1 实体；短消息只注入常驻层）；P0-2 打分保留绝对质量（`bm25n = 2.5×bm25/maxPossible`）+ IDF 加权 `coverage`，`coverage<0.5` 不给 high/medium；P0-3 矛盾链接改为复制、计数前置；测试 31 → 34 项；新增 8 条负样本，误报 2/8 → 0/8，正样本保持 10/10 MRR 0.883 |
@@ -545,6 +546,7 @@ P0 三项已完成（v1.11）；P1-2 与 P3-3 已完成（v1.12）。下一步�
 
 ### 15.2 本文档
 
+- 1.12.3：版本头、第 14 章替换为合并版路线（发布渠道、技术原则、v1.12.3 → v1.14）、0.1 增加“记忆越丰富，认知越审慎”、文件清单与评测说明改为本地数据 + fixture、15 同步；
 - 1.12.2：版本头、2.3（facet 键名与显示标签的差异、助手喜好去重）、2.4（印证引文与复习锚点）、4.1/7（锚点）、6（psychology 需来源、评测草稿）、12（45 项、eval-drafts）、13.1（K12/K13）、14、15 同步；
 - 1.12.1：版本头、2.4（`lastCorroboratedAt`）、4.1（TTL 锚点与印证）、7（TTL 行）、12（43 项）、13.1（K9–K11）、14（P1-2 状态）、15 同步；
 - 1.12.0：版本头、2.3（助手画像改为工作方式/可核对经验，旧内容归档）、2.4（scope/sessions/conditional 与 TTL 说明）、4.1（过期与推断置信度）、7（TTL/衰减行）、10（ttl 配置）、12（41 项）、13.1（K6 已修）、14（P1-2/P3-3 状态）、15 同步；

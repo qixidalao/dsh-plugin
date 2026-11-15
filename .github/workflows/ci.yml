@@ -17,5 +17,10 @@ jobs:
         run: node --check index.js
       - name: Unit tests (pure functions)
         run: node test.mjs
-      # eval.mjs / bench.mjs need a real memory store under $DSH_HOME and are run locally:
-      #   node eval.mjs [--dir <exchanges dir>]
+      - name: Host lifecycle fixture (mock host)
+        run: node test-host.mjs
+      - name: Retrieval eval (synthetic fixture, no personal data)
+        run: node eval.mjs --fixture
+      # Real evaluation data is local only (eval-queries.local.json, gitignored):
+      #   node eval.mjs            # uses local queries if present
+      #   node eval.mjs --fixture  # synthetic

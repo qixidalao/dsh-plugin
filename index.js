@@ -1118,6 +1118,7 @@ async function start(ctx, config) {
     durable: null,
   };
   const inferenceHalfLifeDays = Math.max(1, Number(config.inferenceHalfLifeDays) || 90);
+  let captureEnabled = config.capture !== false;
   const archiveAfterDays = Math.max(7, Math.min(36500, Number(config.archiveAfterDays) || DEFAULT_ARCHIVE_AFTER_DAYS));
   const gapDays = Math.max(1, Math.min(36500, Number(config.gapDays) || DEFAULT_GAP_DAYS));
   const freshDays = Math.max(1, Math.min(36500, Number(config.freshDays) || DEFAULT_FRESH_DAYS));
@@ -1174,9 +1175,16 @@ async function start(ctx, config) {
     }
   };
 
+  const pendingWrites = new Set();
+  const trackWrite = promise => {
+    const task = Promise.resolve(promise);
+    pendingWrites.add(task);
+    task.finally(() => pendingWrites.delete(task)).catch(() => {});
+    return task;
+  };
   const persist = async row => {
     if (!table) return;
-    await table.put(recordKey(row.id), row);
+    await trackWrite(table.put(recordKey(row.id), row));
   };
 
   const dirty = new Set();
@@ -1243,7 +1251,7 @@ async function start(ctx, config) {
 
   const persistObservation = async row => {
     if (!observationsTable) return;
-    await observationsTable.put(`o_${row.id}`, row).catch(error => logger.warn(`dynamic-memory: cannot persist observation: ${String(error)}`));
+    await trackWrite(observationsTable.put(`o_${row.id}`, row)).catch(error => logger.warn(`dynamic-memory: cannot persist observation: ${String(error)}`));
   };
   const OBSERVATION_PRIORITY = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
   const currentObservations = (limit = 20) => [...observations.values()]
@@ -1276,6 +1284,23 @@ async function start(ctx, config) {
     }
     await markFacetsStale(id);
   };
+  /** Remove an exchange id from every facet/observation reference and mark facets for recompute. */
+  const dropExchangeReferences = async id => {
+    for (const [map, tableRef, prefix] of [[portrait, portraitTable, 'p_'], [selfPortrait, selfTable, 's_']]) {
+      for (const [facet, row] of map) {
+        if (!Array.isArray(row.sourceExchangeIds) || !row.sourceExchangeIds.includes(id)) continue;
+        row.sourceExchangeIds = row.sourceExchangeIds.filter(source => source !== id);
+        row.needsRecompute = true;
+        if (tableRef) await trackWrite(tableRef.put(`${prefix}${facet}`, row)).catch(() => {});
+      }
+    }
+    for (const row of observations.values()) {
+      if (!Array.isArray(row.sourceIds) || !row.sourceIds.includes(id)) continue;
+      row.sourceIds = row.sourceIds.filter(source => source !== id);
+      await persistObservation(row);
+    }
+  };
+
   const addObservation = async (args, kind, sessionId) => {
     const at = Date.now();
     const requestedType = OBSERVATION_TYPES.includes(args.observationType) ? args.observationType
@@ -1418,7 +1443,7 @@ async function start(ctx, config) {
       needsRecompute: false,
     };
     map.set(facet, row);
-    if (targetTable) await targetTable.put(`${keyPrefix}${facet}`, row);
+    if (targetTable) await trackWrite(targetTable.put(`${keyPrefix}${facet}`, row));
     return row;
   };
 
@@ -1434,7 +1459,7 @@ async function start(ctx, config) {
         if (!Array.isArray(row.sourceObservationIds) || !row.sourceObservationIds.includes(observationId)) continue;
         row.needsRecompute = true;
         row.sourceObservationIds = row.sourceObservationIds.filter(id => id !== observationId);
-        if (table) await table.put(`${prefix}${facet}`, row).catch(() => {});
+        if (table) await trackWrite(table.put(`${prefix}${facet}`, row)).catch(() => {});
       }
     }
   };
@@ -1602,7 +1627,7 @@ async function start(ctx, config) {
     return { repaired, sessions, details: details.slice(0, 8) };
   };
 
-  const consolidate = sessionKey => {
+  const consolidate = async sessionKey => {
     const list = rowsBySession.get(sessionKey);
     if (!list || list.length < 2) return { merged: 0 };
     let merged = 0;
@@ -1616,7 +1641,7 @@ async function start(ctx, config) {
           row.updatedAt = Math.max(row.updatedAt, candidate.updatedAt);
           row.keywords = [...new Set([...row.keywords, ...candidate.keywords])].slice(0, MAX_KEYWORDS);
           invalidateRow(row);
-          void persist(row).catch(() => {});
+          await persist(row).catch(() => {});
         }
         row.accessCount = (row.accessCount || 0) + (candidate.accessCount || 0);
         row.importance = Math.max(row.importance || DEFAULT_IMPORTANCE, candidate.importance || DEFAULT_IMPORTANCE);
@@ -1626,7 +1651,7 @@ async function start(ctx, config) {
         other -= 1;
         merged += 1;
         stats.merged += 1;
-        if (table) void table.delete(recordKey(candidate.id)).catch(() => {});
+        if (table) await table.delete(recordKey(candidate.id)).catch(() => {});
       }
     }
     stats.lastConsolidatedAt = Date.now();
@@ -1786,12 +1811,14 @@ async function start(ctx, config) {
     if (consolidationTimers.has(sessionKey)) return;
     const timer = setTimeout(() => {
       consolidationTimers.delete(sessionKey);
-      try {
-        consolidate(sessionKey);
-        void flushDirty();
-      } catch (error) {
-        logger.warn(`dynamic-memory: consolidation failed: ${String(error)}`);
-      }
+      void (async () => {
+        try {
+          await consolidate(sessionKey);
+          await flushDirty();
+        } catch (error) {
+          logger.warn(`dynamic-memory: consolidation failed: ${String(error)}`);
+        }
+      })();
     }, 1500);
     if (typeof timer.unref === 'function') timer.unref();
     consolidationTimers.set(sessionKey, timer);
@@ -1838,6 +1865,7 @@ async function start(ctx, config) {
     const key = String(session.id);
     const state = captures.get(key);
     if (!state) return;
+    if (!captureEnabled) return;
     if (typeof event.time === 'number') state.lastTime = event.time;
     if (event.type === 'turn/start') {
       state.pendingAssistant = '';
@@ -1936,6 +1964,7 @@ async function start(ctx, config) {
       injection,
       exportPath,
       command: commandName,
+      capture: captureEnabled ? 'on' : 'paused',
       storage: storageState,
     };
   };
@@ -2328,7 +2357,8 @@ async function start(ctx, config) {
               if (index >= 0) list.splice(index, 1);
             }
             if (table) await table.delete(recordKey(row.id));
-            return { forgotten: row.id };
+            await dropExchangeReferences(row.id);
+            return { forgotten: row.id, referencesCleared: true };
           }
           return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, entities or export.' };
         },
@@ -2362,8 +2392,15 @@ async function start(ctx, config) {
         `- 记录：${snapshot.exchanges} 条 / ${snapshot.sessions} 会话`,
         `- 画像：${snapshot.portraitFacets} 个 facet，实体：${snapshot.entities} 个`,
         `- 平均重要度：${snapshot.avgImportance}，未写印象：${snapshot.withoutSummary}`,
-        `- 存储：${snapshot.storage}，工作区：${workspace || '未知'}`,
+        `- 捕获：${snapshot.capture}，存储：${snapshot.storage}，工作区：${workspace || '未知'}`,
       ].join('\n');
+    }
+    if (input === 'pause' || input === 'resume' || input === 'capture') {
+      if (input === 'pause') captureEnabled = false;
+      else if (input === 'resume') captureEnabled = true;
+      return input === 'capture'
+        ? `自动捕获：${captureEnabled ? 'on' : 'paused'}`
+        : `自动捕获已${captureEnabled ? '开启' : '暂停'}（/dmem ${captureEnabled ? 'pause' : 'resume'} 可切换）`;
     }
     if (input === 'portrait' || input === 'self') {
       const assistant = input === 'self';
@@ -2391,7 +2428,7 @@ async function start(ctx, config) {
         ...result.matches.map((match, index) => `${index + 1}. ${new Date(match.time).toISOString().slice(0, 10)} 用户：${truncate(match.user || '（仅助手回复）', 80)}\n   印象：${truncate(match.summary || '—', 120)}`),
       ].join('\n');
     }
-    return '用法：/dmem [stats|portrait|self|export|search <关键词>]';
+    return '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture]';
   };
 
   const stopCommand = commands
@@ -2492,7 +2529,7 @@ async function start(ctx, config) {
       }, 5000);
   if (warmupTimer && typeof warmupTimer.unref === 'function') warmupTimer.unref();
 
-  return ctx.effect(() => () => {
+  return ctx.effect(() => async () => {
     if (autoIndexTimer) clearTimeout(autoIndexTimer);
     if (warmupTimer) clearTimeout(warmupTimer);
     stopSessionEvents();
@@ -2501,11 +2538,22 @@ async function start(ctx, config) {
     if (stopPrompt) stopPrompt();
     if (stopCommand) stopCommand();
     if (flushTimer) clearTimeout(flushTimer);
-    for (const timer of consolidationTimers.values()) clearTimeout(timer);
+    // Run any pending consolidation now instead of dropping it, then flush.
+    for (const [sessionKey, timer] of consolidationTimers) {
+      clearTimeout(timer);
+      try {
+        await consolidate(sessionKey);
+      } catch (error) {
+        logger.warn(`dynamic-memory: final consolidation failed: ${String(error)}`);
+      }
+    }
     consolidationTimers.clear();
-    void flushDirty();
+    await flushDirty();
     for (const setup of [...setups.values()]) setup();
     setups.clear();
-    if (domain) void domain.close().catch(error => logger.warn(`dynamic-memory: close failed: ${String(error)}`));
+    // Wait for in-flight writes before closing the domain, otherwise the last
+    // rows (captured at dispose time) can be lost or hit a closed backend.
+    if (pendingWrites.size) await Promise.allSettled([...pendingWrites]);
+    if (domain) await domain.close().catch(error => logger.warn(`dynamic-memory: close failed: ${String(error)}`));
   });
 }

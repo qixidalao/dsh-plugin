@@ -1,38 +1,58 @@
 #!/usr/bin/env node
-// Offline retrieval evaluation over the real memory store.
-// Usage: node eval.mjs [--dir <exchanges dir>] [--k 3]
-// Positive queries report hit@k and MRR; negative queries (negative: true) report
-// how often the retriever claims medium/high confidence for something not in memory.
+// Offline retrieval evaluation.
+// Usage: node eval.mjs [--dir <exchanges dir>] [--k 3] [--queries <file>] [--fixture]
+// Real evaluation data stays local (eval-queries.local.json, gitignored); the synthetic
+// fixture (eval-queries.fixture.json) is used by CI and when no local file exists.
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { rankExchanges, cleanUserText } from './index.js';
 
 const args = process.argv.slice(2);
-const dirIndex = args.indexOf('--dir');
-const kIndex = args.indexOf('--k');
-const k = kIndex >= 0 ? Number(args[kIndex + 1]) || 3 : 3;
+const valueOf = flag => {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+};
+const k = Number(valueOf('--k')) || 3;
 const home = process.env.DSH_HOME || join(homedir(), '.dsh');
-const dir = dirIndex >= 0 ? args[dirIndex + 1] : join(home, 'storages', 'dynamic_memory', 'exchanges');
+const dir = valueOf('--dir') || join(home, 'storages', 'dynamic_memory', 'exchanges');
+const fixtureMode = args.includes('--fixture');
 
-if (!existsSync(dir)) {
-  console.error(`no memory directory at ${dir}; run the plugin first or pass --dir`);
-  process.exit(1);
+const synthRows = () => {
+  const now = Date.now();
+  return [
+    { id: 'fixture-1', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now, user: '部署到 example.com 后首页返回 200', assistant: '部署完成，首页 200', summary: '部署 example.com', keywords: [], entities: ['example.com'], importance: 0.8 },
+    { id: 'fixture-2', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 86400000, user: '缓存失效要怎么处理', assistant: '缓存失效时回源并重建', summary: '缓存失效处理', keywords: [], entities: [], importance: 0.5 },
+    { id: 'fixture-3', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 2 * 86400000, user: '登录后没有跳转', assistant: '登录后跳转需要同步路由', summary: '登录跳转', keywords: [], entities: [], importance: 0.6 },
+  ];
+};
+
+let rows;
+if (fixtureMode) {
+  rows = synthRows();
+} else {
+  if (!existsSync(dir)) {
+    console.error(`no memory directory at ${dir}; run the plugin first, pass --dir, or use --fixture`);
+    process.exit(1);
+  }
+  rows = readdirSync(dir)
+    .filter(file => file.endsWith('.json'))
+    .map(file => {
+      try {
+        return JSON.parse(readFileSync(join(dir, file), 'utf8')).record;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter(row => row && typeof row.user === 'string' && typeof row.assistant === 'string' && row.assistant.trim())
+    .map(row => ({ ...row, user: cleanUserText(row.user) }));
 }
 
-const rows = readdirSync(dir)
-  .filter(file => file.endsWith('.json'))
-  .map(file => {
-    try {
-      return JSON.parse(readFileSync(join(dir, file), 'utf8')).record;
-    } catch {
-      return undefined;
-    }
-  })
-  .filter(row => row && typeof row.user === 'string' && typeof row.assistant === 'string' && row.assistant.trim())
-  .map(row => ({ ...row, user: cleanUserText(row.user) }));
-
-const queries = JSON.parse(readFileSync(new URL('./eval-queries.json', import.meta.url), 'utf8'));
+const localQueries = new URL('./eval-queries.local.json', import.meta.url);
+const fixtureQueries = new URL('./eval-queries.fixture.json', import.meta.url);
+const explicitQueries = valueOf('--queries');
+const queriesPath = explicitQueries || (fixtureMode ? fixtureQueries : (existsSync(localQueries) ? localQueries : fixtureQueries));
+const queries = JSON.parse(readFileSync(queriesPath, 'utf8'));
 const positives = queries.filter(query => !query.negative);
 const negatives = queries.filter(query => query.negative);
 
@@ -102,7 +122,7 @@ for (const query of negatives) {
   lines.push(`${query.query.padEnd(24, ' ')} | ${verdicts.join(' | ')}  [negative]`);
 }
 
-console.log(`memory rows: ${rows.length}, positive: ${positives.length}, negative: ${negatives.length}, k=${k}`);
+console.log(`memory rows: ${rows.length}${fixtureMode ? ' (fixture)' : ''}, positive: ${positives.length}, negative: ${negatives.length}, k=${k}`);
 console.log(lines.join('\n'));
 console.log('');
 const n = positives.length;

@@ -1,10 +1,15 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "1.12.2",
+  "version": "1.12.3",
   "private": true,
   "type": "module",
   "description": "Durable long-term memory: evidence-layer observations with scope/TTL and quote-verified corroboration, portraits (user + behavior-based assistant self-portrait), layered injection, calibrated retrieval confidence, gap detection, recycle bin and speaker-continuity evidence",
   "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
-  "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "eval.mjs", "eval-queries.json", "eval-drafts.md", "test.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
+  "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "eval.mjs", "eval-queries.fixture.json", "test.mjs", "test-host.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
+  "scripts": {
+    "test": "node test.mjs",
+    "test:host": "node test-host.mjs",
+    "eval": "node eval.mjs --fixture"
+  },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
 }
