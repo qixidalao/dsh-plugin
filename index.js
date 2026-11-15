@@ -1811,6 +1811,111 @@ async function start(ctx, config) {
     return { repaired, sessions, details: details.slice(0, 8) };
   };
 
+  const HYDRATION_TIME_WINDOW_MS = 5000;
+  const distinctPairs = pairs => {
+    const seen = new Map();
+    for (const pair of pairs) if (!seen.has(pair.user)) seen.set(pair.user, pair);
+    return [...seen.values()];
+  };
+
+  /**
+   * Rebuild the original user/assistant pairs from local Harness session events.
+   * Capture stores one pair per turn: the cleaned user message plus the LAST assistant
+   * message of that turn (turn/start discards a pending assistant text). Hydration must
+   * reproduce exactly that pairing, because a turn can stream several assistant
+   * messages and hashing only the first one can never match the stored textHash.
+   * Assumed local format: event.type, event.data (user message), event.data.message
+   * (assistant message), event.time (epoch ms).
+   */
+  const pairsFromEvents = events => {
+    const pairs = [];
+    let pendingUser = '';
+    let pendingAssistant = '';
+    let at = 0;
+    const flush = () => {
+      if (!pendingUser || !pendingAssistant) return;
+      pairs.push({ user: pendingUser, assistant: pendingAssistant, at });
+      pendingUser = '';
+      pendingAssistant = '';
+    };
+    for (const event of events) {
+      if (!event || typeof event !== 'object') continue;
+      if (typeof event.time === 'number') at = event.time;
+      if (event.type === 'turn/start') {
+        pendingAssistant = '';
+        continue;
+      }
+      if (event.type === 'user/message') {
+        const cleaned = cleanUserText(messageText(event.data));
+        if (!cleaned) continue;
+        flush();
+        pendingUser = cleaned;
+        continue;
+      }
+      if (event.type === 'assistant/message') {
+        const text = messageText(event.data && event.data.message);
+        if (text) pendingAssistant = text;
+        continue;
+      }
+      if (event.type === 'turn/end') flush();
+    }
+    flush();
+    return pairs;
+  };
+
+  /** Resolve one index-only row to its original text, or throw instead of guessing. */
+  const hydrateMatch = async match => {
+    const row = rowsById.get(match.id);
+    const sessionId = String((row && row.sessionId) || match.sessionId || '');
+    if (!sessionId) throw new Error('record has no sessionId; cannot hydrate');
+    const storedHash = String((row && row.textHash) || match.textHash || '');
+    const summary = String((row && row.summary) || '').replace(/\s+/g, '');
+    const summaryHead = summary.slice(0, 20);
+    const target = Number(row && row.time) || Date.parse(match.time) || 0;
+    let read;
+    try {
+      read = await sessionQuery.readSession(sessionId);
+    } catch (error) {
+      throw new Error(`cannot read session ${sessionId}: ${String(error && error.message ? error.message : error)}`);
+    }
+    const pairs = pairsFromEvents(Array.isArray(read?.events) ? read.events : []);
+    if (!pairs.length) throw new Error(`session ${sessionId} has no complete user/assistant pair`);
+    if (storedHash) {
+      const byHash = distinctPairs(pairs.filter(pair => hashText(`${pair.user}\n${pair.assistant}`) === storedHash));
+      if (byHash.length === 1) return { user: byHash[0].user, assistant: byHash[0].assistant };
+      if (byHash.length > 1) throw new Error(`ambiguous hash match (${byHash.length} candidates) in session ${sessionId}`);
+    }
+    // The stored summary starts with the user text (and only reaches the assistant text
+    // when the prompt is shorter than the summary), so a whitespace-insensitive prefix +
+    // length check verifies candidates the hash could not. The full summary is tried
+    // first; the 20-char head is the weaker fallback for rows whose summary was revised.
+    const verify = (needle, label) => {
+      if (needle.length < 8) return null;
+      const candidates = distinctPairs(pairs.filter(pair => {
+        const combined = `${pair.user}${pair.assistant}`.replace(/\s+/g, '');
+        return combined.startsWith(needle) && combined.length >= needle.length;
+      }));
+      if (candidates.length === 1) return { user: candidates[0].user, assistant: candidates[0].assistant };
+      if (candidates.length > 1) {
+        const near = candidates.filter(pair => target && pair.at && Math.abs(pair.at - target) <= HYDRATION_TIME_WINDOW_MS);
+        if (near.length === 1) return { user: near[0].user, assistant: near[0].assistant };
+        throw new Error(`ambiguous ${label} match (${candidates.length} candidates) in session ${sessionId}`);
+      }
+      return null;
+    };
+    const bySummary = verify(summary, 'summary');
+    if (bySummary) return bySummary;
+    const bySummaryHead = verify(summaryHead, 'summary-prefix');
+    if (bySummaryHead) return bySummaryHead;
+    // Last resort for rows whose stored hash/summary no longer agree with the session:
+    // only an unambiguous time-window candidate is used, and its text is cleaned like
+    // every other hydration path.
+    const byTime = distinctPairs(pairs.filter(pair => target && pair.at && Math.abs(pair.at - target) <= HYDRATION_TIME_WINDOW_MS));
+    if (byTime.length === 1) return { user: byTime[0].user, assistant: byTime[0].assistant };
+    if (byTime.length > 1) throw new Error(`ambiguous time-window match (${byTime.length} candidates) in session ${sessionId}`);
+    throw new Error(`no matching user message in session ${sessionId} (${pairs.length} candidates)`);
+  };
+
   const consolidate = async sessionKey => {
     const list = rowsBySession.get(sessionKey);
     if (!list || list.length < 2) return { merged: 0 };
@@ -2229,41 +2334,15 @@ async function start(ctx, config) {
               for (const match of result.matches) {
                 if (cleanUserText(match.user) || match.assistant) { match.sourceAvailable = true; continue; }
                 try {
-                  const read = await sessionQuery.readSession(match.sessionId);
-                  const events = Array.isArray(read?.events) ? read.events : [];
-                  const target = Date.parse(match.time) || 0;
-                  let userText = '';
-                  let assistantText = '';
-                  let matched = false;
-                  for (let i = 0; i < events.length; i += 1) {
-                    if (events[i].type !== 'user/message') continue;
-                    const candidateUser = messageText(events[i].data);
-                    let candidateAssistant = '';
-                    for (let j = i + 1; j < events.length; j += 1) {
-                      if (events[j].type === 'assistant/message') { candidateAssistant = messageText(events[j].data?.message); break; }
-                      if (events[j].type === 'user/message') break;
-                    }
-                    const summaryHead = String(match.summary || '').replace(/\s+/g, '').slice(0, 20);
-                    const candidateClean = String(candidateUser || '').replace(/\s+/g, '');
-                    const hashHit = match.textHash && hashText(`${cleanUserText(candidateUser)}\n${candidateAssistant}`) === match.textHash;
-                    const prefixHit = summaryHead.length >= 8 && candidateClean.includes(summaryHead);
-                    if (hashHit || prefixHit) {
-                      userText = cleanUserText(candidateUser);
-                      assistantText = candidateAssistant;
-                      matched = true;
-                      break;
-                    }
-                    if (!matched) {
-                      const time = Number(events[i].time) || 0;
-                      if (Math.abs(time - target) < 5000) { userText = candidateUser; assistantText = candidateAssistant; }
-                    }
-                  }
-                  if (!userText) throw new Error('no matching user message');
-                  match.user = full ? userText : truncate(userText, chars);
-                  match.assistant = full ? assistantText : truncate(assistantText, chars);
+                  const hydrated = await hydrateMatch(match);
+                  match.user = full ? hydrated.user : truncate(hydrated.user, chars);
+                  match.assistant = full ? hydrated.assistant : truncate(hydrated.assistant, chars);
                   match.sourceAvailable = true;
                 } catch (error) {
+                  // Never guess: an unverified row stays empty and says why.
                   match.sourceAvailable = false;
+                  match.user = '';
+                  match.assistant = '';
                   match.hydrationError = String(error && error.message ? error.message : error).slice(0, 160);
                 }
               }
