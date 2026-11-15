@@ -1900,6 +1900,8 @@ async function start(ctx, config) {
       ? match
       : {
           id: match.id,
+          sessionId: match.sessionId,
+          textHash: match.textHash,
           time: match.time,
           score: match.score,
           reasons: match.reasons,
@@ -2241,8 +2243,12 @@ async function start(ctx, config) {
                       if (events[j].type === 'assistant/message') { candidateAssistant = messageText(events[j].data?.message); break; }
                       if (events[j].type === 'user/message') break;
                     }
-                    if (match.textHash && hashText(`${cleanUserText(candidateUser)}\n${candidateAssistant}`) === match.textHash) {
-                      userText = candidateUser;
+                    const summaryHead = String(match.summary || '').replace(/\s+/g, '').slice(0, 20);
+                    const candidateClean = String(candidateUser || '').replace(/\s+/g, '');
+                    const hashHit = match.textHash && hashText(`${cleanUserText(candidateUser)}\n${candidateAssistant}`) === match.textHash;
+                    const prefixHit = summaryHead.length >= 8 && candidateClean.includes(summaryHead);
+                    if (hashHit || prefixHit) {
+                      userText = cleanUserText(candidateUser);
                       assistantText = candidateAssistant;
                       matched = true;
                       break;
@@ -2256,8 +2262,9 @@ async function start(ctx, config) {
                   match.user = full ? userText : truncate(userText, chars);
                   match.assistant = full ? assistantText : truncate(assistantText, chars);
                   match.sourceAvailable = true;
-                } catch {
+                } catch (error) {
                   match.sourceAvailable = false;
+                  match.hydrationError = String(error && error.message ? error.message : error).slice(0, 160);
                 }
               }
             }
