@@ -57,8 +57,23 @@ export function observationExpired(row, now = Date.now(), ttl = SCOPE_TTL_DAYS) 
   const scope = scopeOf(row);
   const days = scope === 'durable' ? null : ttl[scope] ?? SCOPE_TTL_DAYS[scope];
   if (days === null || days === undefined) return false;
-  const lastSeen = Number(row?.updatedAt) || Number(row?.createdAt) || 0;
-  return lastSeen > 0 && now - lastSeen > days * 86400000;
+  // Only independent corroboration or creation may renew TTL; editing links must not.
+  const anchor = Number(row?.lastCorroboratedAt) || Number(row?.createdAt) || 0;
+  return anchor > 0 && now - anchor > days * 86400000;
+}
+
+/**
+ * Independent corroboration: a *different* session observing the same thing extends the
+ * TTL and gives a bounded confidence boost. Same-session repeats are a no-op.
+ */
+export function applyCorroboration(row, sessionId, now = Date.now()) {
+  if (!row || !sessionId) return false;
+  const sessions = Array.isArray(row.sessions) ? row.sessions : [];
+  if (sessions.includes(String(sessionId))) return false;
+  row.sessions = [...sessions, String(sessionId)];
+  row.lastCorroboratedAt = now;
+  row.updatedAt = now;
+  return true;
 }
 
 /** Inferred confidence decays with age and gets a bounded boost from independent sessions. */
@@ -197,6 +212,7 @@ const DOMAIN_SPEC = {
             contradicts: Array.isArray(value.contradicts) ? value.contradicts.filter(entry => typeof entry === 'string') : [],
             conditionalContradicts: Array.isArray(value.conditionalContradicts) ? value.conditionalContradicts.filter(entry => typeof entry === 'string') : [],
             sessions: Array.isArray(value.sessions) ? value.sessions.filter(entry => typeof entry === 'string') : [],
+            lastCorroboratedAt: Number.isFinite(value.lastCorroboratedAt) ? value.lastCorroboratedAt : undefined,
             scope: OBSERVATION_SCOPES.includes(value.scope) ? value.scope : undefined,
             correctionOf: typeof value.correctionOf === 'string' ? value.correctionOf : null,
             sensitivity: ['normal', 'sensitive', 'private'].includes(value.sensitivity) ? value.sensitivity : 'normal',
@@ -248,6 +264,7 @@ const TOOL = {
       status: { type: 'string', enum: OBSERVATION_STATUS, description: 'For observations: filter by status (current/withdrawn/superseded).' },
       observationScope: { type: 'string', enum: OBSERVATION_SCOPES, description: 'For observe: transient (emotional state, ~3d), situational (goal/decision/behavior/inference, ~30d) or durable (facts/preferences/constraints). Defaults derive from type; TTL only stops injection, it never deletes.' },
       conditional: { type: 'boolean', description: 'For contradict: mark the pair as situationally conflicting (different contexts), so it is not counted as an unresolved contradiction.' },
+      corroborates: { type: 'string', description: 'For observe: id of an existing observation that a different session independently observed; appends the session, renews TTL and gives a bounded confidence boost (same session is a no-op).' },
       full: { type: 'boolean', description: 'Search/recent: return complete user and assistant paragraphs instead of snippets.' },
       snippetChars: { type: 'integer', minimum: 80, maximum: 4000, description: 'Snippet length for compact results.' },
     },
@@ -899,8 +916,9 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     const kindLabel = { observed: '事实', self_reported: '自述', inferred: '推断', corrected: '纠正' };
     const kindOrder = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
     const resident = row => {
-      if (row.kind === 'corrected') return true; // user's own correction always wins
-      if (row.sensitivity === 'sensitive' || row.sensitivity === 'private') return false; // needs a cue
+      // Sensitive items are never injected proactively, not even corrections (mention=P1-1).
+      if (row.sensitivity === 'sensitive' || row.sensitivity === 'private') return false;
+      if (row.kind === 'corrected') return true; // user's own correction wins
       if (RESIDENT_OBSERVATION_TYPES.has(row.type)) return true;
       return row.kind === 'self_reported' && !CUE_ONLY_TYPES.has(row.type);
     };
@@ -1251,9 +1269,11 @@ async function start(ctx, config) {
   };
   const addObservation = async (args, kind, sessionId) => {
     const at = Date.now();
+    const requestedType = OBSERVATION_TYPES.includes(args.observationType) ? args.observationType
+      : OBSERVATION_TYPES.includes(args.type) ? args.type : 'behavior_observation';
     const row = {
       id: uuid(),
-      type: OBSERVATION_TYPES.includes(args.type) ? args.type : 'behavior_observation',
+      type: requestedType,
       text: String(args.content || args.text || '').trim().slice(0, 1000),
       kind,
       confidence: Number.isFinite(args.confidence) ? Math.max(0, Math.min(1, args.confidence)) : null,
@@ -1264,6 +1284,7 @@ async function start(ctx, config) {
       contradicts: [],
       conditionalContradicts: [],
       sessions: sessionId ? [String(sessionId)] : [],
+      lastCorroboratedAt: at,
       scope: OBSERVATION_SCOPES.includes(args.observationScope) ? args.observationScope : undefined,
       correctionOf: null,
       sensitivity: ['normal', 'sensitive', 'private'].includes(args.sensitivity) ? args.sensitivity : 'normal',
@@ -2004,6 +2025,22 @@ async function start(ctx, config) {
             };
           }
           if (action === 'observe') {
+            if (typeof args.corroborates === 'string' && args.corroborates) {
+              const target = observations.get(args.corroborates);
+              if (!target) return { error: 'Unknown observation id in corroborates.' };
+              if (target.status !== 'current') return { error: 'Only current observations can be corroborated.' };
+              const added = applyCorroboration(target, key, Date.now());
+              await persistObservation(target);
+              return {
+                corroborated: target.id,
+                sessionAdded: added,
+                sessions: new Set(target.sessions || []).size,
+                effectiveConfidence: effectiveObservationConfidence(target, { halfLifeDays: inferenceHalfLifeDays }),
+                note: added
+                  ? 'Independent session recorded; TTL renewed and confidence boosted (bounded).'
+                  : 'Same session already recorded; no change.',
+              };
+            }
             const epistemic = OBSERVATION_KINDS.includes(args.epistemic) ? args.epistemic : 'observed';
             const text = String(args.content || args.text || '').trim();
             if (!text) return { error: 'content is required for action=observe' };
@@ -2047,7 +2084,9 @@ async function start(ctx, config) {
               contradicts: inheritedContradictions,
               conditionalContradicts: [],
               sessions: [...new Set([...(original.sessions || []), key])],
-              scope: original.scope,
+              lastCorroboratedAt: at,
+              // Inherit the *derived* scope: `original.scope` is usually undefined on legacy rows.
+              scope: scopeOf(original),
               correctionOf: original.id,
               sensitivity: original.sensitivity,
               status: 'current',

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -463,10 +463,39 @@ check('scope: derived on read, TTL only stops injection', () => {
   assert.equal(scopeOf({ type: 'goal' }), 'situational');
   assert.equal(scopeOf({ type: 'explicit_fact' }), 'durable');
   assert.equal(scopeOf({ type: 'emotional_state', scope: 'durable' }), 'durable');
+  assert.equal(scopeOf({ type: 'correction', scope: 'transient' }), 'transient');
   const now = Date.now();
   assert.ok(observationExpired({ type: 'emotional_state', createdAt: now - 4 * 86400000 }, now));
   assert.ok(!observationExpired({ type: 'emotional_state', createdAt: now - 1 * 86400000 }, now));
   assert.ok(!observationExpired({ type: 'explicit_fact', createdAt: now - 900 * 86400000 }, now));
+});
+
+check('TTL: unrelated edits do not renew; independent corroboration does', () => {
+  const now = Date.now();
+  const aged = { type: 'emotional_state', createdAt: now - 10 * 86400000, updatedAt: now - 1 * 86400000 };
+  assert.ok(observationExpired(aged, now), 'updatedAt must not renew TTL');
+  const corroborated = { type: 'emotional_state', createdAt: now - 10 * 86400000, updatedAt: now - 1 * 86400000, sessions: ['own-session'] };
+  const added = applyCorroboration(corroborated, 'other-session', now);
+  assert.equal(added, true);
+  assert.ok(!observationExpired(corroborated, now), 'corroboration renews TTL');
+  assert.equal(applyCorroboration(corroborated, 'other-session', now), false, 'same session is a no-op');
+  assert.equal(corroborated.sessions.length, 2);
+  const inferred = { kind: 'inferred', confidence: 0.6, createdAt: now - 90 * 86400000, sessions: ['s1'] };
+  const before = effectiveObservationConfidence(inferred, { now });
+  applyCorroboration(inferred, 's2', now);
+  assert.ok(effectiveObservationConfidence(inferred, { now }) > before);
+});
+
+check('injection: sensitive corrections still need a cue', () => {
+  const sensitive = { id: 'sc', kind: 'corrected', type: 'correction', text: '敏感纠正内容', status: 'current', confidence: null, alternatives: [], sensitivity: 'sensitive', contradicts: [] };
+  const unrelated = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '帮我写个排序函数',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: [sensitive],
+  });
+  assert.ok(!unrelated.includes('敏感纠正内容'), unrelated.slice(0, 160));
 });
 
 check('inferred confidence: decays with age, boosted by independent sessions', () => {

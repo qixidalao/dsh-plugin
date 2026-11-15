@@ -38,6 +38,18 @@
 
 这正是预期的保守行为：同一个人的话题换了（这次在聊插件，基线里多是 AIOS/部署），词汇与实体重合自然变低，**风格相似度 0.99** 又支持是同一人 —— 综合成 `uncertain` 而不是武断下结论。判断权留给模型，必要时由模型向你确认。
 
+## v1.12.1 P1-2 缺陷修复
+
+| 问题 | 修复 | 运行时验证 |
+|---|---|---|
+| TTL 会被无关操作续期 | TTL 锚点改为 `lastCorroboratedAt`：创建时设置，之后只有**独立会话印证**才更新；`contradict`/`correct`/引用清理不再续期 | 把 10 天前的 `emotional_state` 的 `updatedAt` 改成 1 天前，重载后仍判过期（`stats.observations.expired=1`，注入提示“1 条观察已过期”） |
+| 独立会话增强是死代码 | 新增显式印证入口 `observe corroborates=<id>`：不同会话追加并续期 + 有上限置信度增强，同会话 no-op | 同会话调用返回 `sessionAdded:false`；模拟另一个会话后返回 `sessionAdded:true`，`sessions:2`，有效置信度 0.447 → 0.547 |
+| 短期观察的纠正永久化 | `correct` 写 `scope: scopeOf(original)`（派生值），不再依赖通常为 `undefined` 的 `original.scope` | 对 `emotional_state` 纠正后，`observations` 显示纠正 `scope: transient`，不再 400 天不过期 |
+| 额外发现：`observe` 忽略 `observationType` | `addObservation` 优先读 `observationType`，所有观察不再一律落成 `behavior_observation`（否则 scope 派生全错） | `emotional_state` 观察返回 `type: emotional_state, scope: transient` |
+| 敏感项豁免 | 敏感/私密项即使 `kind=corrected` 也需线索，不每轮注入 | 单测：无关消息下敏感纠正不出现 |
+
+测试 41 → 43 项；eval 基线不变（正 10/10 MRR 0.883，负 0/8）。
+
 ## v1.12 时间属性与助手画像改造
 
 | 内容 | 实现 | 验证 |
