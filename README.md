@@ -5,7 +5,30 @@
 
 持久化的长期记忆插件：维护**用户画像**、**助手画像**、**证据层观察**、**跨会话印象**、**实体索引**与**可检索的历史原文**。它只补充上下文窗口里没有的东西，不重复注入当前对话。
 
-> 架构、数据模型、写入/注入管线、打分公式等细节见 [DOCS.md](./DOCS.md)。
+> 架构、数据模型、写入/注入管线、打分公式等细节见 [DOCS.md](./DOCS.md)。版本历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+## 安装（Preview）
+
+这是一个 DeepSeek Harness 的 Cordis **bundle 插件**，不是独立应用：
+
+1. 克隆仓库到本机：
+   ```bash
+   git clone https://github.com/qixidalao/dsh-plugin.git
+   ```
+2. 用 Harness 的 plugin manager，把仓库路径作为 bundle 安装到当前 profile（`install_bundle`，target 为仓库绝对路径）。
+3. 重载插件后执行 `/dmem stats`，看到 `storage: durable` 即持久化生效；数据在 `$DSH_HOME/storages/dynamic_memory/`。
+
+**发布渠道**：Preview（`main` + tag）→ 可安装（bundle）→ Stable（npm；当前 `package.json` 为 `private: true`，等包名与许可证确定后再发）。
+
+**许可证**：AGPL-3.0（见 [LICENSE](./LICENSE)）。**数据不在仓库里**：记忆只写本机存储；真实评测数据也只在本地（gitignored）。
+
+## 快速验证
+
+```bash
+node test.mjs        # 45 项纯函数测试
+node test-host.mjs   # 16 项生命周期/写入路径（内存 mock host）
+node eval.mjs --fixture   # 合成评测集（不需要真实数据）
+```
 
 ## v1.8 身份连续性：证据，而不是判决
 

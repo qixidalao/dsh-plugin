@@ -3,9 +3,23 @@
   "version": "1.12.3",
   "private": true,
   "type": "module",
-  "description": "Durable long-term memory: evidence-layer observations with scope/TTL and quote-verified corroboration, portraits (user + behavior-based assistant self-portrait), layered injection, calibrated retrieval confidence, gap detection, recycle bin and speaker-continuity evidence",
+  "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, user and assistant portraits, layered injection, calibrated retrieval confidence, gap detection and recycle bin",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qixidalao/dsh-plugin.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "cordis-plugin",
+    "long-term-memory",
+    "memory"
+  ],
   "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
-  "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "eval.mjs", "eval-queries.fixture.json", "test.mjs", "test-host.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
+  "files": ["index.js", "cordis.patch.yml", "README.md", "DOCS.md", "CHANGELOG.md", "eval.mjs", "eval-queries.fixture.json", "test.mjs", "test-host.mjs", "bench.mjs", "locale/*.json", "icon.svg"],
   "scripts": {
     "test": "node test.mjs",
     "test:host": "node test-host.mjs",

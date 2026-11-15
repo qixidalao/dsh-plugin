@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：1.12.2（`@local/dynamic-memory`）
+> 版本：1.12.3（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
