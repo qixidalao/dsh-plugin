@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Pure-function tests for the memory plugin (no Harness runtime required).
 import assert from 'node:assert/strict';
-import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts } from './index.js';
+import { entitiesOf, buildEntityIndex, rankExchanges, isReAsk, cleanUserText, snippetOf, computeGapState, isStale, selectForArchive, renderContext, styleOf, buildSpeakerBaseline, speakerContinuity, selfDeclarationCues, lintTraitLabel, sharedCueWords, scopeOf, observationExpired, effectiveObservationConfidence, applyCorroboration, findQuoteInTexts, mentionOf, buildReflectProposals, findCrossLayerDuplicates } from './index.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -306,8 +306,8 @@ check('observations: types are separated in injection, private ones hidden', () 
     staleFacets: new Set(),
     observations: [
       { id: 'o1', type: 'behavior_observation', kind: 'observed', text: '连续三次推迟处理任务', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [] },
-      { id: 'o2', type: 'inferred_motivation', kind: 'inferred', text: '可能担心失败', status: 'current', confidence: 0.4, alternatives: ['优先级低'], sensitivity: 'normal', contradicts: ['o3'] },
-      { id: 'o3', type: 'emotional_state', kind: 'self_reported', text: '最近压力大', status: 'current', confidence: null, alternatives: [], sensitivity: 'private', contradicts: ['o2'] },
+      { id: 'o2', type: 'inferred_motivation', kind: 'inferred', text: '可能担心失败', status: 'current', confidence: 0.4, alternatives: ['优先级低'], sensitivity: 'normal', contradicts: ['o1'] },
+      { id: 'o3', type: 'emotional_state', kind: 'self_reported', text: '最近压力大', status: 'current', confidence: null, alternatives: [], sensitivity: 'private', contradicts: [] },
     ],
     observationChars: 120,
     observationBudget: 400,
@@ -564,6 +564,54 @@ check('contradictions: counts are complete even when the display budget truncate
     observations: obs, observationChars: 20, observationBudget: 60,
   });
   assert.ok(text.includes('4 对未解矛盾'), text.slice(0, 200));
+});
+
+
+check('mention: defaults derive from sensitivity, scope and type', () => {
+  assert.equal(mentionOf({ type: 'explicit_fact', sensitivity: 'normal' }), 'proactive');
+  assert.equal(mentionOf({ type: 'emotional_state', sensitivity: 'normal' }), 'if_asked');
+  assert.equal(mentionOf({ type: 'behavior_observation', sensitivity: 'sensitive' }), 'if_asked');
+  assert.equal(mentionOf({ type: 'explicit_fact', sensitivity: 'private' }), 'never');
+});
+
+check('injection: if_asked is marked, never is hidden', () => {
+  const text = renderContext({
+    portraitRows: new Map(), portraitChars: 240, portraitBudget: 900,
+    selfRows: undefined, selfChars: 180, selfBudget: 520,
+    digest: [], digestChars: 100, lastUserText: '',
+    gap: null, gapDays: 30, staleFacets: new Set(), stopwords: new Set(),
+    observations: [
+      { id: 'a', type: 'emotional_state', kind: 'self_reported', text: '最近压力大', status: 'current', confidence: null, alternatives: [], sensitivity: 'sensitive', contradicts: [] },
+      { id: 'b', type: 'explicit_fact', kind: 'observed', text: '不该出现', status: 'current', confidence: null, alternatives: [], sensitivity: 'normal', mention: 'never', contradicts: [] },
+    ],
+  });
+  assert.ok(text.includes('仅语气，不主动提'), text.slice(0, 200));
+  assert.ok(!text.includes('不该出现'), 'never is not injected');
+  assert.ok(text.includes('披露策略'), text.slice(0, 240));
+});
+
+check('reflect: proposals need >=3 distinct sessions and stay proposed', () => {
+  const make = sessions => ({
+    id: 'r' + sessions[0], kind: 'observed', type: 'behavior_observation', text: '反复推迟任务，先做别的',
+    status: 'current', sessions, confidence: null, alternatives: [], sensitivity: 'normal', contradicts: [],
+  });
+  assert.equal(buildReflectProposals([make(['s1']), make(['s2'])]).length, 0);
+  const proposals = buildReflectProposals([make(['s1']), make(['s2']), make(['s3'])]);
+  assert.equal(proposals.length, 1);
+  assert.equal(proposals[0].status, 'proposed');
+  assert.equal(proposals[0].kind, 'inferred');
+  assert.ok(proposals[0].alternatives.length >= 1);
+});
+
+check('duplicates: cross-layer report only lists similar pairs', () => {
+  const portrait = new Map([['preferences', { facet: 'preferences', content: '偏好极简依赖，不喜欢装一堆库' }]]);
+  const observations = [
+    { id: 'dup', text: '偏好极简依赖，不装一堆库', status: 'current' },
+    { id: 'other', text: '周末去爬山', status: 'current' },
+  ];
+  const pairs = findCrossLayerDuplicates(portrait, observations);
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].observationId, 'dup');
 });
 
 console.log(`\n${passed} checks passed`);

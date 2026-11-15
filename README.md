@@ -61,6 +61,19 @@ node eval.mjs --fixture   # 合成评测集（不需要真实数据）
 
 这正是预期的保守行为：同一个人的话题换了（这次在聊插件，基线里多是 AIOS/部署），词汇与实体重合自然变低，**风格相似度 0.99** 又支持是同一人 —— 综合成 `uncertain` 而不是武断下结论。判断权留给模型，必要时由模型向你确认。
 
+## v1.14.0 巩固、重算与披露策略
+
+| 能力 | 实现 | 验证 |
+|---|---|---|
+| 画像版本来源绑定 | 新版本只使用本次 `sourceIds`/`sourceObservationIds`；旧版本的来源留在 `history`，不跨版本累积 | host fixture：旧版本 history 保留来源，新版本为空 |
+| `mention` 披露策略 | `proactive / if_asked / never`，默认由 `sensitivity + scope + type` 派生；`if_asked` 注入带“仅语气，不主动提”，`never` 不注入 | 单测：默认值派生、标记与隐藏 |
+| `reflect` 巩固草稿 | 聚类当前观察，≥3 个不同会话才生成 `status: proposed`；草稿不注入，需 `review` 才 current/withdrawn | 单测：2 会话不生成、3 会话生成且 status=proposed |
+| `recompute` | 返回 facet 存活来源、失效来源 id、上一版内容 | 代码路径 + 工具 |
+| `duplicates` | 画像与观察的跨层重复报告（jaccard ≥0.6），只报告不删除 | 单测 |
+| 校准指标 | `eval.mjs` 输出 confidence 分桶命中率 | 本地：high 3/3 · medium 7/7；fixture：high 3/3 |
+
+测试 45 → 49；host fixture 16 项。
+
 ## v1.12.3 发布前可靠性
 
 | 问题 | 修复 | 验证 |

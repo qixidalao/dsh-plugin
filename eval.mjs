@@ -130,3 +130,20 @@ for (const variant of variants) {
   const total = totals.get(variant.name);
   console.log(`${variant.name.padEnd(9, ' ')} hit@${k}: ${total.hits}/${n}  MRR: ${(total.mrr / n).toFixed(3)}  false-positive: ${total.falsePositives}/${negatives.length}`);
 }
+
+// Calibration: does the reported confidence label actually predict a hit?
+const fullVariant = variants.find(variant => variant.name === 'full');
+const calibration = new Map();
+for (const query of positives) {
+  const result = fullVariant.run(query.query, k);
+  const label = result.confidence?.label ?? 'n/a';
+  const bucket = calibration.get(label) || { hits: 0, total: 0 };
+  bucket.total += 1;
+  if (hitRank(result.matches, query.expectContains)) bucket.hits += 1;
+  calibration.set(label, bucket);
+}
+const calibrationText = [...calibration.entries()]
+  .sort(([left], [right]) => String(left).localeCompare(String(right)))
+  .map(([label, bucket]) => `${label} ${bucket.hits}/${bucket.total}`)
+  .join(' · ');
+console.log(`calibration (full): ${calibrationText}`);

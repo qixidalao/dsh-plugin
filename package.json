@@ -1,9 +1,9 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "1.12.3",
+  "version": "1.14.0",
   "private": true,
   "type": "module",
-  "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, user and assistant portraits, layered injection, calibrated retrieval confidence, gap detection and recycle bin",
+  "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, portrait versions with own sources, layered injection with disclosure policy, consolidation drafts, calibrated retrieval confidence and recycle bin",
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",

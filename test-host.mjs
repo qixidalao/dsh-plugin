@@ -133,6 +133,12 @@ assert.equal(stats3.capture, 'paused', 'stats reports paused capture');
 // Deleting an exchange clears facet/observation references and marks the facet for recompute.
 const recent = await host2.tools[0].execute({ action: 'recent', limit: 1 });
 const exchangeId = recent.exchanges[0].id;
+// Each portrait version binds its own sources: the old version keeps its set in history.
+await host2.tools[0].execute({ action: 'learn', facet: 'dynamics', content: 'fixture 动态', sourceIds: [exchangeId] });
+await host2.tools[0].execute({ action: 'learn', facet: 'dynamics', content: 'fixture 动态 v2' });
+const versionedFacet = [...storage.tables.get('portrait').values()].find(row => row.facet === 'dynamics');
+assert.ok(versionedFacet.history[0].sourceExchangeIds.includes(exchangeId), 'old version keeps its own sources');
+assert.equal(versionedFacet.sourceExchangeIds.length, 0, 'new version does not inherit old sources');
 await host2.tools[0].execute({ action: 'learn', facet: 'thinking', content: 'fixture 结论', sourceIds: [exchangeId] });
 const observed = await host2.tools[0].execute({ action: 'observe', type: 'explicit_fact', content: 'fixture 观察', sourceIds: [exchangeId] });
 await host2.tools[0].execute({ action: 'forget', id: exchangeId });

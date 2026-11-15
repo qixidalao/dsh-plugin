@@ -1,6 +1,16 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。当前为 **1.12.3**（Preview）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。当前为 **1.14.0**（Preview）。
+
+## 1.14.0 — 巩固、重算与披露策略（v1.13 + v1.14 合并发布）
+
+- **画像版本绑定自己的来源**：`learn` 写新版本时使用本次提供的来源；旧版本把自己的来源集合留在 `history` 里，不再跨版本累积。
+- **`mention` 披露策略**：`proactive / if_asked / never`；默认由 `sensitivity + scope + type` 派生（私密 → never；敏感/短暂/情绪/关系 → if_asked）。`if_asked` 注入带“仅语气，不主动提”标记；`never` 不进入上下文，但仍可用 `observations` 查看。
+- **`reflect` 巩固草稿**：按内容相似度聚类当前观察，只有出现在 **≥3 个不同会话** 才生成 `status: proposed` 草稿；草稿不注入，需 `review decision=accept|reject` 后才进入 current/withdrawn。
+- **`recompute`**：返回该 facet 仍存活的来源观察、已失效来源 id、上一版内容，供模型一次取齐证据后重写（不自动写入）。
+- **`duplicates`**：画像 facet 与当前观察的跨层重复报告（相似度 ≥0.6），只报告不删除。
+- **误注入率与校准**：`eval.mjs` 增加 confidence 分桶命中率（calibration），与 false-positive 并列输出。
+- 测试 45 → 49；`test-host` 扩展到 16 项（含版本来源绑定）。
 
 ## 1.12.3 — 发布可靠性（2026-11-15）
 

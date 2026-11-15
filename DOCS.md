@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：1.12.3（`@local/dynamic-memory`）
+> 版本：1.14.0（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -238,6 +238,9 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 - ✅ **隐私分级**：`sensitivity=private` 的观察不注入明文、不导出，只显示条数；`forget` 可按 id 删除观察。
 - ✅ **用户控制**：`observations` 可列出当前/历史观察，`forget` 可删除，`export` 可导出（私密项不导出）。
 - ✅ **用户心理 facet 需来源**（v1.12.2）：`learn target=user facet=psychology` 必须带至少一个真实存在的 `sourceObservationIds`，否则拒绝——心理归纳不能没有证据。
+- ✅ **画像版本来源绑定**（v1.14）：写新版本时使用本次提供的来源；旧版本的来源集合随内容留在 `history`，不再跨版本累积，因此每一版都可独立追溯与重算。
+- ✅ **披露策略 `mention`**（v1.14）：`proactive / if_asked / never`；默认由 `sensitivity + scope + type` 派生（私密 → never；敏感/短暂/情绪/关系 → if_asked）。`if_asked` 注入带“仅语气，不主动提”；`never` 不进入上下文但可在 `observations` 查看。
+- ✅ **巩固与重算**（v1.14）：`reflect` 只对 **≥3 个不同会话** 出现的相似观察生成 `status: proposed` 草稿（不注入），`review decision=accept|reject` 决定 current/withdrawn；`recompute facet=...` 返回存活来源、失效来源 id 与上一版内容；`duplicates` 报告画像与观察的跨层重复（只报告，不删除）。
 - 📐 **评测集**：真实评测数据只在本地（`eval-queries.local.json` / `eval-drafts.local.md`，gitignore）；仓库里只有合成的 `eval-queries.fixture.json` 供 CI 用。P3-1 的 20 条草稿在本地，待评审改写、grep 复核负样本后拆分 dev/test 并冻结。
 
 ## 7. 时间维度：间隔、过期、回收区 ✅
@@ -321,7 +324,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
-| `node test.mjs` | 45 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL（无关编辑不续期）、印证引文校验、推断置信度衰减与复习重置、标签 lint | ✅ 45/45 |
+| `node test.mjs` | 49 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层（纠正优先、常驻/线索分层、短消息、敏感项需要线索、常驻项预算优先）、矛盾存活与完整计数、conditional 矛盾、scope/TTL（无关编辑不续期）、印证引文校验、推断置信度衰减与复习重置、mention 派生、reflect 草稿、跨层重复、标签 lint | ✅ 49/49 |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ❌ 需要本机记忆库 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
@@ -373,8 +376,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | 版本 | 内容 | 状态 |
 |---|---|---|
 | v1.12.3 | 发布可靠性：卸载时 flush → close 等待在途写入；删除 exchange 级联清理 facet/observation 引用并标待重算；`capture: false` 与 `/dmem pause`；README/DOCS 统一；真实评测数据本地化（gitignore + 合成 fixture 供 CI）；内存版 mock host 夹具 | ✅ |
-| v1.13 | 每个画像版本绑定自己的来源集合；`mention`（默认值由 scope + type + sensitivity 派生）；冻结评测集；误注入率与校准指标；端到端对照 | 📐 |
-| v1.14 | `reflect`（复用 observation `status: proposed`，≥3 个会话才起草）；`recompute`；跨层重复检测 | 📐 |
+| v1.13（并入 1.14.0） | 画像版本绑定自己的来源集合；`mention`（默认值由 scope + type + sensitivity 派生）；校准/误注入率指标 | ✅ |
+| v1.14 | `reflect`（`status: proposed`，≥3 个会话才起草）；`recompute`；跨层重复检测 | ✅ v1.14.0 |
 | 之后 | 看指标再决定联想检索等增强；npm 发布等包名/许可证确定 | 📐 |
 
 **明确不做 / 推迟**：
@@ -536,6 +539,7 @@ v1.12.3 可靠性（✅）─► v1.13 mention + 画像来源集合 + 冻结评�
 
 | 版本 | 内容 |
 |---|---|
+| 1.14.0 | 画像版本来源绑定（不跨版本累积，旧版本来源存入 history）；`mention` 披露策略（proactive/if_asked/never，默认由 sensitivity+scope+type 派生）；`reflect` 巩固草稿（≥3 会话，proposed 不注入）+ `review`；`recompute`；`duplicates` 跨层重复报告；eval 增加 calibration 分桶；测试 45 → 49；host fixture 16 项 |
 | 1.12.3 | 发布可靠性：卸载清理改为 async，先等在途写入（`pendingWrites`）、再 flush、再 close；待执行的整合在卸载时执行而不是丢弃；删除 exchange 时级联清理 facet `sourceExchangeIds` 与 observation `sourceIds` 并标 `needsRecompute`；新增 `capture: false` 与 `/dmem pause|resume|capture`；README/DOCS 修正过时的“访问强化”；真实评测数据移出仓库（`eval-queries.local.json` / `eval-drafts.local.md`，gitignore），CI 改用 `eval-queries.fixture.json` 合成数据；新增内存 mock host 夹具；包保持 `private: true` |
 | 1.12.2 | 补印证入口两个缺口：`corroborates` 必须带 `quote`，插件在当前会话用户消息里做子串校验（防止模型看到自己的推断后自我强化）；推断置信度与 TTL 的衰减锚点改为 `lastCorroboratedAt`（复习重置遗忘曲线）；`learn target=user facet=psychology` 必须带 `sourceObservationIds`；助手“喜好”去重；新增评测草稿。测试 43 → 45 |
 | 1.12.1 | 修复 P1-2 三个实测缺陷：TTL 锚点改为 `lastCorroboratedAt`（无关编辑不续期，只有独立会话印证续期）；新增 `observe corroborates=<id>` 作为显式印证入口（同会话 no-op，不同会话给有上限的置信度增强）；`correct` 用 `scopeOf(original)` 继承派生 scope，短期观察的纠正不再永久化；`observe` 修正忽略 `observationType` 导致全部落成 `behavior_observation`；常驻判断对敏感项的豁免收紧（敏感纠正也需线索）。测试 41 → 43；运行时验证：10 天前的 `emotional_state` 编辑 `updatedAt` 后仍判过期，`corroborates` 使置信度 0.447 → 0.547，纠正 scope 为 transient |

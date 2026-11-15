@@ -30,7 +30,8 @@ const OBSERVATION_TYPES = [
   'habit_pattern', 'contradiction', 'goal', 'constraint', 'correction',
 ];
 const OBSERVATION_KINDS = ['observed', 'self_reported', 'inferred', 'corrected'];
-const OBSERVATION_STATUS = ['current', 'withdrawn', 'superseded'];
+const OBSERVATION_STATUS = ['current', 'withdrawn', 'superseded', 'proposed'];
+const MENTION_VALUES = ['proactive', 'if_asked', 'never'];
 const OBSERVATION_SCOPES = ['transient', 'situational', 'durable'];
 const DEFAULT_OBSERVATION_SCOPE = {
   emotional_state: 'transient',
@@ -95,6 +96,73 @@ export function effectiveObservationConfidence(row, { now = Date.now(), halfLife
   const boost = 0.1 * Math.min(2, Math.max(0, sessions - 1));
   return Math.max(0, Math.min(1, decayed + boost));
 }
+/** Disclosure policy: whether the assistant may raise this observation unprompted. */
+export function mentionOf(row) {
+  if (row && MENTION_VALUES.includes(row.mention)) return row.mention;
+  if (row && row.sensitivity === 'private') return 'never';
+  const scope = scopeOf(row);
+  if (row && (row.sensitivity === 'sensitive'
+    || scope === 'transient'
+    || row.type === 'relationship_context'
+    || row.type === 'emotional_state')) return 'if_asked';
+  return 'proactive';
+}
+
+const REFLECT_DEFAULT = { minSessions: 3, jaccardMin: 0.5, maxProposals: 5 };
+
+/**
+ * Consolidation candidate builder: cluster current observations by content similarity and
+ * only propose a pattern seen in >= minSessions *distinct* sessions. Drafts are `proposed`
+ * and never injected; a human/model review accepts or rejects them.
+ */
+export function buildReflectProposals(rows, options = {}) {
+  const { minSessions, jaccardMin, maxProposals } = { ...REFLECT_DEFAULT, ...options };
+  const clusters = [];
+  for (const row of rows) {
+    if (!row || row.status !== 'current' || row.kind === 'corrected' || !row.text) continue;
+    const tokens = new Set(tokensOf(row.text));
+    let home = clusters.find(cluster => jaccard([...tokens], [...cluster.tokens]) >= jaccardMin);
+    if (!home) {
+      home = { tokens, rows: [] };
+      clusters.push(home);
+    }
+    home.rows.push(row);
+  }
+  const proposals = [];
+  for (const cluster of clusters) {
+    const sessions = new Set(cluster.rows.flatMap(row => (Array.isArray(row.sessions) ? row.sessions : [])));
+    if (sessions.size < minSessions) continue;
+    const text = [...cluster.rows].sort((left, right) => right.text.length - left.text.length)[0].text;
+    proposals.push({
+      type: 'habit_pattern',
+      kind: 'inferred',
+      status: 'proposed',
+      text,
+      confidence: Number(Math.min(0.8, 0.2 + 0.1 * sessions.size).toFixed(2)),
+      alternatives: ['只是同一段时间里的共同语境'],
+      sourceIds: cluster.rows.map(row => row.id),
+      sessions: [...sessions],
+    });
+  }
+  return proposals.slice(0, maxProposals);
+}
+
+/** Cross-layer duplicate detection between portrait facets and observations. */
+export function findCrossLayerDuplicates(portraitRows, observations, { jaccardMin = 0.6 } = {}) {
+  const facets = portraitRows instanceof Map ? [...portraitRows.values()] : portraitRows;
+  const pairs = [];
+  for (const facet of facets) {
+    if (!facet || !facet.content) continue;
+    const facetTokens = new Set(tokensOf(facet.content));
+    for (const row of observations) {
+      if (!row || row.status !== 'current' || !row.text) continue;
+      const similarity = jaccard([...facetTokens], [...new Set(tokensOf(row.text))]);
+      if (similarity >= jaccardMin) pairs.push({ facet: facet.facet, observationId: row.id, similarity: Number(similarity.toFixed(2)) });
+    }
+  }
+  return pairs;
+}
+
 const TRAIT_LABEL_PATTERN = /(懒惰|内向|固执|敏感|焦虑|抑郁|自恋|社恐|讨好型|完美主义|强迫|回避型|依赖型|玻璃心|脾气差|人格|性格)/;
 const TRAIT_CONTEXT_HINT = /(当时|因为|情境|场景|那次|反复|跨情境|context)/;
 /** Trait adjectives are fine only with real evidence or an explicit situation; length is not an excuse. */
@@ -223,6 +291,7 @@ const DOMAIN_SPEC = {
             sessions: Array.isArray(value.sessions) ? value.sessions.filter(entry => typeof entry === 'string') : [],
             lastCorroboratedAt: Number.isFinite(value.lastCorroboratedAt) ? value.lastCorroboratedAt : undefined,
             scope: OBSERVATION_SCOPES.includes(value.scope) ? value.scope : undefined,
+            mention: MENTION_VALUES.includes(value.mention) ? value.mention : undefined,
             correctionOf: typeof value.correctionOf === 'string' ? value.correctionOf : null,
             sensitivity: ['normal', 'sensitive', 'private'].includes(value.sensitivity) ? value.sensitivity : 'normal',
             createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
@@ -236,11 +305,11 @@ const DOMAIN_SPEC = {
 
 const TOOL = {
   name: 'dynamic_memory',
-  description: 'Long-term memory outside the current context window. search (default) returns compact evidence snippets with confidence and match reasons (full=true only when quoting); recent: this session\'s exchanges; entities: entity index; deepen: write/revise an impression; portrait/learn: user portrait or target=assistant self-portrait; identity: measured speaker-continuity evidence (vocabulary/entity/style/gap/self-declarations), never a verdict; observe/correct/observations/contradict: evidence layer separating observed facts, user self-reports and inferred hypotheses (with alternatives), keeping contradictions unresolved and letting the user correct the record; archive/restore: low-weight recycle bin; export: write memory.md; stats: store health; index: index unopened sessions; repair: re-derive missing user prompts; forget: delete an impression or clear a facet.',
+  description: 'Long-term memory outside the current context window. search (default) returns compact evidence snippets with confidence and match reasons (full=true only when quoting); recent: this session\'s exchanges; entities: entity index; deepen: write/revise an impression; portrait/learn: user portrait or target=assistant self-portrait; identity: measured speaker-continuity evidence, never a verdict; observe/correct/observations/contradict: evidence layer; reflect/review: propose and accept-or-reject consolidated patterns (proposed drafts are never injected); recompute: gather a facet\'s live sources before rewriting; duplicates: cross-layer duplicate report; archive/restore: recycle bin; export: write memory.md; stats: store health; index: index unopened sessions; repair: re-derive missing user prompts; forget: delete an impression or clear a facet.',
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict'] },
+      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates'] },
       query: { type: 'string', description: 'Search keywords; several words are scored together.' },
       id: { type: 'string', description: 'Exchange id from a recent or search result.' },
       summary: { type: 'string', description: 'Concise impression: what the user wanted, what was done, the reply, and durable details.' },
@@ -272,7 +341,9 @@ const TOOL = {
       sensitivity: { type: 'string', enum: ['normal', 'sensitive', 'private'], description: 'For observe: how sensitive this observation is; private ones are minimized in injection.' },
       status: { type: 'string', enum: OBSERVATION_STATUS, description: 'For observations: filter by status (current/withdrawn/superseded).' },
       observationScope: { type: 'string', enum: OBSERVATION_SCOPES, description: 'For observe: transient (emotional state, ~3d), situational (goal/decision/behavior/inference, ~30d) or durable (facts/preferences/constraints). Defaults derive from type; TTL only stops injection, it never deletes.' },
+      mention: { type: 'string', enum: MENTION_VALUES, description: 'For observe: proactive (may raise it), if_asked (tone only, never bring it up; default for sensitive/transient/emotional), never (not injected; listable only).' },
       conditional: { type: 'boolean', description: 'For contradict: mark the pair as situationally conflicting (different contexts), so it is not counted as an unresolved contradiction.' },
+      decision: { type: 'string', enum: ['accept', 'reject'], description: 'For review: accept a proposed observation (becomes current) or reject it (withdrawn).' },
       corroborates: { type: 'string', description: 'For observe: id of an existing observation independently observed by another session. Requires a verifiable quote from the current user message; same session is a no-op.' },
       full: { type: 'boolean', description: 'Search/recent: return complete user and assistant paragraphs instead of snippets.' },
       snippetChars: { type: 'integer', minimum: 80, maximum: 4000, description: 'Snippet length for compact results.' },
@@ -919,8 +990,13 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   const obs = Array.isArray(observations) ? observations.filter(row => row && row.status === 'current') : [];
   const clock = Number.isFinite(now) ? now : Date.now();
   const ttlConfig = ttl || SCOPE_TTL_DAYS;
-  const active = obs.filter(row => !observationExpired(row, clock, ttlConfig));
-  const expiredHidden = obs.length - active.length;
+  const active = obs
+    .filter(row => !observationExpired(row, clock, ttlConfig))
+    .filter(row => row.sensitivity !== 'private')
+    .filter(row => mentionOf(row) !== 'never');
+  const expiredHidden = obs.filter(row => observationExpired(row, clock, ttlConfig)).length;
+  const privateHidden = obs.filter(row => row.sensitivity === 'private' && !observationExpired(row, clock, ttlConfig)).length;
+  const mentionHidden = obs.filter(row => row.sensitivity !== 'private' && !observationExpired(row, clock, ttlConfig) && mentionOf(row) === 'never').length;
   if (active.length || expiredHidden) {
     const kindLabel = { observed: '事实', self_reported: '自述', inferred: '推断', corrected: '纠正' };
     const kindOrder = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
@@ -944,12 +1020,10 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
     // Pre-pass: count contradictions and hidden items over the whole set,
     // so a budget break cannot make the numbers too small (K5).
     const pairs = new Set();
-    let privateHidden = 0;
     for (const row of ordered) {
       for (const peer of row.contradicts || []) {
         if (obsById.has(peer)) pairs.add([row.id, peer].sort().join('|'));
       }
-      if (row.sensitivity === 'private') privateHidden += 1;
     }
     let remaining = observationBudget;
     const lines = [];
@@ -965,21 +1039,23 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
         continue;
       }
       const label = kindLabel[row.kind] || row.kind;
+      const disclosure = mentionOf(row) === 'if_asked' ? '〔仅语气，不主动提〕' : '';
       const sensitivity = row.sensitivity === 'sensitive' ? '敏感·' : '';
       const effective = row.kind === 'inferred' ? effectiveObservationConfidence(row, { now: clock, halfLifeDays }) : null;
       const confidence = effective !== null ? ` ${effective.toFixed(2)}` : '';
       const alternatives = row.alternatives?.length ? `（也可能：${row.alternatives.slice(0, 2).join('、')}）` : '';
-      const line = `- ${sensitivity}${label}${confidence}：${truncate(row.text, observationChars)}${alternatives}`;
+      const line = `- ${disclosure}${sensitivity}${label}${confidence}：${truncate(row.text, observationChars)}${alternatives}`;
       lines.push(line);
       remaining -= line.length + 1;
     }
-    if (lines.length || expiredHidden) {
+    if (lines.length || expiredHidden || mentionHidden) {
       sections.push(
         '## 观察与推断（证据层）',
-        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。常驻项（偏好/习惯/约束/纠正）与话题无关也保留，其余需要线索命中；过期观察只停止注入，仍可用 observations 查看。',
+        '事实、用户自述、推断分开记录；矛盾可以并存，不强行合并。用户明确纠正优先于任何推断。常驻项（偏好/习惯/约束/纠正）与话题无关也保留，其余需要线索命中；带〔仅语气，不主动提〕的观察只用于调整语气，不要主动复述；过期观察只停止注入，仍可用 observations 查看。',
         lines.join('\n'),
         privateHidden ? `（另有 ${privateHidden} 条私密观察未展示）` : '',
         expiredHidden ? `（${expiredHidden} 条观察已过期，停止注入但保留可查）` : '',
+        mentionHidden ? `（${mentionHidden} 条观察按披露策略设为 never，不进入上下文）` : '',
         pairs.size ? `（有 ${pairs.size} 对未解矛盾）` : '',
         gatedOut ? `（${gatedOut} 条线索不足，未展示）` : '',
         '',
@@ -1322,6 +1398,7 @@ async function start(ctx, config) {
       scope: OBSERVATION_SCOPES.includes(args.observationScope) ? args.observationScope : undefined,
       correctionOf: null,
       sensitivity: ['normal', 'sensitive', 'private'].includes(args.sensitivity) ? args.sensitivity : 'normal',
+      mention: MENTION_VALUES.includes(args.mention) ? args.mention : undefined,
       status: 'current',
       createdAt: at,
       updatedAt: at,
@@ -1428,7 +1505,12 @@ async function start(ctx, config) {
     const next = content.trim().slice(0, 4000);
     const at = Date.now();
     const history = previous && previous.content !== next
-      ? [...(previous.history || []), { content: previous.content, at: previous.updatedAt }].slice(-HISTORY_LIMIT)
+      ? [...(previous.history || []), {
+          content: previous.content,
+          at: previous.updatedAt,
+          sourceExchangeIds: [...(previous.sourceExchangeIds || [])],
+          sourceObservationIds: [...(previous.sourceObservationIds || [])],
+        }].slice(-HISTORY_LIMIT)
       : (previous?.history || []);
     const knownExchanges = (sourceIds || []).filter(id => rowsById.has(id));
     const knownObservations = (sourceObservationIds || []).filter(id => observations.has(id));
@@ -1438,8 +1520,9 @@ async function start(ctx, config) {
       updatedAt: at,
       keywords: [...new Set([...keywordsOf(extraKeywords || [], content), ...(previous?.keywords || [])])].slice(0, MAX_KEYWORDS),
       history,
-      sourceExchangeIds: [...new Set([...(previous?.sourceExchangeIds || []), ...knownExchanges])].slice(-100),
-      sourceObservationIds: [...new Set([...(previous?.sourceObservationIds || []), ...knownObservations])].slice(-100),
+      // Each portrait version binds its own sources; history keeps the previous version's set.
+      sourceExchangeIds: knownExchanges.slice(-100),
+      sourceObservationIds: knownObservations.slice(-100),
       needsRecompute: false,
     };
     map.set(facet, row);
@@ -1948,6 +2031,7 @@ async function start(ctx, config) {
         current: [...observations.values()].filter(row => row.status === 'current').length,
         inferred: [...observations.values()].filter(row => row.kind === 'inferred').length,
         corrections: [...observations.values()].filter(row => row.kind === 'corrected').length,
+        proposed: [...observations.values()].filter(row => row.status === 'proposed').length,
         contradictions: [...observations.values()].filter(row => (row.contradicts || []).length).length,
         conditional: [...observations.values()].filter(row => (row.conditionalContradicts || []).length).length,
         expired: [...observations.values()].filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
@@ -2122,6 +2206,7 @@ async function start(ctx, config) {
               type: row.type,
               kind: row.kind,
               scope: scopeOf(row),
+              mention: mentionOf(row),
               status: row.status,
               confidence: row.confidence,
               ...(lint ? { warning: lint } : {}),
@@ -2151,6 +2236,7 @@ async function start(ctx, config) {
               lastCorroboratedAt: at,
               // Inherit the *derived* scope: `original.scope` is usually undefined on legacy rows.
               scope: scopeOf(original),
+              mention: original.mention,
               correctionOf: original.id,
               sensitivity: original.sensitivity,
               status: 'current',
@@ -2215,6 +2301,7 @@ async function start(ctx, config) {
                 kind: row.kind,
                 text: row.text,
                 scope: scopeOf(row),
+                mention: mentionOf(row),
                 expired: observationExpired(row, Date.now(), ttlConfig),
                 confidence: row.confidence,
                 effectiveConfidence: effectiveObservationConfidence(row, { halfLifeDays: inferenceHalfLifeDays }),
@@ -2229,6 +2316,93 @@ async function start(ctx, config) {
                 correctionOf: row.correctionOf,
               }));
             return { status, total: [...observations.values()].filter(row => row.status === status).length, observations: list };
+          }
+          if (action === 'reflect') {
+            const current = [...observations.values()].filter(row => row.status === 'current');
+            const proposals = buildReflectProposals(current, { minSessions: 3 });
+            const existing = [...observations.values()].filter(row => row.status === 'proposed' || row.status === 'current');
+            const fresh = proposals.filter(proposal => !existing.some(row => jaccard([...new Set(tokensOf(row.text))], [...new Set(tokensOf(proposal.text))]) >= 0.8));
+            const at = Date.now();
+            const created = [];
+            for (const proposal of fresh.slice(0, 5)) {
+              const row = {
+                id: uuid(),
+                type: proposal.type,
+                text: proposal.text,
+                kind: proposal.kind,
+                confidence: proposal.confidence,
+                context: null,
+                quote: null,
+                alternatives: proposal.alternatives,
+                sourceIds: proposal.sourceIds,
+                contradicts: [],
+                conditionalContradicts: [],
+                sessions: proposal.sessions,
+                lastCorroboratedAt: at,
+                correctionOf: null,
+                sensitivity: 'normal',
+                mention: 'proactive',
+                status: 'proposed',
+                createdAt: at,
+                updatedAt: at,
+              };
+              observations.set(row.id, row);
+              await persistObservation(row);
+              created.push({ id: row.id, text: row.text, confidence: row.confidence, sessions: new Set(row.sessions || []).size });
+            }
+            return {
+              proposals: created,
+              total: created.length,
+              note: 'Proposed drafts are not injected. Review them with action=review (decision=accept|reject).',
+            };
+          }
+          if (action === 'review') {
+            const row = typeof args.id === 'string' ? observations.get(args.id) : undefined;
+            if (!row) return { error: 'Unknown observation id.' };
+            if (row.status !== 'proposed') return { error: 'Only proposed drafts can be reviewed.' };
+            const decision = args.decision === 'accept' ? 'accept' : 'reject';
+            row.status = decision === 'accept' ? 'current' : 'withdrawn';
+            row.updatedAt = Date.now();
+            await persistObservation(row);
+            return {
+              id: row.id,
+              status: row.status,
+              note: decision === 'accept'
+                ? 'Accepted: the observation is now current and may be injected (subject to scope/mention).'
+                : 'Rejected: withdrawn and will not be injected.',
+            };
+          }
+          if (action === 'recompute') {
+            const target = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
+            const valid = facetsOf(target);
+            if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
+            const row = mapOf(target).get(args.facet);
+            if (!row) return { error: 'That facet has no content yet.' };
+            const sourceIds = Array.isArray(row.sourceObservationIds) ? row.sourceObservationIds : [];
+            const liveObservations = sourceIds
+              .map(id => observations.get(id))
+              .filter(entry => entry && entry.status === 'current')
+              .map(entry => ({ id: entry.id, kind: entry.kind, text: entry.text, confidence: entry.confidence, effectiveConfidence: effectiveObservationConfidence(entry, { halfLifeDays: inferenceHalfLifeDays }) }));
+            const staleSourceIds = sourceIds.filter(id => { const entry = observations.get(id); return !entry || entry.status !== 'current'; });
+            return {
+              facet: row.facet,
+              label: labelsOf(target)[row.facet],
+              currentContent: row.content,
+              updatedAt: new Date(row.updatedAt).toISOString(),
+              needsRecompute: row.needsRecompute === true,
+              liveObservations,
+              staleSourceIds,
+              previousContent: (row.history || []).slice(-2).map(entry => ({ content: entry.content, at: new Date(entry.at).toISOString(), sourceObservationIds: entry.sourceObservationIds || [] })),
+              note: 'Rewrite with learn (include sourceObservationIds). Nothing is written automatically.',
+            };
+          }
+          if (action === 'duplicates') {
+            const pairs = findCrossLayerDuplicates(portrait, [...observations.values()]);
+            return {
+              pairs,
+              total: pairs.length,
+              note: 'Cross-layer duplicates between portrait facets and current observations. Review manually; nothing is deleted automatically.',
+            };
           }
           if (action === 'export') {
             try {
