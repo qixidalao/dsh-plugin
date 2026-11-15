@@ -1,5 +1,8 @@
 # 动态记忆 · 用户画像（dynamic memory）
 
+[![ci](https://github.com/qixidalao/dsh-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/qixidalao/dsh-plugin/actions/workflows/ci.yml)
+[![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
 持久化的长期记忆插件：维护**用户画像**、**助手画像**、**证据层观察**、**跨会话印象**、**实体索引**与**可检索的历史原文**。它只补充上下文窗口里没有的东西，不重复注入当前对话。
 
 > 架构、数据模型、写入/注入管线、打分公式等细节见 [DOCS.md](./DOCS.md)。
