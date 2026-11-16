@@ -24,8 +24,9 @@ License: AGPL-3.0-only (see [LICENSE](./LICENSE)). Memory data is never stored i
 
 ```bash
 node test.mjs          # 52 pure-function checks
-node test-host.mjs     # 93 lifecycle checks against an in-memory mock host
+node test-host.mjs     # 147 lifecycle checks against an in-memory mock host
 node eval.mjs --fixture # synthetic evaluation (no personal data)
+node eval.mjs           # real-store evaluation (reads the local store)
 ```
 
 ## Docs
@@ -37,7 +38,7 @@ node eval.mjs --fixture # synthetic evaluation (no personal data)
 
 ## Configuration highlights
 
-`locale` (`auto` by default: detect from the latest user message; set `en`/`zh` to force), `facets`, `assistantFacets`, `capture`, `mention` defaults are derived from scope/type/sensitivity, `ttlTransientDays` / `ttlSituationalDays`, `inferenceHalfLifeDays`, `portraitBudget`, `observationBudget`.
+`locale` (`auto` by default: detect from the latest user message; set `en`/`zh` to force), `consent` (`memory` / `inject` / `profile` / `sensitive`), `facets`, `assistantFacets`, `capture`, `mention` defaults are derived from scope/type/sensitivity, `ttlTransientDays` / `ttlSituationalDays`, `inferenceHalfLifeDays`, `portraitBudget`, `observationBudget`.
 
 ## v2.1 Index-only capture (done, unreleased)
 
@@ -49,6 +50,20 @@ Positioning: **Harness sessions are the only source of plaintext; the plugin sto
 - **Current state (real-machine spot check)**: hydration **19/20 = 95%**. The one failure is explicit and never fabricated: a repeated "继续"-style prompt whose row cannot be uniquely located among 54 candidates in its session — `sourceAvailable: false`, empty text, `hydrationError: no matching user message (54 candidates)`; a no-match, not ambiguous, not an unreadable session. Summary/keywords/entities still match in retrieval.
 - **Rollback (limited)**: `memory.md` is exported automatically before stripping, but it is a **readable archive** (portraits, observations, 30 latest impressions with at most 80 chars of user text), not a byte-exact backup of all 2120 rows. For a literal restore use a pre-strip storage snapshot (copy `$DSH_HOME/storages/dynamic_memory/`); `/dmem export` likewise stays at summary level.
 - Migration is available both as a tool action and as `/dmem migrate mode=strip confirm=true` (shared implementation; exports memory.md first, refuses without `confirm=true`; destructive).
+
+## Consent switches (v2.2, C1-C4)
+
+- `consent.memory / inject / profile / sensitive` persist in the storage `consent` table and survive reloads; verified on a real machine: **`memory=on inject=on profile=unified sensitive=off, storage=durable`**.
+- `/dmem consent` prints status; `/dmem consent on|off` (C1), `inject on|off` (C2), `sensitive on|off` (C4), `profile unified|situational|off` (C3); the tool action also accepts `consent={memory,inject,profile,sensitive}`.
+- C1 off: no capture, no injection, background indexing stops.
+- **Not done**: settings panel UI, speaker attribution (`speaker`/`origin` isolation), situational portrait grouping, no real-device mobile test; **the hard block on explicit tool writes while memory is off is in progress**.
+
+## Evaluation (real store, v2.2.0, local)
+
+- `node eval.mjs`: hit@3 **9/10**, MRR **0.750** (after eval-label migration; 7/10, 0.600 before labels were migrated);
+- `node eval.mjs --min-coverage 0.6`: false positives **0/8** (1/8 without the gate);
+- `node eval.mjs --fixture`: **5/5** (MRR 1.000);
+- One genuine remaining loss: `部署 公网 首页 200` — the 90+60-char summary cut drops `公网`/`首页` (a coverage gap; see the evaluation report).
 
 ## Known limits
 

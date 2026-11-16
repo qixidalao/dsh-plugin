@@ -1,17 +1,19 @@
 # 记忆与画像的同意模型（CONSENT）
 
 > 目的：把"用户是否允许跨会话记忆 / 是否允许画像 / 是否允许敏感推断"变成显式、可撤回的同意，而不是默认全开。
-> 状态：设计稿。**尚未实现**：代码里没有 `consent.*` 配置与 `/dmem consent` 命令；v2.1 只有两件相关能力——`retainText`（默认不存原文）与 `capture:false` 暂停捕获。同意模型的落地计划见 §5。
+> 状态：**已实现（C1-C4 基础版，v2.2.0 真机验证）**。`consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机 `/dmem stats` 验证为 `memory=on inject=on profile=unified sensitive=off, storage=durable`。**未做**：面板 UI（§3 为设计稿）、说话者归属、situational 画像分组、真机移动端未测、memory off 时的显式写入硬拦截（正在修）。
 
 ## 1. 必须单独同意的五件事
 
 | # | 同意项 | 默认 | 说明 |
 |---|---|---|---|
-| C1 | **跨会话记忆**（写入索引/摘要） | 安装后首启询问；未同意前不捕获 | 关掉后本会话不写任何记忆 |
-| C2 | **每轮自动注入记忆** | 同意 C1 后默认开，但可只"检索不注入" | 注入有预算；可随时暂停 |
-| C3 | **画像**（用户/助手 facet） | 默认开"事实与偏好"；**人格推断默认关** | 可只允许事实/偏好，不允许心理/人格推断 |
-| C4 | **敏感内容**（健康、情绪、关系等） | 默认关 | 开启后仍需 `mention=if_asked`，不主动提起 |
+| C1 | **跨会话记忆**（写入索引/摘要） | 默认 **开**（`memory=on`）；`/dmem consent off` 关闭 | 关掉后不捕获、不注入、后台索引停；"安装后首启询问"尚未实现 |
+| C2 | **每轮自动注入记忆** | 默认 **开**（`inject=on`） | `inject off` = 只检索不注入；注入有预算 |
+| C3 | **画像**（用户/助手 facet） | 默认 **unified**；可 `situational`/`off` | 可只允许事实/偏好，不允许心理/人格推断 |
+| C4 | **敏感内容**（健康、情绪、关系等） | 默认 **关**（`sensitive=off`） | 开启后仍需 `mention=if_asked`，不主动提起 |
 | C5 | **数据出境/共享** | 永不允许 | 本地存储，无遥测、无云端同步；`export` 只写本地文件 |
+
+> 实现口径（v2.2.0）：默认 `memory=on inject=on profile=unified sensitive=off`，兼容既有安装；状态持久化在 storage `consent` 表。设计稿中的"首启询问"与面板 UI 尚未实现。
 
 ## 2. 画像的两种形态（用户可选）
 
@@ -23,7 +25,7 @@
 
 明确不做：`introvert/extrovert` 这类固定人格分类；任何"人格标签"必须来自证据并允许推翻。
 
-## 3. 面板（记忆设置）最小字段
+## 3. 面板（记忆设置）最小字段（设计稿，**面板 UI 尚未实现**）
 
 - 总开关：允许记忆（C1）
 - 注入：自动注入 / 仅按需检索 / 关闭（C2）
@@ -52,12 +54,19 @@
 | 遥测 | 无 |
 | 语言/地区 | 多语言包；不假设文化规范 |
 
-## 5. v2.1 实现范围（先小后大）
+## 5. 用法（v2.2.0 已实现 C1-C4）
 
-1. host 配置：`consent.memory`、`consent.inject`、`consent.profile`（unified/situational/off）、`consent.sensitive`、`retain: index|full`；
-2. 命令：`/dmem consent [on|off|status]`、`/dmem forget-session`；
-3. 未同意 C1 时不捕获、不注入；
-4. 面板 UI 放 v2.2（client 插件），先保证默认保守、可撤回。
+```bash
+/dmem consent                                   # 看当前状态（+ storage: durable|memory-only）
+/dmem consent on | off                          # C1 跨会话记忆；关闭时不捕获、不注入、后台索引停
+/dmem consent inject on | off                   # C2 每轮自动注入
+/dmem consent sensitive on | off                # C4 敏感观察是否可注入
+/dmem consent profile unified | situational | off  # C3 画像（situational 仅形态选择，分组未实现）
+```
+
+工具 action 等价写法：`consent={memory, inject, profile, sensitive}`（可只传要改的字段）。状态写入 storage 的 `consent` 表，重载后保留。
+
+仍未实现：面板 UI；`/dmem forget-session`；说话者归属（`speaker`/`origin`）；situational 画像分组；memory off 时对工具显式写入的硬拦截（正在修）。
 
 ## 6. 验收
 
@@ -65,4 +74,4 @@
 - 关闭画像后 `portrait` 不再注入、不再写入；
 - 敏感关闭时 `sensitivity=sensitive` 的观察不注入；
 - 删除插件数据不影响 Harness 会话，反之亦然；
-- 同意状态可在 `/dmem consent status` 与面板中查看。
+- 同意状态可在 `/dmem consent status` 与 `stats.consent` 查看（面板尚未实现）。

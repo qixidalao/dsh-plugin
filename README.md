@@ -24,8 +24,9 @@
 
 ```bash
 node test.mjs          # 52 项纯函数测试
-node test-host.mjs     # 93 项生命周期（内存 mock host）
+node test-host.mjs     # 170 项生命周期（内存 mock host）
 node eval.mjs --fixture # 合成评测（不需要真实数据）
+node eval.mjs           # 真实集评测（读本机存储）
 ```
 
 ## 文档
@@ -37,7 +38,7 @@ node eval.mjs --fixture # 合成评测（不需要真实数据）
 
 ## 主要配置
 
-`locale`（默认 auto，按会话语言；可强制 en/zh）、`facets`、`assistantFacets`、`capture`、`ttlTransientDays` / `ttlSituationalDays`、`inferenceHalfLifeDays`、`portraitBudget`、`observationBudget`。披露（mention）默认值由 scope/type/sensitivity 派生。
+`locale`（默认 auto，按会话语言；可强制 en/zh）、`consent`（`memory` / `inject` / `profile` / `sensitive`）、`facets`、`assistantFacets`、`capture`、`ttlTransientDays` / `ttlSituationalDays`、`inferenceHalfLifeDays`、`portraitBudget`、`observationBudget`。披露（mention）默认值由 scope/type/sensitivity 派生。
 
 ## 成本与适用场景（v2.0.3）
 
@@ -56,6 +57,20 @@ node eval.mjs --fixture # 合成评测（不需要真实数据）
 - **当前状态（真机抽检）**：水合 **19/20 = 95%**；20 条命中样本中 1 条显式失败、不伪造片段——该行是重复"继续"类指令，会话内 54 个候选无法唯一定位，返回 `sourceAvailable:false`、文本为空、`hydrationError: no matching user message (54 candidates)`（no-match，不是 ambiguous，也不是会话不可读）。摘要/关键词/实体仍可检索命中。
 - **回滚（有限）**：剥离前会自动导出 `memory.md`，但它是**可读档案**（画像/观察/最近 30 条印象，用户文本只取前 80 字符），不是 2120 条的逐字备份。要逐字恢复请用剥离前的存储快照（复制 `$DSH_HOME/storages/dynamic_memory/`）；日常备份等同理——`/dmem export` 只导出摘要级内容。
 - 迁移已可用：工具 action 或 `/dmem migrate mode=strip confirm=true`（共用同一实现，先自动导出 memory.md 再剥离，缺 `confirm=true` 拒绝；破坏性）。
+
+## 同意开关（v2.2，C1-C4）
+
+- `consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机验证：**`memory=on inject=on profile=unified sensitive=off, storage=durable`**。
+- `/dmem consent` 看状态；`/dmem consent on|off`（C1）、`inject on|off`（C2）、`sensitive on|off`（C4）、`profile unified|situational|off`（C3）；工具 action 可传 `consent={memory,inject,profile,sensitive}`。
+- C1 关闭时：不捕获、不注入、后台索引停。
+- **未做**：面板 UI、说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、真机移动端未测；**memory off 的显式写入硬拦截正在修**。
+
+## 评测（真实集，v2.2.0 本机）
+
+- `node eval.mjs`：hit@3 **9/10**、MRR **0.750**（评测标签迁移后；标签迁移前 7/10、0.600）；
+- `node eval.mjs --min-coverage 0.6`：误报 **0/8**（无门控 1/8）；
+- `node eval.mjs --fixture`：**5/5**（MRR 1.000）；
+- 剩余 1 条真实损失：`部署 公网 首页 200`——摘要截断（90+60 字符）丢掉 `公网`/`首页`，属覆盖缺口（详见评测报告）。
 
 ## 已知限制
 

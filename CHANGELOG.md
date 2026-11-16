@@ -1,24 +1,36 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.1.1**，下一条目 2.1.2 尚未发布（未改版本号）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.2.0**；**未发布**——无 Release、非 Latest、npm 未推送（`private: true`）。
 
-## 2.1.2（未发布）— 索引化收尾与水合可靠性
+## 2.2.0 — 同意开关、digest 实测与评测加固
 
-**当前状态**：v2.1 索引化捕获已落地、真实库迁移完成，水合（按 pointer 回读原文）收尾——真机抽检 **19/20 = 95%**。代码以 commit `60ab15b fix(index-only): execute /dmem migrate and make repair counts live` 为准。
+**当前状态**：v2.2.0 已实现 C1-C4 同意开关并在真机验证；评测标签迁移后真实指标回升。代码以 commit `d6f5b0c release: v2.2.0 consent switches + digest metric + eval hardening` 为准。
+
+- **同意开关 C1-C4（已实现，真机验证）**：`consent.memory / inject / profile / sensitive` 持久化到 storage 的 `consent` 表，重载后保留；真机 `/dmem stats` 验证状态 **`memory=on inject=on profile=unified sensitive=off, storage=durable`**。C1 关闭时：不捕获、不注入、后台索引也停。
+- **命令与工具**：`/dmem consent` 看状态；`/dmem consent on|off`（C1）、`/dmem consent inject on|off`（C2）、`/dmem consent sensitive on|off`（C4）、`/dmem consent profile unified|situational|off`（C3）；工具 action 也可传 `consent={memory,inject,profile,sensitive}` 部分字段。
+- **digestCount 改真实快照**：`stats` 的 `digestCount` 取上一轮提示组装的实际注入结果（附 `digestTotal` / `digestReason`），不再硬编码；2.1.2 条目里的"真机待验证"由此收口。
+- **评测加固（真实集，本机亲手运行）**：迁移评测标签后 hit@3 **9/10**、MRR **0.750**（标签迁移前 7/10、0.600）；加 `--min-coverage 0.6` 后误报 **0/8**（无门控 1/8）；`--fixture` **5/5**（MRR 1.000、FP 0/2）。玩法：`node eval.mjs`、`node eval.mjs --min-coverage 0.6`、`node eval.mjs --fixture`。
+- **剩余 1 条真实损失**：`部署 公网 首页 200`——摘要截断（90+60 字符）使 `公网`/`首页` 未被保留，rank 47；属覆盖缺口，非打分问题（详见评测报告）。
+- 测试（本机亲自运行，commit `d6f5b0c`）：`test.mjs` **52** 项、`test-host.mjs` **147** 项。
+- **明确未做（不写作已完成）**：① 面板 UI（阶段 4）；② 说话者归属（`speaker` 注册表 / exchange `origin` / 助手画像隔离，阶段 3.2）；③ situational 画像按情境分组（`profile=situational` 可选，但分组尚未实现）；④ 真机移动端未测；⑤ **memory off 时的显式写入硬拦截正在修**（当前 C1 关闭会停捕获/注入/后台索引，工具显式写入路径的拦截未完成）。
+
+## 2.1.2（未发布，内容并入 2.2.0）— 索引化收尾与水合可靠性
+
+**当时状态**：v2.1 索引化捕获已落地、真实库迁移完成，水合（按 pointer 回读原文）收尾——真机抽检 **19/20 = 95%**。代码以 commit `60ab15b fix(index-only): execute /dmem migrate and make repair counts live` 为准。
 
 - **存储**：新行只写 `summary` / `keywords` / `entities` / `time` / `textHash` / `pointer`（sessionId+时间）；`user` / `assistant` 为空串。`textHash` 是对"清洗后 user + `\n` + 最后一轮 assistant"的 SHA-256，只用于水合校验，不是加密，也不可还原内容。
 - **读取原文**：search 命中后按 pointer 读本地 Harness 会话，用 `textHash` → `summary` 前缀 → 单一时窗候选三级回退配对，返回片段（`full=true` 返回整段）。
 - **水合实测（真机抽检）**：20 条命中样本中 **19 条**成功回读（95%）；**1 条显式失败，不伪造片段**——会话 `session-be60e2ac…` 的该行（摘要以"p2继续，自动继续p3 p4…"开头）返回 `sourceAvailable:false`、`user`/`assistant` 为空、`hydrationError: no matching user message in session … (54 candidates)`；属 **no-match**，不是 ambiguous，也不是会话不可读。复跑：`search query="继续 修复 插件" limit=10` 第一条即该样本。
 - **失败语义（保持）**：任何未通过校验的命中一律置空并附 `hydrationError`（≤160 字符），哈希/摘要/时窗出现多候选时**拒绝猜测**；摘要、关键词、实体仍可参与检索与排序。
 - **迁移已可用**：工具 action `migrate mode=strip confirm=true` 与 `/dmem migrate mode=strip confirm=true` 共用 `migrateStrip`（先导出再剥离，缺 `confirm=true` 拒绝执行）；本机已用其剥离 **2120** 条旧记录原文，释放约 **2.9M** 字符。
-- **digest 注入**：代码已改为 summary-based 选取，host 测试断言 `digestCount ≥ 1` 通过；但真机 `/dmem stats` 仍为 `digestCount=0`（重载后未复现）——**测试通过，真机待验证**，不写作已修复。
+- **digest 注入**：代码已改为 summary-based 选取，host 测试断言 `digestCount ≥ 1` 通过；当时真机 `/dmem stats` 仍为 `digestCount=0`（重载后未复现），故当时标"测试通过，真机待验证"——**2.2.0 已改为真实快照，见上**。
 - **repair**：不再回写 user/assistant 明文（host 断言明文行保持 0）；`plaintextRows` 已改为实测（`countPlaintextRows`）并新增 `plaintextCleared`，此前"硬编码 0"的问题在本 commit 修正。
 - **回滚缺口（诚实边界）**：剥离前的导出是 `memory.md` 可读档案（画像/观察/最近 30 条印象，用户文本 ≤80 字符），**不是逐字备份**；要逐字恢复只能靠剥离前的存储快照。已在 README 写明，不夸大回滚能力。
 - **无加密**：不做应用层加密/口令，隐私依赖全盘加密与文件权限；这是产品边界，不是待办。
 - **意图**：系统会话是原文唯一来源，插件只存本地派生索引；无遥测、无云同步。
 - 测试（commit `60ab15b`，本机亲自运行）：`test.mjs` **52** 项、`test-host.mjs` **93** 项（含水合成功、显式 no-match、歧义拒绝、重复提问去重、migrate 工具/命令的拒绝与成功剥离、repair 实测计数）。
-- **待验证（不写作已修复）**：真机 digest 注入——应用后重载并复跑 `/dmem stats`，需见 `digestCount ≥ 1`；当前真机仍为 0。
-- **发布状态**：**未发布**——无 Release、非 Latest、npm 未推送；`package.json` 仍为 2.1.1 且 `private: true`，发版流程未启动。
+- **历史待验证项（已由 2.2.0 收口）**：真机 digest 注入当时需见 `digestCount ≥ 1` 而不得；2.2.0 已把 `digestCount` 改为真实注入快照。
+- **发布状态**：当时 `package.json` 为 2.1.1 且 `private: true`；2.2.0 已升版，仍未发布——无 Release、非 Latest、npm 未推送。
 
 > 勘误：2.1.0 条目里"旧数据迁移与面板留待下一步"已过期——迁移命令 2.1.1 已提供并已执行；仍未做的是面板（阶段 4）与迁移前后对比评测（阶段 2.2）。
 
