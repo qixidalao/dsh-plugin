@@ -9,7 +9,8 @@
 // isolation (owner/agent/shared scopes, delegated denial, per-agent namespaces,
 // dormant portraits for deleted agents, explicit /dmem gc dry-run vs confirm), and
 // the isolation safety rails: GC/dormancy refused without a verified session
-// inventory, plus fail-closed unknown identity (no header/registry/ownerAgentIds).
+// inventory, fail-closed unknown identity (no header/registry/ownerAgentIds), and
+// dormant lifecycle (grace-period caution, unmark when the agent returns).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -60,10 +61,9 @@ function makeHost(storage, services = {}) {
   const tools = [];
   const prompts = [];
   const commands = [];
-  const specs = services.agents || [{ id: 'session-fixture' }];
   const agentsById = new Map();
-  const agents = specs.map(spec => {
-    const record = { id: spec.id };
+  const makeAgentRecord = id => {
+    const record = { id: String(id) };
     record.ctx = {
       effect(setup) {
         effects.push(setup());
@@ -79,7 +79,9 @@ function makeHost(storage, services = {}) {
     };
     agentsById.set(record.id, record);
     return record;
-  });
+  };
+  const specs = services.agents || [{ id: 'session-fixture' }];
+  const agents = specs.map(spec => makeAgentRecord(spec.id));
   const rootIds = new Set(services.roots || agents.map(record => record.id));
   // id -> { id, header }. Delegated sessions carry parentSession/origin/delegationDepth.
   // services.sessions === null removes the sessions service (simulates an old/minimal host).
@@ -143,7 +145,13 @@ function makeHost(storage, services = {}) {
     const index = agents.findIndex(record => record.id === key);
     if (index >= 0) agents.splice(index, 1);
   };
-  return { ctx, agent, agents, tools, toolsFor, prompts, commands, sessions, emit, emitCreated, dispose, dropAgent };
+  // Simulate an agent coming back: register its record again (agent/created fires separately).
+  const addAgent = id => {
+    const record = makeAgentRecord(id);
+    agents.push(record);
+    return record;
+  };
+  return { ctx, agent, agents, tools, toolsFor, prompts, commands, sessions, emit, emitCreated, addAgent, dispose, dropAgent };
 }
 
 // Minimal stand-in for the host's sessionQuery service: readSession returns a snapshot,
@@ -1127,7 +1135,7 @@ const dormSpecs = {
   sessionQuery: dormQuery,
 };
 const dormHost = makeHost(dormStorage, dormSpecs);
-apply(dormHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false, capture: true });
+apply(dormHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false, capture: true, dormantGraceDays: 0 });
 await tick();
 const dormOwnerTool = dormHost.toolsFor(dormOwner)[0];
 const dormEmployeeTool = dormHost.toolsFor(dormEmployee)[0];
@@ -1256,7 +1264,7 @@ const noInvRecoverHost = makeHost(noInvStorage, {
   sessions: new Map([[noInvOwner, noInvOwnerSession]]),
   sessionQuery: makeSessionQuery({ [noInvOwner]: { session: noInvOwnerSession, events: [] } }, { listSessions: true }),
 });
-apply(noInvRecoverHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+apply(noInvRecoverHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false, dormantGraceDays: 0 });
 await tick();
 const noInvRecoverTool = noInvRecoverHost.tools[0];
 equal((await noInvRecoverTool.execute({ action: 'scope' })).dormantFacets, 1, 'verified inventory detects the orphan portrait');
@@ -1329,5 +1337,94 @@ apply(oldRootHost.ctx, { memoryScope: 'owner', autoIndexSessions: false, warmup:
 await tick();
 equal((await oldRootHost.tools[0].execute({ action: 'scope' })).identity.role, 'owner', 'registry roots() still proves owner on an old Harness');
 await oldRootHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Dormant must not be permanent (regression from Claude source review): an
+// unverified inventory never marks; a verified inventory marks only after the
+// grace period; live evidence revives (unmark) so scope and injection recover.
+// ---------------------------------------------------------------------------
+const graceStorage = makeStorage();
+const graceOwner = 'session-grace-owner';
+const graceEmployee = 'session-grace-employee';
+const graceOwnerSession = { id: graceOwner, header: { id: graceOwner, isSeeded: false, cwd: null } };
+const graceEmployeeSession = { id: graceEmployee, header: { id: graceEmployee, isSeeded: false, parentSession: graceOwner, origin: 'subagent', delegationDepth: 1, cwd: null } };
+const graceSnapshots = {
+  [graceOwner]: { session: graceOwnerSession, events: [] },
+  [graceEmployee]: { session: graceEmployeeSession, events: [] },
+};
+const graceHost = makeHost(graceStorage, {
+  agents: [{ id: graceOwner }, { id: graceEmployee }],
+  roots: [graceOwner],
+  sessions: new Map([[graceOwner, graceOwnerSession], [graceEmployee, graceEmployeeSession]]),
+  sessionQuery: makeSessionQuery(graceSnapshots, { listSessions: true }),
+});
+apply(graceHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const graceEmployeeTool = graceHost.toolsFor(graceEmployee)[0];
+await graceEmployeeTool.execute({ action: 'learn', facet: 'preferences', content: '短暂离线也要保留的画像' });
+const graceRow = () => [...graceStorage.tables.get('portrait').values()].find(row => row.content.includes('短暂离线'));
+equal(graceRow().dormant, false, 'new portrait starts active');
+// Step 1: agent not loaded AND inventory unavailable -> never mark dormant.
+graceHost.dropAgent(graceEmployee);
+graceHost.sessions.delete(graceEmployee);
+await graceHost.dispose();
+const graceNoInventoryHost = makeHost(graceStorage, {
+  agents: [{ id: graceOwner }],
+  roots: [graceOwner],
+  sessions: new Map([[graceOwner, graceOwnerSession]]),
+  // no sessionQuery: inventory unavailable
+});
+apply(graceNoInventoryHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const noInvScopeNow = await graceNoInventoryHost.tools[0].execute({ action: 'scope' });
+equal(noInvScopeNow.dormantFacets, 0, 'missing inventory does not mark dormant');
+equal(noInvScopeNow.cautionFacets, 0, 'missing inventory does not even mark caution');
+ok(noInvScopeNow.unknownScopes.some(entry => entry.scopeId.includes(graceEmployee)), 'unknown scope is reported instead');
+equal(graceRow().dormant, false, 'stored portrait is untouched without an inventory');
+await graceNoInventoryHost.dispose();
+// Step 2: authoritative inventory says the agent is missing -> caution inside grace.
+const graceCautionHost = makeHost(graceStorage, {
+  agents: [{ id: graceOwner }],
+  roots: [graceOwner],
+  sessions: new Map([[graceOwner, graceOwnerSession]]),
+  sessionQuery: makeSessionQuery({ [graceOwner]: graceSnapshots[graceOwner] }, { listSessions: true }),
+});
+apply(graceCautionHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const graceCautionTool = graceCautionHost.tools[0];
+const cautionScope = await graceCautionTool.execute({ action: 'scope' });
+equal(cautionScope.inventory.verified, true, 'caution path requires a verified inventory');
+equal(cautionScope.dormantGraceDays, 3, 'grace defaults to 3 days');
+equal(cautionScope.dormantFacets, 0, 'missing agent is not dormant inside the grace period');
+equal(cautionScope.cautionFacets, 1, 'missing agent is flagged caution inside the grace period');
+equal(graceRow().dormant, false, 'stored portrait is caution, not dormant');
+equal(graceRow().caution, true, 'stored portrait carries caution');
+const cautionGc = await graceCautionTool.execute({ action: 'gc', confirm: true });
+equal(cautionGc.dormantFacets, 0, 'gc never deletes caution portraits');
+equal(cautionGc.deletedFacets, 0, 'gc confirm deletes nothing inside the grace period');
+equal([...graceStorage.tables.get('portrait').values()].filter(row => row.content.includes('短暂离线')).length, 1, 'caution portrait survives gc');
+// Step 3: grace elapsed (offlineSince backdated) -> dormant.
+graceRow().offlineSince = Date.now() - 4 * 86400000;
+const dormantScope = await graceCautionTool.execute({ action: 'scope' });
+equal(dormantScope.dormantFacets, 1, 'missing agent becomes dormant after the grace period');
+equal(dormantScope.cautionFacets, 0, 'caution is cleared when dormant is set');
+equal(graceRow().dormant, true, 'stored portrait becomes dormant');
+// Step 4: agent returns -> unmark and injection recovers.
+graceCautionHost.addAgent(graceEmployee);
+graceCautionHost.sessions.set(graceEmployee, graceEmployeeSession);
+graceSnapshots[graceEmployee] = { session: graceEmployeeSession, events: [] };
+await tick();
+graceCautionHost.emitCreated(graceEmployee);
+await tick();
+const revivedScope = await graceCautionTool.execute({ action: 'scope' });
+equal(revivedScope.dormantFacets, 0, 'returning agent is unmarked (dormant cleared)');
+equal(revivedScope.cautionFacets, 0, 'returning agent clears caution too');
+ok(revivedScope.revived >= 1, 'scope reports the revival');
+equal(graceRow().dormant, false, 'stored portrait is no longer dormant');
+const revivedEmployeeTool = graceCautionHost.toolsFor(graceEmployee)[0];
+ok(revivedEmployeeTool, 'returned agent gets its tool again');
+ok(graceCautionHost.prompts[0].text({ scope: { id: graceEmployee } }).includes('短暂离线'), 'returning agent injection shows the portrait again');
+ok((await revivedEmployeeTool.execute({ action: 'portrait', facet: 'preferences' })).portrait[0].content.includes('短暂离线'), 'returning agent portrait read recovers');
+await graceCautionHost.dispose();
 
 console.log(`host fixture: ${checks} checks passed`);

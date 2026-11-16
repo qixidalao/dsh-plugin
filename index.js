@@ -1523,6 +1523,11 @@ async function start(ctx, config) {
   // Safety: dormant detection and GC deletion need a complete session inventory. When
   // listSessions is missing/failed, live agents alone must never be treated as "deleted".
   const gcRequireInventory = config.gcRequireInventory !== false;
+  // Grace period: a scope missing from a verified inventory is only flagged `caution`
+  // until it has been missing this long, so a briefly offline subagent is not dormantized.
+  const dormantGraceDays = Number.isFinite(Number(config.dormantGraceDays))
+    ? Math.max(0, Number(config.dormantGraceDays))
+    : 3;
   const exportPath = typeof config.exportPath === 'string' && config.exportPath.trim()
     ? config.exportPath
     : join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'storages', 'dynamic_memory', 'memory.md');
@@ -1822,13 +1827,13 @@ async function start(ctx, config) {
     }
     return [...scopes.values()];
   };
-  /** Portraits already flagged dormant by a verified inventory run (persisted state). */
-  const persistedDormantScopes = () => {
+  /** Portrait rows already flagged by a verified inventory run (persisted state). */
+  const persistedScopesByFlag = flag => {
     const scopes = new Map();
     for (const { map, prefix, scopeId } of allFacetMaps()) {
       if (scopeId === OWNER_SCOPE) continue;
       for (const row of map.values()) {
-        if (row.dormant !== true) continue;
+        if (row[flag] !== true) continue;
         const entry = scopes.get(scopeId) || { scopeId, user: 0, self: 0 };
         if (prefix === 'p_') entry.user += 1;
         else entry.self += 1;
@@ -1837,50 +1842,96 @@ async function start(ctx, config) {
     }
     return [...scopes.values()];
   };
+  const persistedDormantScopes = () => persistedScopesByFlag('dormant');
+  const persistedCautionScopes = () => persistedScopesByFlag('caution');
   /**
-   * Mark (never unmark) portraits whose agent no longer exists. Without a verified session
-   * inventory nothing is marked: offline-but-existing agents must not become dormant.
+   * A scope with live evidence is alive again: clear dormant/caution/offlineSince so its
+   * portrait becomes visible and injectable immediately (dormant must not be permanent).
+   */
+  const reviveScope = async scopeId => {
+    let revived = 0;
+    for (const { map, table, prefix } of allFacetMaps().filter(entry => entry.scopeId === scopeId)) {
+      for (const [facet, row] of map) {
+        if (row.dormant !== true && row.caution !== true && row.offlineSince === undefined) continue;
+        row.dormant = false;
+        row.caution = false;
+        delete row.offlineSince;
+        row.updatedAt = Date.now();
+        revived += 1;
+        if (table) await trackWrite(table.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
+      }
+    }
+    return revived;
+  };
+  /**
+   * Reconcile portrait dormancy with the live world.
+   * - Only an authoritative (verified) session inventory may mark a scope dead.
+   * - A missing scope first becomes `caution`; it only becomes `dormant` after
+   *   dormantGraceDays, so a briefly offline subagent keeps a usable portrait.
+   * - Any scope with live evidence is revived (dormant/caution cleared) immediately.
    */
   const refreshDormancy = async () => {
     await refreshKnownSessions();
     const inventory = { ...sessionInventory };
     const scopes = scopesWithFacets();
-    if (!inventory.verified && gcRequireInventory) {
-      return {
-        marked: 0,
-        aliveScopes: scopes.filter(entry => scopeIsAlive(entry.scopeId)).length,
-        dormantScopes: [],
-        // Scopes with no live evidence at all: reported as unknown, never marked/deleted.
-        unknownScopes: scopes.filter(entry => !scopeHasLiveEvidence(entry.scopeId)),
-        inventory,
-        reason: 'unverified-inventory',
-      };
-    }
+    const now = Date.now();
+    const graceMs = dormantGraceDays * 86400000;
     let marked = 0;
+    let revived = 0;
     let alive = 0;
+    const unknownScopes = [];
     for (const { scopeId } of scopes) {
-      const dormant = !scopeIsAlive(scopeId);
-      if (!dormant) {
+      if (scopeHasLiveEvidence(scopeId)) {
         alive += 1;
+        revived += await reviveScope(scopeId);
+        continue;
+      }
+      if (!inventory.verified) {
+        // Never mark from an unverified inventory; report the scope as unknown only.
+        unknownScopes.push({ scopeId });
         continue;
       }
       for (const { map, table, prefix } of allFacetMaps().filter(entry => entry.scopeId === scopeId)) {
         for (const [facet, row] of map) {
-          if (row.dormant === true) continue;
-          row.dormant = true;
-          row.updatedAt = Date.now();
-          marked += 1;
-          if (table) await trackWrite(table.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
+          if (row.dormant === true) continue; // already past the grace period
+          let changed = false;
+          if (!Number.isFinite(row.offlineSince)) {
+            row.offlineSince = now;
+            changed = true;
+          }
+          const beyondGrace = graceMs === 0 || now - row.offlineSince >= graceMs;
+          if (beyondGrace) {
+            row.dormant = true;
+            row.caution = false;
+            marked += 1;
+            changed = true;
+          } else if (row.caution !== true) {
+            row.caution = true;
+            changed = true;
+          }
+          if (changed) {
+            row.updatedAt = now;
+            if (table) await trackWrite(table.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
+          }
         }
       }
     }
-    const dormantScopes = scopesWithFacets().filter(entry => !scopeIsAlive(entry.scopeId));
-    return { marked, aliveScopes: alive, dormantScopes, unknownScopes: [], inventory, reason: null };
+    return {
+      marked,
+      revived,
+      aliveScopes: alive,
+      dormantScopes: persistedDormantScopes(),
+      cautionScopes: persistedCautionScopes(),
+      unknownScopes,
+      inventory,
+      reason: inventory.verified ? null : 'unverified-inventory',
+      graceDays: dormantGraceDays,
+    };
   };
   /**
    * /dmem gc: dry-run by default. confirm=true removes only dormant portrait facets whose
-   * agent no longer exists. Without a verified session inventory (and gcRequireInventory,
-   * default true) nothing is detected or deleted; unknown scopes are only reported.
+   * agent no longer exists (never `caution` ones inside the grace period). Without a
+   * verified session inventory nothing is marked or deleted; unknown scopes are reported.
    */
   const gcPortraits = async confirm => {
     const state = await refreshDormancy();
@@ -1889,21 +1940,25 @@ async function start(ctx, config) {
     const orphanScopes = blockedByInventory ? [] : state.dormantScopes;
     const unknownScopes = blockedByInventory ? state.unknownScopes : (state.unknownScopes || []);
     const persisted = persistedDormantScopes();
+    const caution = persistedCautionScopes();
     const report = {
       dryRun: confirm !== true || blockedByInventory,
       mode: memoryScope,
       inventory,
+      graceDays: dormantGraceDays,
       reason: blockedByInventory ? 'unverified-inventory' : null,
       orphanScopes,
+      cautionScopes: caution,
       unknownScopes,
       dormantFacets: blockedByInventory
         ? persisted.reduce((sum, entry) => sum + entry.user + entry.self, 0)
         : orphanScopes.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+      cautionFacets: caution.reduce((sum, entry) => sum + entry.user + entry.self, 0),
       note: blockedByInventory
         ? 'gc disabled: no complete session inventory (listSessions missing/failed). Nothing was detected or deleted; unknown scopes are reported only. Set config gcRequireInventory=false only if you accept the risk.'
         : confirm === true
-          ? 'Dormant portraits for missing agents were deleted; owner portraits were never touched.'
-          : 'Dry-run only: nothing deleted. Pass confirm=true (tool) or /dmem gc confirm=true to delete dormant portraits.',
+          ? 'Dormant portraits for missing agents were deleted; caution portraits inside the grace period, owner portraits and live agents were untouched.'
+          : `Dry-run only: nothing deleted. Scopes missing for less than dormantGraceDays=${dormantGraceDays} days show as caution and are never deleted.`,
     };
     if (blockedByInventory || confirm !== true) return report;
     let deletedFacets = 0;
@@ -1917,7 +1972,7 @@ async function start(ctx, config) {
         if (entry.table) await entry.table.delete(facetKey(entry.prefix, entry.scopeId, facet)).catch(() => {});
       }
     }
-    return { ...report, deletedFacets, note: 'Dormant portraits deleted; owner portraits and live agents untouched.' };
+    return { ...report, deletedFacets, note: 'Dormant portraits deleted; owner portraits, live agents and caution portraits were untouched.' };
   };
 
   const addRow = row => {
@@ -3121,6 +3176,7 @@ async function start(ctx, config) {
     });
     const importance = scopedRows.reduce((sum, row) => sum + (Number(row.importance) || DEFAULT_IMPORTANCE), 0) / Math.max(1, scopedRows.length);
     const dormantViews = persistedDormantScopes();
+    const cautionViews = persistedCautionScopes();
     let injection = null;
     if (agent) {
       const sessionKey = String(agent.id);
@@ -3152,6 +3208,7 @@ async function start(ctx, config) {
         source: sessionInventory.source,
         known: sessionInventory.known,
         gcRequireInventory,
+        dormantGraceDays,
       },
       observations: {
         current: scopedObservations.filter(row => row.status === 'current').length,
@@ -3166,6 +3223,7 @@ async function start(ctx, config) {
       portraitFacets: [...userFacetView.values()].filter(row => row.content.trim()).length,
       assistantFacets: [...selfFacetView.values()].filter(row => row.content.trim()).length,
       dormantFacets: dormantViews,
+      cautionFacets: cautionViews,
       entities: buildEntityIndex(scopedRows).size,
       avgImportance: Number(importance.toFixed(2)),
       workspace: agent ? currentWorkspaceOf(agent) : null,
@@ -3222,14 +3280,19 @@ async function start(ctx, config) {
           if (action === 'scope') {
             const dormancy = await refreshDormancy();
             const persisted = persistedDormantScopes();
+            const caution = persistedCautionScopes();
             return {
               ...scopeStatus(policy),
               dormantFacets: persisted.reduce((sum, entry) => sum + entry.user + entry.self, 0),
               dormantScopes: persisted,
-              inventory: { ...dormancy.inventory, gcRequireInventory },
+              cautionFacets: caution.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+              cautionScopes: caution,
+              dormantGraceDays,
+              inventory: { ...dormancy.inventory, gcRequireInventory, dormantGraceDays },
               dormantReason: dormancy.reason,
               unknownScopes: dormancy.unknownScopes || [],
-              note: `${scopeStatus(policy).note} Identity sources: config.ownerAgentIds > session header (parentSession/origin/delegationDepth) > agents.roots()/list(). Dormant/GC requires a verified session inventory (gcRequireInventory=${gcRequireInventory}).`,
+              revived: dormancy.revived,
+              note: `${scopeStatus(policy).note} Identity sources: config.ownerAgentIds > session header (parentSession/origin/delegationDepth) > agents.roots()/list(). Dormant/GC requires a verified session inventory (gcRequireInventory=${gcRequireInventory}); a missing scope is caution for dormantGraceDays=${dormantGraceDays} before it becomes dormant, and live evidence clears both.`,
             };
           }
           if (action === 'gc') {
@@ -3834,6 +3897,7 @@ async function start(ctx, config) {
       const dormancy = await refreshDormancy();
       const status = scopeStatus(policy);
       const persisted = persistedDormantScopes();
+      const caution = persistedCautionScopes();
       return [
         '记忆隔离状态：',
         `- 模式：${status.mode}（配置：${status.configured}）`,
@@ -3841,7 +3905,8 @@ async function start(ctx, config) {
         `- 命名空间：${status.scopeId || '无'}，读：${status.canRead ? '允许' : '拒绝'}，写：${status.canWrite ? '允许' : '拒绝'}`,
         `- 显式 ownerAgentIds：${status.ownerAgentIds.length ? status.ownerAgentIds.join(', ') : '（未配置）'}`,
         `- 会话清单：${dormancy.inventory.verified ? `完整（${dormancy.inventory.source}，${dormancy.inventory.known} 个）` : `不可用（${dormancy.inventory.source}）`}，gcRequireInventory=${gcRequireInventory}`,
-        `- 孤儿(dormant)画像：${persisted.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
+        `- 宽限期：dormantGraceDays=${dormantGraceDays}；caution 画像：${caution.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
+        `- 孤儿(dormant)画像：${persisted.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}${dormancy.revived ? `；本次恢复(unmark)：${dormancy.revived}` : ''}`,
         dormancy.reason === 'unverified-inventory' ? `- 未知作用域（清单不可用，未判 dormant/未删除）：${dormancy.unknownScopes.map(entry => entry.scopeId).join(', ') || '无'}` : '',
         dormancy.reason === 'unverified-inventory' ? '- 原因：unverified-inventory（缺少完整会话清单，禁止自动 dormant 与 gc 删除）' : '',
         `- ${status.note}`,
@@ -3855,6 +3920,7 @@ async function start(ctx, config) {
       return [
         result.dryRun ? 'GC 预演（未删除任何画像）：' : 'GC 已执行：',
         `- 会话清单：${result.inventory.verified ? `完整（${result.inventory.source}，${result.inventory.known} 个）` : `不可用（${result.inventory.source}）`}，gcRequireInventory=${gcRequireInventory}`,
+        `- 宽限期：dormantGraceDays=${dormantGraceDays}；caution 画像：${result.cautionScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
         result.reason === 'unverified-inventory' ? `- 拒绝删除：reason=unverified-inventory；未知作用域：${result.unknownScopes.map(entry => entry.scopeId).join(', ') || '无'}` : '',
         `- 孤儿 agent 作用域：${result.orphanScopes.length ? result.orphanScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') : '无'}`,
         `- dormant facet 数：${result.dormantFacets}`,
