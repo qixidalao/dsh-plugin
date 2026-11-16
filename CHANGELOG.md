@@ -1,6 +1,26 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。当前为 **2.1.1**（测试版）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.1.1**，下一条目 2.1.2 尚未发布（未改版本号）。
+
+## 2.1.2（未发布）— 索引化收尾与水合可靠性
+
+**当前状态**：v2.1 索引化捕获已落地、真实库迁移完成，水合（按 pointer 回读原文）收尾——真机抽检 **19/20 = 95%**。代码以 commit `60ab15b fix(index-only): execute /dmem migrate and make repair counts live` 为准。
+
+- **存储**：新行只写 `summary` / `keywords` / `entities` / `time` / `textHash` / `pointer`（sessionId+时间）；`user` / `assistant` 为空串。`textHash` 是对"清洗后 user + `\n` + 最后一轮 assistant"的 SHA-256，只用于水合校验，不是加密，也不可还原内容。
+- **读取原文**：search 命中后按 pointer 读本地 Harness 会话，用 `textHash` → `summary` 前缀 → 单一时窗候选三级回退配对，返回片段（`full=true` 返回整段）。
+- **水合实测（真机抽检）**：20 条命中样本中 **19 条**成功回读（95%）；**1 条显式失败，不伪造片段**——会话 `session-be60e2ac…` 的该行（摘要以"p2继续，自动继续p3 p4…"开头）返回 `sourceAvailable:false`、`user`/`assistant` 为空、`hydrationError: no matching user message in session … (54 candidates)`；属 **no-match**，不是 ambiguous，也不是会话不可读。复跑：`search query="继续 修复 插件" limit=10` 第一条即该样本。
+- **失败语义（保持）**：任何未通过校验的命中一律置空并附 `hydrationError`（≤160 字符），哈希/摘要/时窗出现多候选时**拒绝猜测**；摘要、关键词、实体仍可参与检索与排序。
+- **迁移已可用**：工具 action `migrate mode=strip confirm=true` 与 `/dmem migrate mode=strip confirm=true` 共用 `migrateStrip`（先导出再剥离，缺 `confirm=true` 拒绝执行）；本机已用其剥离 **2120** 条旧记录原文，释放约 **2.9M** 字符。
+- **digest 注入**：代码已改为 summary-based 选取，host 测试断言 `digestCount ≥ 1` 通过；但真机 `/dmem stats` 仍为 `digestCount=0`（重载后未复现）——**测试通过，真机待验证**，不写作已修复。
+- **repair**：不再回写 user/assistant 明文（host 断言明文行保持 0）；`plaintextRows` 已改为实测（`countPlaintextRows`）并新增 `plaintextCleared`，此前"硬编码 0"的问题在本 commit 修正。
+- **回滚缺口（诚实边界）**：剥离前的导出是 `memory.md` 可读档案（画像/观察/最近 30 条印象，用户文本 ≤80 字符），**不是逐字备份**；要逐字恢复只能靠剥离前的存储快照。已在 README 写明，不夸大回滚能力。
+- **无加密**：不做应用层加密/口令，隐私依赖全盘加密与文件权限；这是产品边界，不是待办。
+- **意图**：系统会话是原文唯一来源，插件只存本地派生索引；无遥测、无云同步。
+- 测试（commit `60ab15b`，本机亲自运行）：`test.mjs` **52** 项、`test-host.mjs` **93** 项（含水合成功、显式 no-match、歧义拒绝、重复提问去重、migrate 工具/命令的拒绝与成功剥离、repair 实测计数）。
+- **待验证（不写作已修复）**：真机 digest 注入——应用后重载并复跑 `/dmem stats`，需见 `digestCount ≥ 1`；当前真机仍为 0。
+- **发布状态**：**未发布**——无 Release、非 Latest、npm 未推送；`package.json` 仍为 2.1.1 且 `private: true`，发版流程未启动。
+
+> 勘误：2.1.0 条目里"旧数据迁移与面板留待下一步"已过期——迁移命令 2.1.1 已提供并已执行；仍未做的是面板（阶段 4）与迁移前后对比评测（阶段 2.2）。
 
 ## 2.1.1 — 旧数据剥离
 

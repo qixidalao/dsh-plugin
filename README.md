@@ -17,15 +17,15 @@
 2. 用插件管理器把仓库路径作为 bundle 安装到当前 profile（`install_bundle`）；
 3. 重载后执行 `/dmem stats`，看到 `storage: durable` 即持久化生效；数据在 `$DSH_HOME/storages/dynamic_memory/`。
 
-发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。
+发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。**当前未发布**：无 Release、非 Latest、npm 未推送。
 许可证：AGPL-3.0-only（见 LICENSE）。记忆数据不进仓库；真实评测数据只在本机（gitignore）。
 
 ## 验证
 
 ```bash
-node test.mjs          # 51 项纯函数测试
-node test-host.mjs     # 16 项生命周期（内存 mock host）
-node eval.mjs --fixture# 合成评测（不需要真实数据）
+node test.mjs          # 52 项纯函数测试
+node test-host.mjs     # 93 项生命周期（内存 mock host）
+node eval.mjs --fixture # 合成评测（不需要真实数据）
 ```
 
 ## 文档
@@ -46,11 +46,16 @@ node eval.mjs --fixture# 合成评测（不需要真实数据）
 - 若只需要"偶尔翻历史"，官方 session search + `notes.md` 更省；本插件适合需要跨会话连续性、可纠正画像、证据链的场景。
 - `private` 观察在工具输出中默认打码，需 `includePrivate: true` 才显示原文。
 
-## 索引化捕获（v2.1）
+## v2.1 索引化捕获（已完成，未发布）
 
-- 默认 `retainText: false`：新记忆不存 user/assistant 原文，只存摘要、关键词、实体与指向本地会话的 pointer；
-- search 命中后通过本地 sessionQuery 回读片段（`full=true` 取整段），失败标 `sourceAvailable:false`；
-- 旧数据仍在（含原文），迁移命令与面板在下一步。
+定位：**系统会话是原文唯一来源，插件只存本地派生索引**。不是加密产品，也不做云端同步。
+
+- **存什么**：摘要、关键词、实体、时间、`textHash`（SHA-256，仅校验用）、`pointer`（sessionId + 时间）；新记录 `user`/`assistant` 为空串（`retainText: false` 默认）。
+- **不存什么**：用户/助手原文副本；不做应用层加密或口令（隐私靠全盘加密与权限）。历史记录已剥离原文：2120 条，释放约 2.9M 字符。
+- **原文怎么读**：search 命中后按 pointer 读本地 Harness 会话，依次用 `textHash`、摘要前缀、单一时窗候选配对，返回片段（`full=true` 取整段）。
+- **当前状态（真机抽检）**：水合 **19/20 = 95%**；20 条命中样本中 1 条显式失败、不伪造片段——该行是重复"继续"类指令，会话内 54 个候选无法唯一定位，返回 `sourceAvailable:false`、文本为空、`hydrationError: no matching user message (54 candidates)`（no-match，不是 ambiguous，也不是会话不可读）。摘要/关键词/实体仍可检索命中。
+- **回滚（有限）**：剥离前会自动导出 `memory.md`，但它是**可读档案**（画像/观察/最近 30 条印象，用户文本只取前 80 字符），不是 2120 条的逐字备份。要逐字恢复请用剥离前的存储快照（复制 `$DSH_HOME/storages/dynamic_memory/`）；日常备份等同理——`/dmem export` 只导出摘要级内容。
+- 迁移已可用：工具 action 或 `/dmem migrate mode=strip confirm=true`（共用同一实现，先自动导出 memory.md 再剥离，缺 `confirm=true` 拒绝；破坏性）。
 
 ## 已知限制
 
