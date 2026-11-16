@@ -1321,6 +1321,12 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
 // below is pure apart from the registration inside start(): no network, no extra
 // file reads, and no dependency on a live agent.
 const DSH_GO_PANEL_ID = 'memory-settings';
+/**
+ * Every action id the dsh-go registration provides. The rendered view must reach
+ * each of them (`toggle` through the consent list, the rest through the actions
+ * node); ui/verify-dshgo.mjs fails when a registered action has no entry point.
+ */
+export const DSH_GO_ACTION_IDS = Object.freeze(['toggle', 'pause', 'resume', 'export', 'copyStats', 'consentHelp']);
 const dshGoLocaleOf = locale => {
   const code = String(locale || '').toLowerCase();
   if (code.startsWith('zh')) return 'zh';
@@ -1418,8 +1424,11 @@ export function dshGoView(locale) {
       {
         type: 'actions',
         items: [
-          { label: text.export, action: 'export' },
+          { label: text.pause, action: 'pause' },
+          { label: text.resume, action: 'resume' },
+          { label: text.export, action: 'export', style: 'plain' },
           { label: text.copyStats, action: 'copyStats', style: 'plain' },
+          { label: text.consentHelp, action: 'consentHelp', style: 'plain' },
         ],
       },
     ],

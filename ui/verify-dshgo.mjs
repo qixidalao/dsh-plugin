@@ -314,9 +314,35 @@ if (mod && pkg) {
       if (!toggleKeys.has(key)) problems.push(`consent list has no toggle for key "${key}"`);
     }
     const actionRows = findNode(view, 'actions');
-    const actionIds = (actionRows ? actionRows.items || [] : []).map(item => item && item.action).filter(Boolean);
-    for (const id of ['export', 'copyStats']) {
-      if (!actionIds.includes(id)) problems.push(`actions node has no "${id}" action (got ${actionIds.join(', ') || 'none'})`);
+    const actionRowsItems = actionRows && Array.isArray(actionRows.items) ? actionRows.items : [];
+    const actionIds = actionRowsItems.map(item => item && item.action).filter(Boolean);
+    const toggleIds = (list ? list.items || [] : []).map(item => item && item.action && item.action.id).filter(Boolean);
+    const renderedActionIds = [...new Set([...actionIds, ...toggleIds])];
+    const registered = Array.isArray(mod.DSH_GO_ACTION_IDS) ? mod.DSH_GO_ACTION_IDS.map(String) : [];
+    if (registered.length === 0) {
+      problems.push('index.js does not export DSH_GO_ACTION_IDS, so rendered actions cannot be cross-checked');
+    } else {
+      for (const id of renderedActionIds) {
+        if (!registered.includes(id)) problems.push(`view renders action "${id}" that has no registered handler`);
+      }
+      for (const id of registered) {
+        if (!renderedActionIds.includes(id)) problems.push(`action "${id}" is registered but unreachable in the rendered view`);
+      }
+    }
+    for (const id of ['pause', 'resume']) {
+      if (!actionIds.includes(id)) problems.push(`actions node has no "${id}" button (registered is not reachable)`);
+    }
+    for (const id of ['export', 'copyStats', 'consentHelp']) {
+      if (!actionIds.includes(id)) problems.push(`actions node has no "${id}" button (got ${actionIds.join(', ') || 'none'})`);
+    }
+    if (locale === 'zh') {
+      // The rendered view is only useful if the registration really provides the handlers.
+      const registration = sliceBetween(source, 'actions: {', "logger.info('dynamic-memory: dsh-go panel");
+      for (const id of registered) {
+        if (!registration.includes(`${id}:`)) {
+          problems.push(`registered action "${id}" has no handler inside ctx.inject(['dshGo'])`);
+        }
+      }
     }
     const sample = mod.buildDshGoSnapshot({
       storage: 'durable',
@@ -409,6 +435,18 @@ if (mod && pkg) {
     }
     if (mod.dshGoToggleCommand('bogus', true, {}) === null) pass('unknown toggle key is rejected (no command)');
     else fail('unknown toggle key produced a command');
+    // Host syntax guard: memory has no key argument. `dmem consent memory on` would be
+    // parsed as an unknown sub-command and silently do nothing on the phone.
+    const producedCommands = cases.map(({ key, on, consent }) => mod.dshGoToggleCommand(key, on, consent)).filter(Boolean);
+    const keyedMemory = producedCommands.filter(command => /^dmem consent memory\b/.test(command));
+    if (keyedMemory.length === 0) pass('memory toggle uses `dmem consent on|off`, never `consent memory …`');
+    else fail(`memory toggle emitted an invalid keyed command: ${keyedMemory.join(', ')}`);
+    const memoryCommands = cases.filter(({ key }) => key === 'memory').map(({ key, on, consent }) => mod.dshGoToggleCommand(key, on, consent));
+    if (memoryCommands.every(command => command === 'dmem consent on' || command === 'dmem consent off')) {
+      pass('every memory toggle command is exactly `dmem consent on` or `dmem consent off`');
+    } else {
+      fail(`memory toggle commands are not in the host grammar: ${memoryCommands.join(', ')}`);
+    }
   }
 
   function validateEffects() {
@@ -504,7 +542,7 @@ if (mod && pkg) {
       else fail(`empty zh panel strings: ${empty.join(', ')}`);
       if (length(zhPanel.title) <= PANEL_TITLE_MAX && length(enPanel.title) <= PANEL_TITLE_MAX) pass('panel title within 16 chars in both locales');
       else fail('panel title exceeds 16 chars in a locale');
-      for (const key of ['export', 'copyStats']) {
+      for (const key of ['export', 'copyStats', 'pause', 'resume', 'consentHelp']) {
         if (length(zhPanel[key]) > BUTTON_LABEL_MAX || length(enPanel[key]) > BUTTON_LABEL_MAX) {
           fail(`button label "${key}" exceeds ${BUTTON_LABEL_MAX} chars`);
         }
