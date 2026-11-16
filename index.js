@@ -418,7 +418,7 @@ const TOOL = {
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates', 'consent', 'scope'] },
+      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates', 'consent', 'scope', 'gc'] },
       mode: { type: 'string', enum: ['strip'], description: 'For migrate: only mode=strip is supported; it removes legacy plaintext (user/assistant) while keeping summary, keywords, entities, textHash and pointer.' },
       confirm: { type: 'boolean', description: 'For migrate: must be true. The destructive strip runs only after an export file is written to the export path.' },
       consent: {
@@ -1566,20 +1566,21 @@ async function start(ctx, config) {
     return entry;
   };
   const facetMapsFor = policy => {
-    if (memoryScope === 'shared' || !policy || !policy.canRead || policy.scopeId === OWNER_SCOPE || !policy.scopeId) {
+    if (!policy) return { user: portrait, self: selfPortrait, scopeId: OWNER_SCOPE };
+    if (!policy.canRead) return { user: new Map(), self: new Map(), scopeId: null };
+    if (memoryScope === 'shared' || policy.scopeId === OWNER_SCOPE || !policy.scopeId) {
       return { user: portrait, self: selfPortrait, scopeId: OWNER_SCOPE };
     }
     return { ...scopedFacetMaps(policy.scopeId), scopeId: policy.scopeId };
   };
-  /** Effective read view: agent-mode root agents also see pre-upgrade owner rows. */
+  /** Effective read view: agent-mode root agents also see pre-upgrade owner rows; dormant never appears. */
   const facetViewFor = (policy, target) => {
     const maps = facetMapsFor(policy);
     const map = target === ASSISTANT_TARGET ? maps.self : maps.user;
-    if (memoryScope === 'agent' && policy && policy.role === 'owner' && maps.scopeId !== OWNER_SCOPE) {
-      const legacy = target === ASSISTANT_TARGET ? selfPortrait : portrait;
-      return new Map([...legacy, ...map]);
-    }
-    return map;
+    const base = memoryScope === 'agent' && policy && policy.role === 'owner' && maps.scopeId !== OWNER_SCOPE
+      ? new Map([...(target === ASSISTANT_TARGET ? selfPortrait : portrait), ...map])
+      : map;
+    return new Map([...base].filter(([, row]) => row && row.dormant !== true));
   };
   const facetKey = (prefix, scopeId, facet) => (scopeId === OWNER_SCOPE ? `${prefix}${facet}` : `${prefix}${scopeId}:${facet}`);
   const allFacetMaps = () => [
@@ -1592,7 +1593,10 @@ async function start(ctx, config) {
   ];
   const stats = { merged: 0, pruned: 0, superseded: 0, indexed: 0, knownSessions: null, lastConsolidatedAt: null };
   /** Live count of rows that still carry legacy plaintext (index-only rows keep both fields empty). */
-  const countPlaintextRows = () => [...rowsById.values()].filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length;
+  const countPlaintextRows = policy => {
+    const rows = policy ? visibleRows(policy) : [...rowsById.values()];
+    return rows.filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length;
+  };
 
   // ── Multi-agent memory isolation ──────────────────────────────────────────
   // Identity is resolved from the Harness runtime contract, in this order (no guessing):
@@ -1665,7 +1669,7 @@ async function start(ctx, config) {
       role = 'unknown';
       source = 'none';
     }
-    const identity = { sessionId: id, agentId: id, role, source };
+    const identity = { sessionId: id, agentId: id, role, source, agentPreset: header?.agentPreset || null };
     if (role !== 'unknown') identityCache.set(id, identity);
     return identity;
   };
@@ -1709,6 +1713,8 @@ async function start(ctx, config) {
     };
   };
   const policyForAgent = agent => policyFor(agent && agent.id ? agent.id : '', sessionHeaderOf(agent && agent.id));
+  /** Physical scope id for writes: shared mode folds back into the legacy owner namespace. */
+  const storageScopeOf = policy => (memoryScope === 'shared' ? OWNER_SCOPE : (policy && policy.scopeId ? policy.scopeId : OWNER_SCOPE));
   const recordScopeOf = row => (row && typeof row.scopeId === 'string' && row.scopeId ? row.scopeId : OWNER_SCOPE);
   const canSeeRecord = (row, policy) => {
     if (!policy || !policy.canRead) return false;
@@ -1740,6 +1746,120 @@ async function start(ctx, config) {
         ? 'Every agentId has its own memory namespace (legacy unscoped rows stay visible to root agents).'
         : 'shared keeps the legacy profile-wide behavior: every agent sees the same memory.',
   });
+
+  // ── Durable identity keys + orphan (dormant) portraits ────────────────────
+  // Portrait keys are stable identity scopes, never a raw session id lookup:
+  //   owner scope  -> 'owner'          (the user, stable forever)
+  //   agent scope  -> 'agent:<agentId>' (Harness Agent id; for teammates this is their
+  //                                      durable continuable session id, not the caller's)
+  // When that agent no longer exists (its session was deleted), the portrait becomes
+  // dormant instead of dangling: it is never injected and /dmem gc is the only remover.
+  let knownSessionIds = new Set();
+  const refreshKnownSessions = async () => {
+    const next = new Set();
+    try {
+      if (agentsService && typeof agentsService.list === 'function') {
+        for (const agent of agentsService.list()) next.add(String(agent.id));
+      }
+    } catch {
+      // registry unavailable: fall through to the persisted session list
+    }
+    if (!sessionQuery || typeof sessionQuery.listSessions !== 'function') {
+      knownSessionIds = next;
+      return { source: 'live-only', known: next.size };
+    }
+    try {
+      const records = await sessionQuery.listSessions();
+      for (const record of records) {
+        const id = String(record && record.header ? record.header.id : record);
+        if (id) next.add(id);
+      }
+      knownSessionIds = next;
+      return { source: 'session-list', known: next.size };
+    } catch {
+      knownSessionIds = next;
+      return { source: 'session-list-unavailable', known: next.size };
+    }
+  };
+  const scopeIsAlive = scopeId => {
+    if (!scopeId || scopeId === OWNER_SCOPE) return true;
+    const id = scopeId.startsWith('agent:') ? scopeId.slice(6) : scopeId;
+    if (sessionOf(id)) return true;
+    try {
+      if (agentsService && typeof agentsService.get === 'function' && agentsService.get(id)) return true;
+    } catch {
+      // ignore registry errors: fall through to the session list
+    }
+    return knownSessionIds.has(id);
+  };
+  const scopesWithFacets = () => {
+    const scopes = new Map();
+    for (const { map, prefix, scopeId } of allFacetMaps()) {
+      if (scopeId === OWNER_SCOPE) continue;
+      const entry = scopes.get(scopeId) || { scopeId, user: 0, self: 0 };
+      if (prefix === 'p_') entry.user += map.size;
+      else entry.self += map.size;
+      scopes.set(scopeId, entry);
+    }
+    return [...scopes.values()];
+  };
+  /** Mark (never unmark) portraits whose agent no longer exists; persists only on change. */
+  const refreshDormancy = async () => {
+    await refreshKnownSessions();
+    let marked = 0;
+    let alive = 0;
+    for (const { scopeId } of scopesWithFacets()) {
+      const dormant = !scopeIsAlive(scopeId);
+      if (!dormant) {
+        alive += 1;
+        continue;
+      }
+      for (const { map, table, prefix } of allFacetMaps().filter(entry => entry.scopeId === scopeId)) {
+        for (const [facet, row] of map) {
+          if (row.dormant === true) continue;
+          row.dormant = true;
+          row.updatedAt = Date.now();
+          marked += 1;
+          if (table) await trackWrite(table.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
+        }
+      }
+    }
+    const dormantScopes = scopesWithFacets().filter(entry => !scopeIsAlive(entry.scopeId));
+    return { marked, aliveScopes: alive, dormantScopes };
+  };
+  const dormantFacetRows = () => allFacetMaps()
+    .filter(entry => entry.scopeId !== OWNER_SCOPE && !scopeIsAlive(entry.scopeId))
+    .flatMap(entry => [...entry.map.values()].filter(row => row.dormant === true).map(row => ({ row, entry, facet: row.facet })));
+  /**
+   * /dmem gc: dry-run by default. confirm=true removes only dormant portrait facets whose
+   * agent no longer exists; owner portraits and live agents are never touched.
+   */
+  const gcPortraits = async confirm => {
+    const state = await refreshDormancy();
+    const orphans = state.dormantScopes;
+    const report = {
+      dryRun: confirm !== true,
+      mode: memoryScope,
+      orphanScopes: orphans,
+      dormantFacets: orphans.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+      note: confirm === true
+        ? 'Dormant portraits for missing agents were deleted; owner portraits were never touched.'
+        : 'Dry-run only: nothing deleted. Pass confirm=true (tool) or /dmem gc confirm=true to delete dormant portraits.',
+    };
+    if (confirm !== true) return report;
+    let deletedFacets = 0;
+    for (const entry of allFacetMaps()) {
+      if (entry.scopeId === OWNER_SCOPE) continue;
+      if (scopeIsAlive(entry.scopeId)) continue;
+      for (const [facet, row] of [...entry.map]) {
+        if (row.dormant !== true) continue;
+        entry.map.delete(facet);
+        deletedFacets += 1;
+        if (entry.table) await entry.table.delete(facetKey(entry.prefix, entry.scopeId, facet)).catch(() => {});
+      }
+    }
+    return { ...report, deletedFacets, note: 'Dormant portraits deleted; owner portraits and live agents untouched.' };
+  };
 
   const addRow = row => {
     if (rowsById.has(row.id)) return;
@@ -1822,12 +1942,16 @@ async function start(ctx, config) {
   }
   if (portraitTable) {
     for (const [, row] of portraitTable.entries()) {
-      if (row && typeof row === 'object' && userFacets.includes(row.facet)) portrait.set(row.facet, row);
+      if (!row || typeof row !== 'object' || !userFacets.includes(row.facet)) continue;
+      const scopeId = recordScopeOf(row);
+      (scopeId === OWNER_SCOPE ? portrait : scopedFacetMaps(scopeId).user).set(row.facet, row);
     }
   }
   if (selfTable) {
     for (const [, row] of selfTable.entries()) {
-      if (row && typeof row === 'object' && assistantFacets.includes(row.facet)) selfPortrait.set(row.facet, row);
+      if (!row || typeof row !== 'object' || !assistantFacets.includes(row.facet)) continue;
+      const scopeId = recordScopeOf(row);
+      (scopeId === OWNER_SCOPE ? selfPortrait : scopedFacetMaps(scopeId).self).set(row.facet, row);
     }
   }
   if (observationsTable) {
@@ -1859,6 +1983,9 @@ async function start(ctx, config) {
   if (consentFutureVersion !== null) {
     logger.warn(`dynamic-memory: consent row uses schema v${consentFutureVersion} (newer than v${CONSENT_SCHEMA_VERSION}); reading known fields only`);
   }
+  // Best-effort startup classification: portraits whose agent no longer exists become
+  // dormant (never injected) instead of dangling. GC stays explicit and dry-run first.
+  void refreshDormancy().catch(error => logger.warn(`dynamic-memory: dormancy refresh failed: ${String(error)}`));
   const consentStatus = () => ({
     memory: consent.memory ? 'on' : 'off',
     inject: consent.inject ? 'on' : 'off',
@@ -1918,13 +2045,13 @@ async function start(ctx, config) {
     await trackWrite(observationsTable.put(`o_${row.id}`, row)).catch(error => logger.warn(`dynamic-memory: cannot persist observation: ${String(error)}`));
   };
   const OBSERVATION_PRIORITY = { corrected: 0, self_reported: 1, observed: 2, inferred: 3 };
-  const currentObservations = (limit = 20) => [...observations.values()]
+  const currentObservations = (policy, limit = 20) => visibleObservations(policy)
     .filter(row => row.status === 'current')
     .sort((left, right) => (OBSERVATION_PRIORITY[left.kind] ?? 4) - (OBSERVATION_PRIORITY[right.kind] ?? 4) || right.updatedAt - left.updatedAt)
     .slice(0, limit);
-  const liveObservation = id => {
+  const liveObservation = (id, policy) => {
     const row = observations.get(id);
-    return Boolean(row && row.status === 'current');
+    return Boolean(row && row.status === 'current' && canSeeRecord(row, policy));
   };
   /** Remove an id from every observation/portrait reference so no dangling links remain. */
   const dropObservationReferences = async id => {
@@ -1950,12 +2077,12 @@ async function start(ctx, config) {
   };
   /** Remove an exchange id from every facet/observation reference and mark facets for recompute. */
   const dropExchangeReferences = async id => {
-    for (const [map, tableRef, prefix] of [[portrait, portraitTable, 'p_'], [selfPortrait, selfTable, 's_']]) {
+    for (const { map, table: tableRef, prefix, scopeId } of allFacetMaps()) {
       for (const [facet, row] of map) {
         if (!Array.isArray(row.sourceExchangeIds) || !row.sourceExchangeIds.includes(id)) continue;
         row.sourceExchangeIds = row.sourceExchangeIds.filter(source => source !== id);
         row.needsRecompute = true;
-        if (tableRef) await trackWrite(tableRef.put(`${prefix}${facet}`, row)).catch(() => {});
+        if (tableRef) await trackWrite(tableRef.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
       }
     }
     for (const row of observations.values()) {
@@ -1965,12 +2092,13 @@ async function start(ctx, config) {
     }
   };
 
-  const addObservation = async (args, kind, sessionId) => {
+  const addObservation = async (args, kind, sessionId, policy) => {
     const at = Date.now();
     const requestedType = OBSERVATION_TYPES.includes(args.observationType) ? args.observationType
       : OBSERVATION_TYPES.includes(args.type) ? args.type : 'behavior_observation';
     const row = {
       id: uuid(),
+      scopeId: storageScopeOf(policy),
       type: requestedType,
       text: String(args.content || args.text || '').trim().slice(0, 1000),
       kind,
@@ -2025,13 +2153,15 @@ async function start(ctx, config) {
   stats.gapDaysAtStart = gapNow.gapDays;
 
   const speakerBaselineCache = new Map();
-  const speakerBaseline = sessionId => {
+  const speakerBaseline = (sessionId, policy) => {
     const key = String(sessionId);
-    const size = rowsById.size;
-    const cached = speakerBaselineCache.get(key);
+    const scoped = visibleRows(policy);
+    const size = scoped.length;
+    const cacheKey = `${key}|${policy ? policy.scopeId : 'all'}`;
+    const cached = speakerBaselineCache.get(cacheKey);
     if (cached && cached.size === size) return cached.baseline;
-    const baseline = buildSpeakerBaseline([...rowsById.values()], { excludeSessionId: key });
-    speakerBaselineCache.set(key, { size, baseline });
+    const baseline = buildSpeakerBaseline(scoped, { excludeSessionId: key });
+    speakerBaselineCache.set(cacheKey, { size, baseline });
     return baseline;
   };
 
@@ -2062,8 +2192,8 @@ async function start(ctx, config) {
     return set;
   };
 
-  const strongIdentityReport = sessionId => {
-    const report = identityReport(sessionId);
+  const strongIdentityReport = (sessionId, policy) => {
+    const report = identityReport(sessionId, policy);
     const baseline = report.baseline?.messages || 0;
     const gap = report.evidence?.gapDays;
     const strong = report.label === 'drifted'
@@ -2073,14 +2203,17 @@ async function start(ctx, config) {
     return strong ? report : undefined;
   };
 
-  const identityReport = sessionId => {
+  const identityReport = (sessionId, policy) => {
     const key = String(sessionId);
-    const texts = (rowsBySession.get(key) || []).map(row => cleanUserText(row.user)).filter(Boolean);
+    const texts = (rowsBySession.get(key) || [])
+      .filter(row => (policy ? canSeeRecord(row, policy) : true))
+      .map(row => cleanUserText(row.user))
+      .filter(Boolean);
     const live = lastUserBySession.get(key);
-    if (live) texts.push(live);
-    const gap = computeGapState([...rowsById.values()], Date.now());
-    const report = speakerContinuity(texts.slice(-12), speakerBaseline(key), { gapDays: gap.gapDays });
-    const baseline = speakerBaseline(key);
+    if (live && (!policy || policy.canRead)) texts.push(live);
+    const gap = computeGapState(policy ? visibleRows(policy) : [...rowsById.values()], Date.now());
+    const report = speakerContinuity(texts.slice(-12), speakerBaseline(key, policy), { gapDays: gap.gapDays });
+    const baseline = speakerBaseline(key, policy);
     return {
       ...report,
       baseline: {
@@ -2098,7 +2231,7 @@ async function start(ctx, config) {
     };
   };
 
-  const writeFacet = async (map, targetTable, keyPrefix, validFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds) => {
+  const writeFacet = async (map, targetTable, keyPrefix, scopeId, validFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds, identity) => {
     if (!validFacets.includes(facet)) throw new Error(`facet must be one of ${validFacets.join(', ')}`);
     const previous = map.get(facet);
     const next = content.trim().slice(0, 4000);
@@ -2115,6 +2248,15 @@ async function start(ctx, config) {
     const knownObservations = (sourceObservationIds || []).filter(id => observations.has(id));
     const row = {
       facet,
+      scopeId,
+      // Durable identity key metadata: owner scope or the Harness Agent id (never a
+      // transient lookup), plus the preset for diagnosis. Agent.id is a SessionId brand
+      // in this Harness, so the same value survives while the agent is durable.
+      agentId: identity && identity.agentId ? String(identity.agentId) : null,
+      agentPreset: identity && identity.agentPreset ? String(identity.agentPreset) : null,
+      identityRole: identity && identity.role ? String(identity.role) : null,
+      identitySource: identity && identity.source ? String(identity.source) : null,
+      dormant: false,
       content: next,
       updatedAt: at,
       keywords: [...new Set([...keywordsOf(extraKeywords || [], content), ...(previous?.keywords || [])])].slice(0, MAX_KEYWORDS),
@@ -2125,40 +2267,47 @@ async function start(ctx, config) {
       needsRecompute: false,
     };
     map.set(facet, row);
-    if (targetTable) await trackWrite(targetTable.put(`${keyPrefix}${facet}`, row));
+    if (targetTable) await trackWrite(targetTable.put(facetKey(keyPrefix, scopeId, facet), row));
     return row;
   };
 
-  const writePortrait = (facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
-    writeFacet(portrait, portraitTable, 'p_', userFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds);
-  const writeSelf = (facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
-    writeFacet(selfPortrait, selfTable, 's_', assistantFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds);
+  const writePortrait = (policy, facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
+    writeFacet(facetMapsFor(policy).user, portraitTable, 'p_', storageScopeOf(policy), userFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds, policy);
+  const writeSelf = (policy, facet, content, extraKeywords, sourceIds, sourceObservationIds) =>
+    writeFacet(facetMapsFor(policy).self, selfTable, 's_', storageScopeOf(policy), assistantFacets, facet, content, extraKeywords, sourceIds, sourceObservationIds, policy);
 
   /** Mark every facet that cited this observation as needing a rewrite. */
   const markFacetsStale = async observationId => {
-    for (const [map, table, prefix] of [[portrait, portraitTable, 'p_'], [selfPortrait, selfTable, 's_']]) {
+    for (const { map, table, prefix, scopeId } of allFacetMaps()) {
       for (const [facet, row] of map) {
         if (!Array.isArray(row.sourceObservationIds) || !row.sourceObservationIds.includes(observationId)) continue;
         row.needsRecompute = true;
         row.sourceObservationIds = row.sourceObservationIds.filter(id => id !== observationId);
-        if (table) await trackWrite(table.put(`${prefix}${facet}`, row)).catch(() => {});
+        if (table) await trackWrite(table.put(facetKey(prefix, scopeId, facet), row)).catch(() => {});
       }
     }
   };
 
   const facetsOf = target => (target === ASSISTANT_TARGET ? assistantFacets : userFacets);
-  const mapOf = target => (target === ASSISTANT_TARGET ? selfPortrait : portrait);
   const labelsOf = (target, locale = 'zh') => {
     const labels = labelsFor(locale);
     return target === ASSISTANT_TARGET ? labels.self : labels.user;
   };
 
   const restores = new Map();
-  const restore = sessionId => {
+  const restore = (sessionId, headerHint) => {
     const key = String(sessionId);
     if (rowsBySession.has(key) || !sessionQuery) return Promise.resolve();
     if (restores.has(key)) return restores.get(key);
     const job = (async () => {
+      // Isolation: never index a session this agent cannot read/write (a delegated
+      // session in owner mode, or any unverifiable identity) into shared storage.
+      const policy = policyFor(key, headerHint);
+      if (!policy.canRead || !policy.canWrite) {
+        rowsBySession.set(key, []);
+        return;
+      }
+      const scopeId = storageScopeOf(policy);
       const events = [];
       let workspace = null;
       try {
@@ -2186,6 +2335,7 @@ async function start(ctx, config) {
         if (duplicateOf(key, user, assistant)) return;
         const row = {
           id: uuid(),
+          scopeId,
           sessionId: key,
           workspace,
           kind: 'episodic',
@@ -2232,18 +2382,23 @@ async function start(ctx, config) {
   const indexUnseen = async (limit) => {
     if (!sessionQuery || typeof sessionQuery.listSessions !== 'function') return { error: 'session query service is unavailable' };
     const records = await sessionQuery.listSessions();
-    const unseen = records
+    const eligible = records.filter(record => {
+      const policy = policyFor(record.header.id, record.header);
+      return policy.canRead && policy.canWrite;
+    });
+    const unseen = eligible
       .filter(record => !rowsBySession.has(String(record.header.id)))
       .sort((left, right) => (right.header.createdAt || 0) - (left.header.createdAt || 0))
       .slice(0, Math.max(1, Math.min(50, limit)));
-    for (const record of unseen) await restore(record.header.id);
+    for (const record of unseen) await restore(record.header.id, record.header);
     stats.indexed += unseen.length;
     stats.knownSessions = records.length;
     return {
       indexed: unseen.length,
       knownSessions: records.length,
       indexedSessions: rowsBySession.size,
-      remaining: Math.max(0, records.length - rowsBySession.size),
+      skippedIsolated: records.length - eligible.length,
+      remaining: Math.max(0, eligible.length - rowsBySession.size),
     };
   };
 
@@ -2602,14 +2757,15 @@ async function start(ctx, config) {
     }
   };
 
-  const search = (args, workspace) => {
+  const search = (args, workspace, policy) => {
     const query = String(args.query || '').trim();
     const terms = [...new Set(tokensOf(query))];
     if (!terms.length && !entitiesOf(query).length) return { error: 'query is required and must contain at least two letters, digits, or Chinese characters' };
     if (args.from !== undefined && toTimestamp(args.from) === undefined) return { error: 'from must be an ISO date or epoch milliseconds' };
     if (args.to !== undefined && toTimestamp(args.to) === undefined) return { error: 'to must be an ISO date or epoch milliseconds' };
     const scope = args.scope === 'all' || args.scope === 'workspace' ? args.scope : defaultScope;
-    const ranked = rankExchanges([...rowsById.values()], {
+    const scopedRows = visibleRows(policy);
+    const ranked = rankExchanges(scopedRows, {
       query,
       from: args.from,
       to: args.to,
@@ -2632,7 +2788,7 @@ async function start(ctx, config) {
     scheduleFlush();
     const portraitTerms = terms.filter(term => term.length >= 2);
     const portraitMatches = userFacets
-      .map(facet => portrait.get(facet))
+      .map(facet => facetViewFor(policy, USER_TARGET).get(facet))
       .filter(row => row && row.content.trim())
       .map(row => {
         const haystack = `${row.content}\n${row.keywords.join(' ')}`.toLowerCase();
@@ -2666,7 +2822,7 @@ async function start(ctx, config) {
       ...ranked,
       matches,
       portraitMatches,
-      archivedHidden: args.includeArchived === true ? 0 : [...rowsById.values()].filter(row => row.archivedAt).length,
+      archivedHidden: args.includeArchived === true ? 0 : scopedRows.filter(row => row.archivedAt).length,
       full,
       snippetChars: full ? null : chars,
       scope,
@@ -2675,37 +2831,46 @@ async function start(ctx, config) {
     };
   };
 
-  const topEntities = (limit, entityFilter) => {
-    const index = buildEntityIndex([...rowsById.values()]);
+  const topEntities = (limit, entityFilter, policy) => {
+    const scopedRows = visibleRows(policy);
+    const scopedIds = new Set(scopedRows.map(row => row.id));
+    const index = buildEntityIndex(scopedRows);
     if (entityFilter) {
       const related = [...(index.get(String(entityFilter).toLowerCase()) || [])]
-        .filter(row => rowsById.has(row.id))
+        .filter(row => scopedIds.has(row.id))
         .sort((left, right) => right.time - left.time)
         .slice(0, limit)
         .map(row => ({ id: row.id, time: new Date(row.time).toISOString(), user: truncate(cleanUserText(row.user), 80), summary: truncate(row.summary, 80), importance: row.importance }));
       return { entity: String(entityFilter).toLowerCase(), related, count: related.length };
     }
     const entries = [...index.entries()]
-      .map(([entity, set]) => ({ entity, count: [...set].filter(row => rowsById.has(row.id)).length }))
+      .map(([entity, set]) => ({ entity, count: [...set].filter(row => scopedIds.has(row.id)).length }))
       .filter(entry => entry.count > 0)
       .sort((left, right) => right.count - left.count || left.entity.localeCompare(right.entity))
       .slice(0, limit);
     return { entities: entries, total: index.size, sample: entries.slice(0, 3).map(entry => entry.entity) };
   };
 
-  const exportMarkdown = async () => {
+  const exportMarkdown = async policy => {
+    // A scoped agent exports only what it can see; a profile-level maintenance call
+    // (migrate) passes no policy and backs up the whole store for rollback.
+    const scoped = Boolean(policy);
+    const userFacetView = scoped ? facetViewFor(policy, USER_TARGET) : portrait;
+    const selfFacetView = scoped ? facetViewFor(policy, ASSISTANT_TARGET) : selfPortrait;
+    const exportRows = scoped ? visibleRows(policy) : [...rowsById.values()];
+    const exportObs = scoped ? visibleObservations(policy) : [...observations.values()];
     const lines = ['# 动态记忆', '', `生成时间：${new Date().toISOString()}`, ''];
     lines.push('## 用户画像', '');
     for (const facet of userFacets) {
-      const row = portrait.get(facet);
+      const row = userFacetView.get(facet);
       if (row && row.content.trim()) lines.push(`- **${labelsOf(USER_TARGET)[facet] || facet}**：${row.content}`);
     }
-    const selfRowsExport = assistantFacets.map(facet => ({ facet, row: selfPortrait.get(facet) })).filter(({ row }) => row && row.content.trim());
+    const selfRowsExport = assistantFacets.map(facet => ({ facet, row: selfFacetView.get(facet) })).filter(({ row }) => row && row.content.trim());
     if (selfRowsExport.length) {
       lines.push('', '## 助手画像', '');
       for (const { facet, row } of selfRowsExport) lines.push(`- **${labelsOf(ASSISTANT_TARGET)[facet] || facet}**：${row.content}`);
     }
-    const obsExport = [...observations.values()].filter(row => row.status === 'current').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
+    const obsExport = exportObs.filter(row => row.status === 'current').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
     if (obsExport.length) {
       lines.push('', '## 观察与推断', '');
       const labels = { observed: '事实', self_reported: '自述', inferred: '推断', corrected: '纠正' };
@@ -2719,7 +2884,7 @@ async function start(ctx, config) {
       }
     }
     lines.push('', '## 最近印象', '');
-    const impressions = [...rowsById.values()]
+    const impressions = exportRows
       .filter(row => row.summary && !row.archivedAt)
       .sort((left, right) => right.time - left.time)
       .slice(0, 30);
@@ -2728,11 +2893,11 @@ async function start(ctx, config) {
       lines.push(`- ${new Date(row.time).toISOString().slice(0, 10)} 用户：${cleanUserText(row.user).replace(/\s+/g, ' ').slice(0, 80)}`);
       lines.push(`  - 印象：${row.summary.replace(/\s+/g, ' ')}`);
     }
-    const archivedCount = [...rowsById.values()].filter(row => row.archivedAt).length;
+    const archivedCount = exportRows.filter(row => row.archivedAt).length;
     if (archivedCount) lines.push('', `> 另有 ${archivedCount} 条旧记忆在回收区（权重 ${archivedWeight}，默认不参与检索与注入）。`);
     lines.push('', '## 统计', '');
-    lines.push(`- 记录数：${rowsById.size}`);
-    lines.push(`- 画像 facet：${[...portrait.values()].filter(row => row.content.trim()).length}`);
+    lines.push(`- 记录数：${exportRows.length}`);
+    lines.push(`- 画像 facet：${[...userFacetView.values()].filter(row => row.content.trim()).length}`);
     lines.push(`- 存储：${storageState}`);
     await mkdir(join(exportPath, '..'), { recursive: true }).catch(() => {});
     await writeFile(exportPath, `${lines.join('\n')}\n`, 'utf8');
@@ -2808,6 +2973,7 @@ async function start(ctx, config) {
     if (duplicateOf(key, user, assistant)) return;
     const row = {
       id: uuid(),
+      scopeId: state.scopeId || OWNER_SCOPE,
       sessionId: key,
       workspace: state.workspace || null,
       kind: 'episodic',
@@ -2844,6 +3010,15 @@ async function start(ctx, config) {
     if (!state) return;
     // C1: memory consent off means no capture at all, even before /dmem pause|resume.
     if (!captureEnabled || !consent.memory) return;
+    // Isolation runs on the same gate as reads/injection: a delegated session in owner
+    // mode (or an unverifiable identity) never captures into the owner namespace.
+    const policy = policyFor(key, session.header);
+    if (!policy.canWrite) {
+      state.pendingUser = '';
+      state.pendingAssistant = '';
+      return;
+    }
+    state.scopeId = storageScopeOf(policy);
     if (typeof event.time === 'number') state.lastTime = event.time;
     if (event.type === 'turn/start') {
       state.pendingAssistant = '';
@@ -2866,34 +3041,45 @@ async function start(ctx, config) {
   });
 
   const statsSnapshot = agent => {
+    // Isolation: a delegated/unverifiable agent gets zero counts, never owner totals.
+    const policy = agent
+      ? policyForAgent(agent)
+      : { mode: memoryScope, sessionId: '', role: 'unknown', source: 'none', scopeId: null, canRead: false, canWrite: false, reason: 'no agent context' };
+    const scopedRows = visibleRows(policy);
+    const scopedObservations = visibleObservations(policy);
+    const userFacetView = facetViewFor(policy, USER_TARGET);
+    const selfFacetView = facetViewFor(policy, ASSISTANT_TARGET);
     const byKind = { episodic: 0, semantic: 0, procedural: 0 };
-    for (const row of rowsById.values()) byKind[row.kind || 'episodic'] += 1;
-    const withoutSummary = [...rowsById.values()].filter(row => !row.summary).length;
-    const superseded = [...rowsById.values()].filter(row => row.supersededBy).length;
-    const archived = [...rowsById.values()].filter(row => row.archivedAt).length;
-    const active = [...rowsById.values()].filter(row => !row.archivedAt);
+    for (const row of scopedRows) byKind[row.kind || 'episodic'] += 1;
+    const withoutSummary = scopedRows.filter(row => !row.summary).length;
+    const superseded = scopedRows.filter(row => row.supersededBy).length;
+    const archived = scopedRows.filter(row => row.archivedAt).length;
+    const active = scopedRows.filter(row => !row.archivedAt);
     const gap = computeGapState(active, Date.now());
-    const stale = [...userFacets, ...assistantFacets].filter(facet => {
-      const row = portrait.get(facet) || selfPortrait.get(facet);
+    const stale = [...new Set([...userFacets, ...assistantFacets])].filter(facet => {
+      const row = userFacetView.get(facet) || selfFacetView.get(facet);
       return row && isStale(row.updatedAt, Date.now(), freshDays);
     });
-    const importance = [...rowsById.values()].reduce((sum, row) => sum + (Number(row.importance) || DEFAULT_IMPORTANCE), 0) / Math.max(1, rowsById.size);
+    const importance = scopedRows.reduce((sum, row) => sum + (Number(row.importance) || DEFAULT_IMPORTANCE), 0) / Math.max(1, scopedRows.length);
+    const dormantViews = scopesWithFacets().filter(entry => !scopeIsAlive(entry.scopeId));
     let injection = null;
     if (agent) {
       const sessionKey = String(agent.id);
       const snapshot = injectionSnapshots.get(sessionKey);
       injection = snapshot
         ? { ...snapshot }
-        : { chars: 0, digestCount: 0, digestTotal: 0, digestReason: 'no prompt injection recorded for this session yet', at: null };
+        : { chars: 0, digestCount: 0, digestTotal: 0, digestReason: policy.canRead ? 'no prompt injection recorded for this session yet' : policy.reason, at: null };
+      if (!policy.canRead) injection = { ...injection, chars: 0, digestCount: 0, digestTotal: 0, digestReason: policy.reason };
     }
+    const scopedSessions = new Set(scopedRows.map(row => row.sessionId));
     return {
-      exchanges: rowsById.size,
-      sessions: rowsBySession.size,
+      exchanges: scopedRows.length,
+      sessions: scopedSessions.size,
       knownSessions: stats.knownSessions,
       indexedByUs: stats.indexed,
       byKind,
       withoutSummary,
-      missingUser: [...rowsById.values()].filter(row => !cleanUserText(row.user)).length,
+      missingUser: scopedRows.filter(row => !cleanUserText(row.user)).length,
       superseded,
       archived,
       archivedWeight,
@@ -2901,23 +3087,25 @@ async function start(ctx, config) {
       gapDays: gap.gapDays === null ? null : Number(gap.gapDays.toFixed(1)),
       lastActivityAt: gap.lastActivityAt ? new Date(gap.lastActivityAt).toISOString() : null,
       staleFacets: stale,
-      facetsNeedingRecompute: [...portrait.values(), ...selfPortrait.values()].filter(row => row.needsRecompute).length,
+      facetsNeedingRecompute: [...userFacetView.values(), ...selfFacetView.values()].filter(row => row.needsRecompute).length,
       observations: {
-        current: [...observations.values()].filter(row => row.status === 'current').length,
-        inferred: [...observations.values()].filter(row => row.kind === 'inferred').length,
-        corrections: [...observations.values()].filter(row => row.kind === 'corrected').length,
-        proposed: [...observations.values()].filter(row => row.status === 'proposed').length,
-        contradictions: [...observations.values()].filter(row => (row.contradicts || []).length).length,
-        conditional: [...observations.values()].filter(row => (row.conditionalContradicts || []).length).length,
-        expired: [...observations.values()].filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
+        current: scopedObservations.filter(row => row.status === 'current').length,
+        inferred: scopedObservations.filter(row => row.kind === 'inferred').length,
+        corrections: scopedObservations.filter(row => row.kind === 'corrected').length,
+        proposed: scopedObservations.filter(row => row.status === 'proposed').length,
+        contradictions: scopedObservations.filter(row => (row.contradicts || []).length).length,
+        conditional: scopedObservations.filter(row => (row.conditionalContradicts || []).length).length,
+        expired: scopedObservations.filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
       },
-      plaintextRows: countPlaintextRows(),
-      portraitFacets: [...portrait.values()].filter(row => row.content.trim()).length,
-      assistantFacets: [...selfPortrait.values()].filter(row => row.content.trim()).length,
-      entities: buildEntityIndex([...rowsById.values()]).size,
+      plaintextRows: countPlaintextRows(policy),
+      portraitFacets: [...userFacetView.values()].filter(row => row.content.trim()).length,
+      assistantFacets: [...selfFacetView.values()].filter(row => row.content.trim()).length,
+      dormantFacets: dormantViews,
+      entities: buildEntityIndex(scopedRows).size,
       avgImportance: Number(importance.toFixed(2)),
       workspace: agent ? currentWorkspaceOf(agent) : null,
       scope: defaultScope,
+      isolation: scopeStatus(policy),
       merged: stats.merged,
       pruned: stats.pruned,
       lastConsolidatedAt: stats.lastConsolidatedAt ? new Date(stats.lastConsolidatedAt).toISOString() : null,
@@ -2936,7 +3124,7 @@ async function start(ctx, config) {
     const key = String(agent.id);
     const setup = agent.ctx.effect(() => {
       void restore(agent.id);
-      const state = { pendingUser: '', pendingAssistant: '', lastTime: Date.now(), workspace: currentWorkspaceOf(agent), lastUserText: lastUserBySession.get(key) || '' };
+      const state = { pendingUser: '', pendingAssistant: '', lastTime: Date.now(), workspace: currentWorkspaceOf(agent), lastUserText: lastUserBySession.get(key) || '', scopeId: storageScopeOf(policyForAgent(agent)) };
       captures.set(key, state);
       const agentLocale = sessionLocaleFor(key);
       const agentLabels = labelsFor(agentLocale);
@@ -2956,13 +3144,38 @@ async function start(ctx, config) {
         },
         async execute(args) {
           const action = args && args.action;
+          // One isolation decision per call: the same gate covers injection, capture, reads
+          // and writes, so no delegated agent can reach owner memory through any action.
+          const policy = policyForAgent(agent);
+          const isolationGate = write => {
+            if (write ? !policy.canWrite : !policy.canRead) return isolationRefusal(action, policy);
+            return null;
+          };
+          const ownerOnly = () => (memoryScope === 'shared' || policy.role === 'owner' ? null : isolationRefusal(action, policy));
           await restore(agent.id);
-          const own = rowsBySession.get(key) || [];
+          const own = (rowsBySession.get(key) || []).filter(row => canSeeRecord(row, policy));
+          if (action === 'scope') {
+            const dormancy = await refreshDormancy();
+            return {
+              ...scopeStatus(policy),
+              dormantFacets: dormancy.dormantScopes.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+              dormantScopes: dormancy.dormantScopes,
+              note: `${scopeStatus(policy).note} Identity sources: config.ownerAgentIds > session header (parentSession/origin/delegationDepth) > agents.roots()/list().`,
+            };
+          }
+          if (action === 'gc') {
+            const denied = ownerOnly();
+            if (denied) return denied;
+            return await gcPortraits(args.confirm === true);
+          }
+          if (action === 'stats') return statsSnapshot(agent);
           if (action === 'recent') {
+            const denied = isolationGate(false);
+            if (denied) return { ...denied, exchanges: [], total: 0 };
             const wanted = Math.max(1, Math.min(50, Number(args.limit) || recentLimit));
             const scope = args.scope === 'all' || args.scope === 'workspace' ? args.scope : defaultScope;
             const workspace = currentWorkspaceOf(agent);
-            const pool = args.allSessions ? [...rowsById.values()] : own;
+            const pool = args.allSessions ? visibleRows(policy) : own;
             const filtered = pool
               .filter(row => cleanUserText(row.user) || String(row.summary || '').trim())
               .filter(row => !row.archivedAt)
@@ -2988,7 +3201,9 @@ async function start(ctx, config) {
             };
           }
           if (action === 'search') {
-            const result = search(args, currentWorkspaceOf(agent));
+            const denied = isolationGate(false);
+            if (denied) return { ...denied, matches: [], total: 0 };
+            const result = search(args, currentWorkspaceOf(agent), policy);
             if (result.matches?.length && sessionQuery) {
               const full = args.full === true;
               const chars = Math.max(80, Math.min(4000, Number(args.snippetChars) || snippetChars));
@@ -3011,6 +3226,8 @@ async function start(ctx, config) {
             return result;
           }
           if (action === 'index') {
+            const denied = ownerOnly();
+            if (denied) return denied;
             try {
               return await indexUnseen(Number(args.limit) || 10);
             } catch (error) {
@@ -3018,6 +3235,8 @@ async function start(ctx, config) {
             }
           }
           if (action === 'repair') {
+            const denied = ownerOnly();
+            if (denied) return denied;
             try {
               return await repairMissingUser(Number(args.limit) || 5);
             } catch (error) {
@@ -3025,15 +3244,17 @@ async function start(ctx, config) {
             }
           }
           if (action === 'archive' || action === 'restore') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             const targets = Array.isArray(args.ids) && args.ids.length
               ? args.ids
               : (typeof args.id === 'string' ? [args.id] : []);
             if (action === 'restore') {
-              const rows = targets.map(id => rowsById.get(id)).filter(Boolean);
+              const rows = targets.map(id => rowsById.get(id)).filter(row => row && canSeeRecord(row, policy));
               for (const row of rows) await restoreRow(row);
               return { restored: rows.length, ids: rows.slice(0, 5).map(row => row.id) };
             }
-            const selected = selectForArchive([...rowsById.values()], {
+            const selected = selectForArchive(visibleRows(policy), {
               now: Date.now(),
               olderThanDays: Math.max(0, Math.min(36500, Number(args.olderThanDays) || archiveAfterDays)),
               ids: targets,
@@ -3046,9 +3267,11 @@ async function start(ctx, config) {
               hiddenFromDefaultSearch: true,
             };
           }
-          if (action === 'entities') return topEntities(Math.max(1, Math.min(50, Number(args.limit) || 15)), typeof args.entity === 'string' ? args.entity : undefined);
+          if (action === 'entities') return topEntities(Math.max(1, Math.min(50, Number(args.limit) || 15)), typeof args.entity === 'string' ? args.entity : undefined, policy);
           if (action === 'stats') return statsSnapshot(agent);
           if (action === 'consent') {
+            const denied = ownerOnly();
+            if (denied) return denied;
             if (args.consent !== undefined && args.consent !== null) {
               const result = await setConsent(args.consent);
               if (result.error) return result;
@@ -3063,7 +3286,9 @@ async function start(ctx, config) {
             };
           }
           if (action === 'identity') {
-            const report = identityReport(key);
+            const denied = isolationGate(false);
+            if (denied) return denied;
+            const report = identityReport(key, policy);
             return {
               sessionId: key,
               continuity: report.score,
@@ -3076,10 +3301,12 @@ async function start(ctx, config) {
           }
           if (action === 'observe') {
             // C1: explicit writes are blocked while memory consent is off (reads stay allowed).
+            const denied = isolationGate(true);
+            if (denied) return denied;
             if (!consent.memory) return memoryWriteRefusal('observe');
             if (typeof args.corroborates === 'string' && args.corroborates) {
               const target = observations.get(args.corroborates);
-              if (!target) return { error: 'Unknown observation id in corroborates.' };
+              if (!target || !canSeeRecord(target, policy)) return { error: 'Unknown observation id in corroborates.' };
               if (target.status !== 'current') return { error: 'Only current observations can be corroborated.' };
               const quote = typeof args.quote === 'string' ? args.quote.trim() : '';
               if (quote.length < 4) {
@@ -3128,8 +3355,8 @@ async function start(ctx, config) {
             if (epistemic === 'inferred' && !Number.isFinite(args.confidence)) {
               return { error: 'inferred observations need an approximate confidence (0-1)' };
             }
-            const row = await addObservation({ ...args, content: text }, epistemic, key);
-            const knownSources = (args.sourceIds || []).filter(id => rowsById.has(id) || observations.has(id));
+            const row = await addObservation({ ...args, content: text }, epistemic, key, policy);
+            const knownSources = (args.sourceIds || []).filter(id => (rowsById.has(id) && canSeeRecord(rowsById.get(id), policy)) || (observations.has(id) && canSeeRecord(observations.get(id), policy)));
             const lint = lintTraitLabel(text, knownSources, localeFor(text));
             return {
               id: row.id,
@@ -3143,16 +3370,19 @@ async function start(ctx, config) {
             };
           }
           if (action === 'correct') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             if (!consent.memory) return memoryWriteRefusal('correct');
             const original = typeof args.id === 'string' ? observations.get(args.id) : undefined;
-            if (!original) return { error: 'Unknown observation id.' };
+            if (!original || !canSeeRecord(original, policy)) return { error: 'Unknown observation id.' };
             if (original.status !== 'current') return { error: 'Only current observations can be corrected.' };
             const text = String(args.content || args.text || '').trim();
             if (!text) return { error: 'content is required for action=correct' };
             const at = Date.now();
-            const inheritedContradictions = (original.contradicts || []).filter(id => liveObservation(id));
+            const inheritedContradictions = (original.contradicts || []).filter(id => liveObservation(id, policy));
             const correction = {
               id: uuid(),
+              scopeId: storageScopeOf(policy),
               type: 'correction',
               text,
               kind: 'corrected',
@@ -3198,9 +3428,11 @@ async function start(ctx, config) {
             };
           }
           if (action === 'contradict') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             const pair = Array.isArray(args.ids) ? args.ids : [];
             const [left, right] = pair.map(id => observations.get(id));
-            if (!left || !right) return { error: 'contradict needs two existing observation ids.' };
+            if (!left || !right || !canSeeRecord(left, policy) || !canSeeRecord(right, policy)) return { error: 'contradict needs two existing observation ids.' };
             const at = Date.now();
             const conditional = args.conditional === true;
             const field = conditional ? 'conditionalContradicts' : 'contradicts';
@@ -3219,9 +3451,12 @@ async function start(ctx, config) {
             };
           }
           if (action === 'observations') {
+            const denied = isolationGate(false);
+            if (denied) return { ...denied, observations: [], total: 0 };
             const status = OBSERVATION_STATUS.includes(args.status) ? args.status : 'current';
             const limit = Math.max(1, Math.min(50, Number(args.limit) || 20));
-            const list = [...observations.values()]
+            const scopedObservations = visibleObservations(policy);
+            const list = scopedObservations
               .filter(row => row.status === status)
               .filter(row => !args.observationType || row.type === args.observationType)
               .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -3246,18 +3481,22 @@ async function start(ctx, config) {
                 conditionalContradicts: row.conditionalContradicts || [],
                 correctionOf: row.correctionOf,
               }));
-            return { status, total: [...observations.values()].filter(row => row.status === status).length, observations: list };
+            return { status, total: scopedObservations.filter(row => row.status === status).length, observations: list };
           }
           if (action === 'reflect') {
-            const current = [...observations.values()].filter(row => row.status === 'current');
+            const denied = isolationGate(true);
+            if (denied) return denied;
+            const scopedObservations = visibleObservations(policy);
+            const current = scopedObservations.filter(row => row.status === 'current');
             const proposals = buildReflectProposals(current, { minSessions: 3 });
-            const existing = [...observations.values()].filter(row => row.status === 'proposed' || row.status === 'current');
+            const existing = scopedObservations.filter(row => row.status === 'proposed' || row.status === 'current');
             const fresh = proposals.filter(proposal => !existing.some(row => jaccard([...new Set(tokensOf(row.text))], [...new Set(tokensOf(proposal.text))]) >= 0.8));
             const at = Date.now();
             const created = [];
             for (const proposal of fresh.slice(0, 5)) {
               const row = {
                 id: uuid(),
+                scopeId: storageScopeOf(policy),
                 type: proposal.type,
                 text: proposal.text,
                 kind: proposal.kind,
@@ -3288,8 +3527,10 @@ async function start(ctx, config) {
             };
           }
           if (action === 'review') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             const row = typeof args.id === 'string' ? observations.get(args.id) : undefined;
-            if (!row) return { error: 'Unknown observation id.' };
+            if (!row || !canSeeRecord(row, policy)) return { error: 'Unknown observation id.' };
             if (row.status !== 'proposed') return { error: 'Only proposed drafts can be reviewed.' };
             const decision = args.decision === 'accept' ? 'accept' : 'reject';
             row.status = decision === 'accept' ? 'current' : 'withdrawn';
@@ -3304,17 +3545,19 @@ async function start(ctx, config) {
             };
           }
           if (action === 'recompute') {
+            const denied = isolationGate(false);
+            if (denied) return denied;
             const target = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
             const valid = facetsOf(target);
             if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
-            const row = mapOf(target).get(args.facet);
+            const row = facetViewFor(policy, target).get(args.facet);
             if (!row) return { error: 'That facet has no content yet.' };
             const sourceIds = Array.isArray(row.sourceObservationIds) ? row.sourceObservationIds : [];
             const liveObservations = sourceIds
               .map(id => observations.get(id))
-              .filter(entry => entry && entry.status === 'current')
+              .filter(entry => entry && entry.status === 'current' && canSeeRecord(entry, policy))
               .map(entry => ({ id: entry.id, kind: entry.kind, text: entry.text, confidence: entry.confidence, effectiveConfidence: effectiveObservationConfidence(entry, { halfLifeDays: inferenceHalfLifeDays }) }));
-            const staleSourceIds = sourceIds.filter(id => { const entry = observations.get(id); return !entry || entry.status !== 'current'; });
+            const staleSourceIds = sourceIds.filter(id => { const entry = observations.get(id); return !entry || entry.status !== 'current' || !canSeeRecord(entry, policy); });
             return {
               facet: row.facet,
               label: labelsOf(target)[row.facet],
@@ -3328,7 +3571,9 @@ async function start(ctx, config) {
             };
           }
           if (action === 'duplicates') {
-            const pairs = findCrossLayerDuplicates(portrait, [...observations.values()]);
+            const denied = isolationGate(false);
+            if (denied) return { ...denied, pairs: [], total: 0 };
+            const pairs = findCrossLayerDuplicates(facetViewFor(policy, USER_TARGET), visibleObservations(policy));
             return {
               pairs,
               total: pairs.length,
@@ -3336,21 +3581,27 @@ async function start(ctx, config) {
             };
           }
           if (action === 'migrate') {
+            const denied = ownerOnly();
+            if (denied) return denied;
             if (args.mode !== 'strip') return { error: 'Only mode=strip is supported.' };
             if (args.confirm !== true) return { error: 'migrate strip is destructive: pass confirm=true. An export is written first.' };
             return await migrateStrip();
           }
           if (action === 'export') {
+            const denied = isolationGate(false);
+            if (denied) return denied;
             try {
-              return await exportMarkdown();
+              return await exportMarkdown(policy);
             } catch (error) {
               return { error: `export failed: ${String(error)}` };
             }
           }
           if (action === 'portrait') {
+            const denied = isolationGate(false);
+            if (denied) return { ...denied, portrait: [] };
             const target = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
             const valid = facetsOf(target);
-            const map = mapOf(target);
+            const map = facetViewFor(policy, target);
             const labels = labelsOf(target);
             const facets = args.facet ? [args.facet].filter(facet => valid.includes(facet)) : valid;
             if (!facets.length) return { error: `facet must be one of ${valid.join(', ')}` };
@@ -3371,6 +3622,8 @@ async function start(ctx, config) {
             };
           }
           if (action === 'learn') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             // C1: no portrait writes while memory consent is off.
             if (!consent.memory) return memoryWriteRefusal('learn');
             // C3: profile off disables portrait writes (and the prompt no longer injects them).
@@ -3380,15 +3633,15 @@ async function start(ctx, config) {
             if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
             if (typeof args.content !== 'string' || !args.content.trim()) return { error: 'content is required for action=learn' };
             if (target === USER_TARGET && args.facet === 'psychology') {
-              const known = (args.sourceObservationIds || []).filter(id => observations.has(id));
+              const known = (args.sourceObservationIds || []).filter(id => observations.has(id) && canSeeRecord(observations.get(id), policy));
               if (!known.length) {
                 return { error: 'learn target=user facet=psychology requires at least one existing sourceObservationIds entry: psychological summaries must be traceable to observations.' };
               }
             }
             const row = target === ASSISTANT_TARGET
-              ? await writeSelf(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || [])
-              : await writePortrait(args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || []);
-            const knownSources = (args.sourceIds || []).filter(id => rowsById.has(id) || observations.has(id));
+              ? await writeSelf(policy, args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || [])
+              : await writePortrait(policy, args.facet, args.content, args.keywords || [], args.sourceIds || [], args.sourceObservationIds || []);
+            const knownSources = (args.sourceIds || []).filter(id => (rowsById.has(id) && canSeeRecord(rowsById.get(id), policy)) || (observations.has(id) && canSeeRecord(observations.get(id), policy)));
             const lint = lintTraitLabel(args.content, knownSources, localeFor(args.content));
             return {
               target,
@@ -3405,9 +3658,11 @@ async function start(ctx, config) {
             };
           }
           if (action === 'deepen') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             if (!consent.memory) return memoryWriteRefusal('deepen');
             const row = typeof args.id === 'string' ? rowsById.get(args.id) : undefined;
-            if (!row) return { error: 'Unknown exchange id. Read one with action=recent or action=search first.' };
+            if (!row || !canSeeRecord(row, policy)) return { error: 'Unknown exchange id. Read one with action=recent or action=search first.' };
             if (typeof args.summary !== 'string' || !args.summary.trim()) return { error: 'summary is required for action=deepen' };
             const next = args.summary.trim().slice(0, 4000);
             if (row.summary !== next) {
@@ -3432,19 +3687,19 @@ async function start(ctx, config) {
             };
           }
           if (action === 'forget') {
+            const denied = isolationGate(true);
+            if (denied) return denied;
             const forgetTarget = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
             const forgetValid = facetsOf(forgetTarget);
             if (!args.id && forgetValid.includes(args.facet)) {
-              const map = mapOf(forgetTarget);
+              const maps = facetMapsFor(policy);
+              const map = forgetTarget === ASSISTANT_TARGET ? maps.self : maps.user;
               map.delete(args.facet);
-              if (forgetTarget === ASSISTANT_TARGET) {
-                if (selfTable) await selfTable.delete(`s_${args.facet}`);
-              } else if (portraitTable) {
-                await portraitTable.delete(`p_${args.facet}`);
-              }
+              const table = forgetTarget === ASSISTANT_TARGET ? selfTable : portraitTable;
+              if (table) await table.delete(facetKey(forgetTarget === ASSISTANT_TARGET ? 's_' : 'p_', maps.scopeId, args.facet));
               return { clearedFacet: args.facet, target: forgetTarget, label: labelsOf(forgetTarget)[args.facet] };
             }
-            if (typeof args.id === 'string' && observations.has(args.id)) {
+            if (typeof args.id === 'string' && observations.has(args.id) && canSeeRecord(observations.get(args.id), policy)) {
               const target = observations.get(args.id);
               // If the deleted record was itself a correction, the original becomes current again.
               if (target.correctionOf) {
@@ -3462,7 +3717,7 @@ async function start(ctx, config) {
               return { forgotten: args.id, kind: 'observation' };
             }
             const row = typeof args.id === 'string' ? rowsById.get(args.id) : undefined;
-            if (!row) return { error: 'Unknown exchange id, observation id, and no valid facet was given.' };
+            if (!row || !canSeeRecord(row, policy)) return { error: 'Unknown exchange id, observation id, and no valid facet was given.' };
             rowsById.delete(row.id);
             invalidateRow(row);
             dirty.delete(row);
@@ -3475,7 +3730,7 @@ async function start(ctx, config) {
             await dropExchangeReferences(row.id);
             return { forgotten: row.id, referencesCleared: true };
           }
-          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, consent, entities, export, index, repair, migrate or archive.' };
+          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, consent, scope, gc, entities, export, index, repair, migrate or archive.' };
         },
       });
       return () => {
@@ -3501,8 +3756,37 @@ async function start(ctx, config) {
   const commandText = async (invocation, rawInput) => {
     const workspace = currentWorkspaceOf(invocation.agent);
     const input = String(rawInput || '').trim();
+    const policy = policyForAgent(invocation.agent);
+    const ownerLevel = memoryScope === 'shared' || policy.role === 'owner';
+    const isolationText = () => `记忆隔离：${policy.reason}（/dmem scope 查看身份与模式）`;
     const commandLocale = sessionLocaleFor(invocation.agent.id);
     const commandMessages = packFor(commandLocale).commands || {};
+    if (input === 'scope') {
+      const dormancy = await refreshDormancy();
+      const status = scopeStatus(policy);
+      return [
+        '记忆隔离状态：',
+        `- 模式：${status.mode}（配置：${status.configured}）`,
+        `- 当前身份：${status.identity.role}（来源：${status.identity.source}，会话：${status.identity.sessionId || '未知'}）`,
+        `- 命名空间：${status.scopeId || '无'}，读：${status.canRead ? '允许' : '拒绝'}，写：${status.canWrite ? '允许' : '拒绝'}`,
+        `- 显式 ownerAgentIds：${status.ownerAgentIds.length ? status.ownerAgentIds.join(', ') : '（未配置）'}`,
+        `- 孤儿(dormant)画像：${dormancy.dormantScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
+        `- ${status.note}`,
+        status.reason ? `- 原因：${status.reason}` : '',
+      ].filter(Boolean).join('\n');
+    }
+    if (input === 'gc' || input.startsWith('gc ')) {
+      if (!ownerLevel) return isolationText();
+      const confirm = /\bconfirm=true\b/.test(input);
+      const result = await gcPortraits(confirm);
+      return [
+        result.dryRun ? 'GC 预演（未删除任何画像）：' : 'GC 已执行：',
+        `- 孤儿 agent 作用域：${result.orphanScopes.length ? result.orphanScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') : '无'}`,
+        `- dormant facet 数：${result.dormantFacets}`,
+        result.dryRun ? '' : `- 已删除 facet：${result.deletedFacets}`,
+        `- ${result.note}`,
+      ].filter(Boolean).join('\n');
+    }
     if (!input || input === 'stats') {
       const snapshot = statsSnapshot(invocation.agent);
       return [
@@ -3512,9 +3796,11 @@ async function start(ctx, config) {
         `- 平均重要度：${snapshot.avgImportance}，未写印象：${snapshot.withoutSummary}`,
         `- 捕获：${snapshot.capture}，存储：${snapshot.storage}，工作区：${workspace || '未知'}`,
         `- 同意：记忆=${snapshot.consent.memory} 注入=${snapshot.consent.inject} 画像=${snapshot.consent.profile} 敏感=${snapshot.consent.sensitive}`,
+        `- 隔离：${snapshot.isolation.mode} / ${snapshot.isolation.identity.role}（${snapshot.isolation.identity.source}），dormant 画像：${snapshot.dormantFacets.length}`,
       ].join('\n');
     }
     if (input === 'pause' || input === 'resume' || input === 'capture') {
+      if (!ownerLevel) return isolationText();
       if (input === 'pause') captureEnabled = false;
       else if (input === 'resume') captureEnabled = true;
       return input === 'capture'
@@ -3523,6 +3809,7 @@ async function start(ctx, config) {
     }
     // C1-C4 consent: status|on|off|profile <mode>|sensitive on|off|inject on|off.
     if (input === 'consent' || input.startsWith('consent ')) {
+      if (!ownerLevel) return isolationText();
       const tokens = input.split(/\s+/).slice(1);
       const sub = (tokens[0] || 'status').toLowerCase();
       if (sub === 'status') return consentLines();
@@ -3543,9 +3830,10 @@ async function start(ctx, config) {
       return `用法：${consentUsage}`;
     }
     if (input === 'portrait' || input === 'self') {
+      if (!policy.canRead) return isolationText();
       const assistant = input === 'self';
       const facets = assistant ? assistantFacets : userFacets;
-      const map = assistant ? selfPortrait : portrait;
+      const map = facetViewFor(policy, assistant ? ASSISTANT_TARGET : USER_TARGET);
       const labels = labelsOf(assistant ? ASSISTANT_TARGET : USER_TARGET, sessionLocaleFor(invocation.agent.id));
       const rows = facets.map(facet => ({ facet, row: map.get(facet) })).filter(({ row }) => row && row.content.trim());
       if (!rows.length) return assistant
@@ -3554,13 +3842,15 @@ async function start(ctx, config) {
       return [assistant ? '助手画像' : '用户画像', ...rows.map(({ facet, row }) => `- ${labels[facet]}：${row.content}`)].join('\n');
     }
     if (input === 'export') {
-      const result = await exportMarkdown();
+      if (!policy.canRead) return isolationText();
+      const result = await exportMarkdown(policy);
       return `已导出 ${result.impressions} 条印象到 ${result.path}（${result.bytes} 字节）`;
     }
     if (input.startsWith('search ')) {
+      if (!policy.canRead) return isolationText();
       const query = input.slice(7).trim();
       if (!query) return '用法：/memory search <关键词>';
-      const result = search({ query, limit: 3 }, workspace);
+      const result = search({ query, limit: 3 }, workspace, policy);
       if (result.error) return result.error;
       if (!result.matches.length) return `没有找到与「${query}」相关的记忆。`;
       return [
@@ -3572,6 +3862,7 @@ async function start(ctx, config) {
     // action (migrateStrip). Only key=value flags are parsed; a bare "confirm" never
     // authorizes the destructive strip, and any mode other than strip is rejected.
     if (input === 'migrate' || input.startsWith('migrate ')) {
+      if (!ownerLevel) return isolationText();
       const params = {};
       for (const token of input.split(/\s+/).slice(1)) {
         const separator = token.indexOf('=');
@@ -3586,11 +3877,13 @@ async function start(ctx, config) {
         result.note,
       ].join('\n');
     }
-    const methods = commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture|consent|migrate]';
+    const methods = commandMessages.methods || '用法：/dmem [stats|scope|gc|portrait|self|export|search <关键词>|pause|resume|capture|consent|migrate]';
     // Locale packs may not list newer operator commands yet; keep them discoverable.
     const extra = [];
     if (!methods.includes('migrate')) extra.push('- migrate: /dmem migrate mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）');
     if (!methods.includes('consent')) extra.push(`- consent: ${consentUsage}（C1-C4，状态持久化，重载后保留）`);
+    if (!methods.includes('scope')) extra.push(`- scope: /dmem scope（记忆隔离模式、当前 agent 身份与读写权限）`);
+    if (!methods.includes('gc')) extra.push('- gc: /dmem gc（dry-run 列出孤儿 dormant 画像）/ /dmem gc confirm=true（删除）');
     return extra.length ? `${methods}\n${extra.join('\n')}` : methods;
   };
 
@@ -3600,7 +3893,7 @@ async function start(ctx, config) {
           return commands.register({
             name: 'dmem',
             description: 'Inspect or export the dynamic memory store',
-            input: { hint: 'stats | portrait | self | export | search <关键词> | consent status|on|off|profile <mode>|sensitive <on|off> | migrate (tool action: mode=strip confirm=true)' },
+            input: { hint: 'stats | scope | gc | portrait | self | export | search <关键词> | consent status|on|off|profile <mode>|sensitive <on|off> | migrate (tool action: mode=strip confirm=true)' },
             handler: async invocation => {
               try {
                 return { kind: 'success', text: await commandText(invocation, invocation.rawInput) };
@@ -3620,18 +3913,20 @@ async function start(ctx, config) {
   // Index-only rows (v2.1) keep no plaintext user text, so digest eligibility comes from
   // the stored summary: a non-empty summary is required, the current session is excluded
   // and archived rows stay hidden. Relevance is computed from the summary in renderContext.
-  const digestRows = currentSessionId => {
+  const digestRows = (currentSessionId, policy) => {
     if (!digestImpressions) return [];
-    return [...rowsById.values()]
+    return visibleRows(policy)
       .filter(row => String(row.summary || '').trim() && !row.archivedAt && row.sessionId !== currentSessionId)
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, digestImpressions);
   };
 
-  const staleFacetSet = now => {
+  const staleFacetSet = (now, policy) => {
     const stale = new Set();
+    const userView = facetViewFor(policy, USER_TARGET);
+    const selfView = facetViewFor(policy, ASSISTANT_TARGET);
     for (const facet of [...FACETS, ...SELF_FACETS]) {
-      const row = portrait.get(facet) || selfPortrait.get(facet);
+      const row = userView.get(facet) || selfView.get(facet);
       if (row && isStale(row.updatedAt, now, freshDays)) stale.add(facet);
     }
     return stale;
@@ -3646,6 +3941,21 @@ async function start(ctx, config) {
           const sessionId = scope && scope.id !== undefined ? String(scope.id) : undefined;
           if (!sessionId) return '';
           const now = Date.now();
+          // Isolation is checked before consent: a delegated/unverifiable agent must not
+          // even learn whether the owner has memory.
+          const policy = policyFor(sessionId, sessionHeaderOf(sessionId));
+          if (!policy.canRead) {
+            injectionSnapshots.set(sessionId, {
+              chars: 0,
+              digestCount: 0,
+              digestTotal: 0,
+              digestReason: policy.reason || 'memory isolated for this agent',
+              at: now,
+              isolation: { mode: policy.mode, role: policy.role, source: policy.source },
+            });
+            return '';
+          }
+          knownSessionIds.add(sessionId);
           // C1/C2: no memory or no injection consent means the prompt gets nothing.
           if (!consent.memory || !consent.inject) {
             injectionSnapshots.set(sessionId, {
@@ -3654,30 +3964,33 @@ async function start(ctx, config) {
               digestTotal: 0,
               digestReason: !consent.memory ? 'memory consent is off' : 'injection consent is off',
               at: now,
+              isolation: { mode: policy.mode, role: policy.role, source: policy.source },
             });
             return '';
           }
-          const rows = rowsBySession.get(sessionId) || [];
+          const rows = (rowsBySession.get(sessionId) || []).filter(row => canSeeRecord(row, policy));
+          const userFacetView = facetViewFor(policy, USER_TARGET);
+          const selfFacetView = facetViewFor(policy, ASSISTANT_TARGET);
           let digestReport = null;
           const text = renderContext({
             // C3: profile off removes both user and assistant portrait sections.
-            portraitRows: consent.profile === 'off' ? new Map() : portrait,
+            portraitRows: consent.profile === 'off' ? new Map() : userFacetView,
             portraitChars,
             portraitBudget,
-            selfRows: consent.profile === 'off' || !injectAssistantPortrait ? undefined : selfPortrait,
+            selfRows: consent.profile === 'off' || !injectAssistantPortrait ? undefined : selfFacetView,
             selfChars,
             selfBudget,
-            digest: digestRows(sessionId),
+            digest: digestRows(sessionId, policy),
             digestChars,
             lastUserText: lastUserBySession.get(sessionId) || '',
             legacyRecent: injectRecentExchanges ? rows.slice(-recentLimit) : [],
             recentLimit,
             promptChars,
-            gap: computeGapState([...rowsById.values()], now),
+            gap: computeGapState(visibleRows(policy).filter(row => !row.archivedAt), now),
             gapDays,
-            staleFacets: staleFacetSet(now),
-            identity: identityNoticeEnabled ? strongIdentityReport(sessionId) : undefined,
-            observations: currentObservations(20),
+            staleFacets: staleFacetSet(now, policy),
+            identity: identityNoticeEnabled ? strongIdentityReport(sessionId, policy) : undefined,
+            observations: currentObservations(policy, 20),
             locale: sessionLocaleFor(sessionId),
             messages: packFor(sessionLocaleFor(sessionId)).injection,
             facetList: userFacets,
@@ -3703,6 +4016,7 @@ async function start(ctx, config) {
               ? null
               : (digestReport && digestReport.digestReason) || 'digest report unavailable',
             at: digestReport && digestReport.at ? digestReport.at : now,
+            isolation: { mode: policy.mode, role: policy.role, source: policy.source },
           });
           return text;
         },
@@ -3737,6 +4051,7 @@ async function start(ctx, config) {
     const sessionKey = scope && scope.sessionId !== undefined && scope.sessionId !== null
       ? String(scope.sessionId)
       : null;
+    const policy = sessionKey ? policyFor(sessionKey) : null;
     let injection = sessionKey ? injectionSnapshots.get(sessionKey) : undefined;
     if (!injection) {
       // No session-scoped snapshot (e.g. a `features` surface): show the latest one.
@@ -3747,8 +4062,8 @@ async function start(ctx, config) {
     }
     return buildDshGoSnapshot({
       storage: storageState,
-      exchanges: rowsById.size,
-      plaintextRows: countPlaintextRows(),
+      exchanges: policy ? visibleRows(policy).length : rowsById.size,
+      plaintextRows: policy ? countPlaintextRows(policy) : countPlaintextRows(),
       injectedChars: injection && typeof injection.chars === 'number' ? injection.chars : undefined,
       consent: consentStatus(),
     });

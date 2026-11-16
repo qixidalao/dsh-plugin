@@ -4,8 +4,10 @@
 // (in-flight writes are awaited before the domain closes), restart recovery, migrate
 // schema/command discovery and execution, index-only hydration from fake local sessions
 // (metadata cleaning, repeated-prompt disambiguation + explicit failures), the
-// summary-based cross-session digest and its real injected-count stats, and repair
-// that never writes plaintext back (with a live plaintext count).
+// summary-based cross-session digest and its real injected-count stats, repair that
+// never writes plaintext back (with a live plaintext count), and multi-agent memory
+// isolation (owner/agent/shared scopes, delegated denial, per-agent namespaces,
+// dormant portraits for deleted agents, and explicit /dmem gc dry-run vs confirm).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -56,27 +58,47 @@ function makeHost(storage, services = {}) {
   const tools = [];
   const prompts = [];
   const commands = [];
-  const agent = {
-    id: 'session-fixture',
-    ctx: {
+  const specs = services.agents || [{ id: 'session-fixture' }];
+  const agentsById = new Map();
+  const agents = specs.map(spec => {
+    const record = { id: spec.id };
+    record.ctx = {
       effect(setup) {
         effects.push(setup());
         return () => {};
       },
       tools: {
         register(tool) {
+          tool.__agentId = record.id;
           tools.push(tool);
           return () => {};
         },
       },
-    },
-  };
+    };
+    agentsById.set(record.id, record);
+    return record;
+  });
+  const rootIds = new Set(services.roots || agents.map(record => record.id));
+  // id -> { id, header }. Delegated sessions carry parentSession/origin/delegationDepth.
+  const sessions = services.sessions instanceof Map ? services.sessions : new Map();
+  if (!services.sessions) {
+    for (const record of agents) sessions.set(record.id, { id: record.id, header: { id: record.id, isSeeded: false, cwd: null } });
+  }
+  const liveAgents = () => agents;
+  const agent = agents[0];
   const ctx = {
     logger: { warn() {}, info() {} },
     get(name) {
       if (name === 'systemPrompt') return { context: options => { prompts.push(options); return () => {}; } };
       if (name === 'storageDomain') return { open: async () => storage.domain };
-      if (name === 'agents') return { list: () => [agent] };
+      if (name === 'agents') {
+        return {
+          list: () => liveAgents(),
+          roots: () => liveAgents().filter(record => rootIds.has(record.id)),
+          get: id => liveAgents().find(record => record.id === String(id)),
+        };
+      }
+      if (name === 'sessions') return { get: id => sessions.get(String(id)) };
       if (name === 'commands') return { register: options => { commands.push(options); return () => {}; } };
       if (name === 'sessionQuery') return services.sessionQuery;
       return undefined;
@@ -94,19 +116,28 @@ function makeHost(storage, services = {}) {
     },
     agent,
   };
-  const emit = (sessionId, event) => handlers.get('session/event')?.({ id: sessionId }, event);
+  const emit = (sessionId, event) => handlers.get('session/event')?.({ id: sessionId, header: sessions.get(String(sessionId))?.header }, event);
+  const toolsFor = id => tools.filter(tool => tool.__agentId === String(id));
   const dispose = async () => {
     for (const cleanup of effects.reverse()) {
       if (typeof cleanup === 'function') await cleanup();
     }
   };
-  return { ctx, agent, tools, prompts, commands, emit, dispose };
+  // Simulate a deleted session/agent (archive keeps both, deletion removes them).
+  const dropAgent = id => {
+    const key = String(id);
+    sessions.delete(key);
+    const index = agents.findIndex(record => record.id === key);
+    if (index >= 0) agents.splice(index, 1);
+  };
+  return { ctx, agent, agents, tools, toolsFor, prompts, commands, sessions, emit, dispose, dropAgent };
 }
 
-// Minimal stand-in for the host's sessionQuery service: readSession returns a snapshot.
-function makeSessionQuery(sessions) {
+// Minimal stand-in for the host's sessionQuery service: readSession returns a snapshot,
+// listSessions optionally reuses the same snapshots so dormancy can be exercised.
+function makeSessionQuery(sessions, { listSessions = false } = {}) {
   const reads = [];
-  return {
+  const query = {
     reads,
     async readSession(sessionId) {
       reads.push(String(sessionId));
@@ -115,6 +146,13 @@ function makeSessionQuery(sessions) {
       return snapshot;
     },
   };
+  if (listSessions) {
+    query.listSessions = async () => Object.values(sessions).map(snapshot => ({
+      header: snapshot.session?.header || { id: snapshot.session?.id, cwd: null },
+      session: snapshot.session,
+    }));
+  }
+  return query;
 }
 
 // A persisted index-only row (v2.1 storage: summary/hash/pointer, no plaintext).
@@ -936,5 +974,210 @@ equal(futureConsent.consent.profile, 'situational', 'future row keeps a known pr
 const futureStored = [...futureConsentStorage.tables.get('consent').values()][0];
 equal(futureStored.schemaVersion, 99, 'future row is not blindly rewritten on read');
 await futureConsentHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Multi-agent memory isolation (default memoryScope=owner). Identity comes from
+// the Harness contract: session header (parentSession/origin/delegationDepth) and
+// agents.roots()/list(). Delegated subagents/teammates are denied owner memory.
+// ---------------------------------------------------------------------------
+const isoStorage = makeStorage();
+const isoOwner = 'session-owner';
+const isoEmployee = 'session-employee';
+const isoHeader = (id, extra = {}) => ({ header: { id, isSeeded: false, cwd: null, ...extra } });
+const isoSnapshot = (id, extra = {}) => ({ session: { id, ...isoHeader(id, extra) }, events: [] });
+const isoSessionQuery = makeSessionQuery({
+  [isoOwner]: isoSnapshot(isoOwner),
+  [isoEmployee]: isoSnapshot(isoEmployee, { parentSession: isoOwner, origin: 'subagent', delegationDepth: 1 }),
+}, { listSessions: true });
+const isoSpecs = {
+  agents: [{ id: isoOwner }, { id: isoEmployee }],
+  roots: [isoOwner],
+  sessions: new Map([
+    [isoOwner, isoHeader(isoOwner)],
+    [isoEmployee, isoHeader(isoEmployee)],
+  ]),
+  sessionQuery: isoSessionQuery,
+};
+const isoHost = makeHost(isoStorage, isoSpecs);
+apply(isoHost.ctx, { autoIndexSessions: false, warmup: false, capture: true });
+await tick();
+const isoOwnerTool = isoHost.toolsFor(isoOwner)[0];
+const isoEmployeeTool = isoHost.toolsFor(isoEmployee)[0];
+ok(isoOwnerTool && isoEmployeeTool, 'owner mode registers one memory tool per agent');
+equal((await isoOwnerTool.execute({ action: 'scope' })).identity.role, 'owner', 'root agent is owner');
+equal((await isoEmployeeTool.execute({ action: 'scope' })).identity.role, 'delegate', 'non-root agent is delegated');
+equal((await isoEmployeeTool.execute({ action: 'scope' })).identity.source, 'agents-roots', 'delegation is identified from the agent registry');
+
+await isoOwnerTool.execute({ action: 'learn', facet: 'habits', content: 'owner 偏好自托管与本地存储' });
+const isoOwnerObs = await isoOwnerTool.execute({ action: 'observe', type: 'explicit_fact', content: 'owner 在 Windows 上开发插件' });
+ok(isoOwnerObs.id, 'owner can write observations');
+isoHost.emit(isoOwner, { type: 'user/message', time: Date.now() - 2000, data: message('owner 的私密部署细节 example.com') });
+isoHost.emit(isoOwner, { type: 'assistant/message', time: Date.now() - 1000, data: { message: message('owner 助手回答：部署完成') } });
+isoHost.emit(isoOwner, { type: 'turn/end', time: Date.now(), data: {} });
+await tick();
+const isoOwnerStats = await isoOwnerTool.execute({ action: 'stats' });
+ok(isoOwnerStats.exchanges >= 1, 'owner captures exchanges');
+equal(isoOwnerStats.isolation.identity.role, 'owner', 'owner stats expose the isolation role');
+ok((await isoOwnerTool.execute({ action: 'portrait', facet: 'habits' })).portrait[0].content.includes('自托管'), 'owner portrait stored');
+
+const isoEmployeeStats = await isoEmployeeTool.execute({ action: 'stats' });
+equal(isoEmployeeStats.exchanges, 0, 'delegated agent sees zero owner exchanges');
+equal(isoEmployeeStats.portraitFacets, 0, 'delegated agent sees no owner portrait');
+equal(isoEmployeeStats.observations.current, 0, 'delegated agent sees no owner observations');
+equal(isoEmployeeStats.isolation.canRead, false, 'delegated reads are denied');const isoEmployeeSearch = await isoEmployeeTool.execute({ action: 'search', query: '部署 example.com' });
+equal(isoEmployeeSearch.matches.length, 0, 'delegated search returns no owner row');
+equal(isoEmployeeSearch.isolated, true, 'delegated search is explicitly isolated');
+equal((await isoEmployeeTool.execute({ action: 'portrait', facet: 'habits' })).portrait.length, 0, 'delegated portrait read is empty');
+equal((await isoEmployeeTool.execute({ action: 'observations' })).total, 0, 'delegated observations list is empty');
+matches((await isoEmployeeTool.execute({ action: 'learn', facet: 'habits', content: '员工写入' })).error, /isolation/, 'delegated learn is refused');
+matches((await isoEmployeeTool.execute({ action: 'observe', type: 'explicit_fact', content: '员工观察' })).error, /isolation/, 'delegated observe is refused');
+matches((await isoEmployeeTool.execute({ action: 'deepen', id: 'whatever', summary: 'x' })).error, /isolation/, 'delegated deepen is refused');
+matches((await isoEmployeeTool.execute({ action: 'correct', id: isoOwnerObs.id, content: '篡改' })).error, /isolation/, 'delegated correct cannot touch an owner observation');
+isoHost.emit(isoEmployee, { type: 'user/message', time: Date.now() - 2000, data: message('员工私密任务 alpha') });
+isoHost.emit(isoEmployee, { type: 'assistant/message', time: Date.now() - 1000, data: { message: message('员工助手回答 beta') } });
+isoHost.emit(isoEmployee, { type: 'turn/end', time: Date.now(), data: {} });
+await tick();
+equal((await isoOwnerTool.execute({ action: 'stats' })).exchanges, isoOwnerStats.exchanges, 'delegated capture writes nothing into owner memory');
+const isoEmployeePrompt = isoHost.prompts[0].text({ scope: { id: isoEmployee } });
+equal(isoEmployeePrompt, '', 'delegated session gets no injected memory');
+matches((await isoEmployeeTool.execute({ action: 'stats' })).injection.digestReason, /memoryScope=owner/, 'delegated injection reason names the isolation mode');
+const isoOwnerPrompt = isoHost.prompts[0].text({ scope: { id: isoOwner } });
+ok(isoOwnerPrompt.includes('自托管'), 'owner prompt still injects the owner portrait');
+await isoHost.dispose();
+
+// Reload: isolation state survives (owner keeps memory, delegate stays denied).
+const isoReloadSpecs = {
+  ...isoSpecs,
+  agents: [{ id: isoOwner }, { id: isoEmployee }],
+  sessions: new Map([
+    [isoOwner, isoHeader(isoOwner)],
+    [isoEmployee, isoHeader(isoEmployee)],
+  ]),
+};
+const isoReloadHost = makeHost(isoStorage, isoReloadSpecs);
+apply(isoReloadHost.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const isoReloadOwner = isoReloadHost.toolsFor(isoOwner)[0];
+const isoReloadEmployee = isoReloadHost.toolsFor(isoEmployee)[0];
+ok((await isoReloadOwner.execute({ action: 'stats' })).exchanges >= 1, 'owner rows survive reload');
+ok((await isoReloadOwner.execute({ action: 'portrait', facet: 'habits' })).portrait[0].content.includes('自托管'), 'owner portrait survives reload');
+equal((await isoReloadEmployee.execute({ action: 'stats' })).exchanges, 0, 'delegated isolation survives reload');
+equal(isoReloadHost.prompts[0].text({ scope: { id: isoEmployee } }), '', 'reload keeps the delegate injection empty');
+await isoReloadHost.dispose();
+
+// shared mode keeps the legacy profile-wide behavior for existing installs.
+const isoSharedHost = makeHost(isoStorage, isoReloadSpecs);
+apply(isoSharedHost.ctx, { memoryScope: 'shared', autoIndexSessions: false, warmup: false });
+await tick();
+const isoSharedEmployee = isoSharedHost.toolsFor(isoEmployee)[0];
+ok((await isoSharedEmployee.execute({ action: 'search', query: '部署 example.com' })).matches.length >= 1, 'shared mode lets the delegate search owner rows (legacy behavior)');
+ok((await isoSharedEmployee.execute({ action: 'portrait', facet: 'habits' })).portrait[0].content.includes('自托管'), 'shared mode exposes the owner portrait');
+ok((await isoSharedEmployee.execute({ action: 'learn', facet: 'preferences', content: 'shared 写入' })).updated, 'shared mode allows legacy writes');
+await isoSharedHost.dispose();
+
+// Explicit mode: ownerAgentIds wins even when every live agent is a root, so an
+// install without usable session lineage can still declare the owner.
+const explicitHost = makeHost(makeStorage(), {
+  agents: [{ id: 'explicit-owner' }, { id: 'explicit-employee' }],
+  roots: ['explicit-owner', 'explicit-employee'],
+});
+apply(explicitHost.ctx, { memoryScope: 'owner', ownerAgentIds: ['explicit-owner'], autoIndexSessions: false, warmup: false });
+await tick();
+const explicitDelegate = await explicitHost.toolsFor('explicit-employee')[0].execute({ action: 'scope' });
+equal(explicitDelegate.identity.role, 'delegate', 'ownerAgentIds makes the owner explicit');
+equal(explicitDelegate.identity.source, 'config:ownerAgentIds', 'explicit identity source is reported');
+await explicitHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Agent mode + durable portrait identity: each agentId gets its own namespace;
+// an archived (still existing) session keeps its portrait active, while deleting
+// the session marks the portrait dormant (never injected) and /dmem gc is the
+// only remover — dry-run first, confirm=true deletes, owner is never touched.
+// ---------------------------------------------------------------------------
+const dormStorage = makeStorage();
+const dormOwner = 'session-dorm-owner';
+const dormEmployee = 'session-dorm-employee';
+const dormOwnerSession = { session: { id: dormOwner, header: { id: dormOwner, isSeeded: false, cwd: null } }, events: [] };
+const dormEmployeeSession = {
+  session: { id: dormEmployee, header: { id: dormEmployee, isSeeded: false, parentSession: dormOwner, origin: 'subagent', delegationDepth: 1, cwd: null } },
+  events: [],
+};
+const dormSessions = { [dormOwner]: dormOwnerSession, [dormEmployee]: dormEmployeeSession };
+const dormQuery = makeSessionQuery(dormSessions, { listSessions: true });
+const dormSpecs = {
+  agents: [{ id: dormOwner }, { id: dormEmployee }],
+  roots: [dormOwner],
+  sessions: new Map([
+    [dormOwner, dormOwnerSession.session],
+    [dormEmployee, dormEmployeeSession.session],
+  ]),
+  sessionQuery: dormQuery,
+};
+const dormHost = makeHost(dormStorage, dormSpecs);
+apply(dormHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false, capture: true });
+await tick();
+const dormOwnerTool = dormHost.toolsFor(dormOwner)[0];
+const dormEmployeeTool = dormHost.toolsFor(dormEmployee)[0];
+ok(dormOwnerTool && dormEmployeeTool, 'agent mode registers one memory tool per agent');
+await dormOwnerTool.execute({ action: 'learn', facet: 'identity', content: 'owner 身份画像内容' });
+ok((await dormEmployeeTool.execute({ action: 'learn', facet: 'preferences', content: '员工自己的偏好画像' })).updated, 'agent mode lets the delegate write its own namespace');
+ok((await dormEmployeeTool.execute({ action: 'portrait', facet: 'preferences' })).portrait[0].content.includes('员工自己的偏好'), 'delegate reads its own portrait');
+const durableFacetRow = [...dormStorage.tables.get('portrait').values()].find(row => row.content.includes('员工自己的偏好'));
+equal(durableFacetRow.scopeId, `agent:${dormEmployee}`, 'portrait key is the durable agentId namespace, not the caller session');
+equal(durableFacetRow.agentId, dormEmployee, 'portrait stores the stable agentId for audit');
+equal(durableFacetRow.dormant, false, 'fresh portrait is active (not dormant)');
+equal((await dormOwnerTool.execute({ action: 'portrait', facet: 'preferences' })).portrait[0].content, '', 'owner does not see the delegate namespace');
+ok((await dormOwnerTool.execute({ action: 'portrait', facet: 'identity' })).portrait[0].content.includes('owner 身份画像'), 'owner portrait stays in the owner namespace');
+dormHost.emit(dormEmployee, { type: 'user/message', time: Date.now() - 2000, data: message('员工私密任务内容 alpha') });
+dormHost.emit(dormEmployee, { type: 'assistant/message', time: Date.now() - 1000, data: { message: message('员工助手回答 beta') } });
+dormHost.emit(dormEmployee, { type: 'turn/end', time: Date.now(), data: {} });
+await tick();
+ok((await dormEmployeeTool.execute({ action: 'stats' })).exchanges >= 1, 'delegate captures into its own namespace');
+equal((await dormOwnerTool.execute({ action: 'stats' })).exchanges, 0, 'owner does not count delegate rows in agent mode');
+equal((await dormOwnerTool.execute({ action: 'search', query: '员工私密任务' })).matches.length, 0, 'owner cannot search delegate rows');
+ok((await dormEmployeeTool.execute({ action: 'search', query: '员工私密任务' })).matches.length >= 1, 'delegate searches its own rows');
+ok(dormHost.prompts[0].text({ scope: { id: dormEmployee } }).includes('员工自己的偏好'), 'delegate portrait is injected into its own prompt');
+ok(!dormHost.prompts[0].text({ scope: { id: dormOwner } }).includes('员工自己的偏好'), 'owner prompt never contains the delegate portrait');
+// Archive step: archiving exchanges (session still exists) keeps the portrait active.
+const empArchivedRow = (await dormEmployeeTool.execute({ action: 'recent' })).exchanges[0];
+await dormEmployeeTool.execute({ action: 'archive', ids: [empArchivedRow.id] });
+ok((await dormEmployeeTool.execute({ action: 'portrait', facet: 'preferences' })).portrait[0].content.includes('员工自己的偏好'), 'archiving exchanges keeps the delegate portrait active');
+equal((await dormOwnerTool.execute({ action: 'scope' })).dormantFacets, 0, 'archived (still existing) sessions are not dormant');
+// Delete step: the agent/session disappears; the portrait becomes dormant.
+dormHost.dropAgent(dormEmployee);
+delete dormSessions[dormEmployee];
+const dormScopeAfterDelete = await dormOwnerTool.execute({ action: 'scope' });
+equal(dormScopeAfterDelete.dormantFacets, 1, 'deleted agent portrait is marked dormant');
+const dormStatsAfterDelete = await dormOwnerTool.execute({ action: 'stats' });
+equal(dormStatsAfterDelete.dormantFacets.length, 1, 'stats exposes the dormant portrait');
+ok(dormStatsAfterDelete.dormantFacets[0].scopeId.includes(dormEmployee), 'dormant scope names the missing agent');
+equal(dormHost.prompts[0].text({ scope: { id: dormEmployee } }), '', 'deleted agent session gets no injection');
+matches((await dormHost.commands[0].handler({ agent: dormHost.agent, rawInput: 'scope' })).text, /记忆隔离状态/, '/dmem scope reports the isolation status');
+matches((await dormHost.commands[0].handler({ agent: dormHost.agent, rawInput: 'gc' })).text, /预演/, '/dmem gc defaults to dry-run');
+ok(!dormHost.prompts[0].text({ scope: { id: dormOwner } }).includes('员工自己的偏好'), 'dormant portrait is never injected into the owner prompt');
+ok(dormHost.prompts[0].text({ scope: { id: dormOwner } }).includes('owner 身份画像'), 'owner portrait is still injected after the delegate deletion');
+const dryRun = await dormOwnerTool.execute({ action: 'gc' });
+equal(dryRun.dryRun, true, 'gc defaults to dry-run');
+equal(dryRun.dormantFacets, 1, 'gc dry-run reports the dormant facet');
+equal([...dormStorage.tables.get('portrait').values()].filter(row => row.content.includes('员工自己的偏好')).length, 1, 'gc dry-run deletes nothing');
+const confirmedGc = await dormOwnerTool.execute({ action: 'gc', confirm: true });
+equal(confirmedGc.dryRun, false, 'gc confirm=true executes');
+equal(confirmedGc.deletedFacets, 1, 'gc deletes the dormant facet');
+equal([...dormStorage.tables.get('portrait').values()].filter(row => row.content.includes('员工自己的偏好')).length, 0, 'dormant portrait is removed from storage');
+ok((await dormOwnerTool.execute({ action: 'portrait', facet: 'identity' })).portrait[0].content.includes('owner 身份画像'), 'owner portrait is untouched by gc');
+await dormHost.dispose();
+// Reload after deletion + gc: owner memory intact, no dormant leftovers.
+const dormReloadHost = makeHost(dormStorage, {
+  agents: [{ id: dormOwner }],
+  roots: [dormOwner],
+  sessions: new Map([[dormOwner, dormOwnerSession.session]]),
+  sessionQuery: makeSessionQuery({ [dormOwner]: dormOwnerSession }, { listSessions: true }),
+});
+apply(dormReloadHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const dormReloadStats = await dormReloadHost.tools[0].execute({ action: 'stats' });
+equal(dormReloadStats.dormantFacets.length, 0, 'gc state persists after reload');
+ok((await dormReloadHost.tools[0].execute({ action: 'portrait', facet: 'identity' })).portrait[0].content.includes('owner 身份画像'), 'owner portrait survives deletion + gc + reload');
+await dormReloadHost.dispose();
 
 console.log(`host fixture: ${checks} checks passed`);
