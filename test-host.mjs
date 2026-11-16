@@ -4,8 +4,8 @@
 // (in-flight writes are awaited before the domain closes), restart recovery, migrate
 // schema/command discovery and execution, index-only hydration from fake local sessions
 // (metadata cleaning, repeated-prompt disambiguation + explicit failures), the
-// summary-based cross-session digest, and repair that never writes plaintext back
-// (with a live plaintext count).
+// summary-based cross-session digest and its real injected-count stats, and repair
+// that never writes plaintext back (with a live plaintext count).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -515,7 +515,8 @@ matches(tieMatch && tieMatch.hydrationError, /ambiguous time-window match/, 'tim
 // ---------------------------------------------------------------------------
 // Digest (index-only): no row carries plaintext user text anymore, so the
 // injected cross-session digest must be built from summaries. A current-session
-// prompt that overlaps a stored summary must render that summary.
+// prompt that overlaps a stored summary must render that summary, and stats must
+// report the count renderContext actually injected (not a jaccard approximation).
 // ---------------------------------------------------------------------------
 const digestStorage = makeStorage();
 const digestUser = '继续修复部署 example.com 的注入问题并给出验证结果';
@@ -533,12 +534,39 @@ const digestHost = makeHost(digestStorage);
 apply(digestHost.ctx, { autoIndexSessions: false, warmup: false, capture: true });
 await new Promise(resolve => setTimeout(resolve, 5));
 digestHost.emit('session-fixture', { type: 'user/message', data: message(digestUser) });
-const digestStats = await digestHost.tools[0].execute({ action: 'stats' });
-ok(digestStats.injection && digestStats.injection.digestCount >= 1, 'stats counts index-only rows in the digest');
+const beforeInject = await digestHost.tools[0].execute({ action: 'stats' });
+equal(beforeInject.injection.digestCount, 0, 'stats is 0 before any prompt injection was recorded');
+ok(beforeInject.injection.digestReason, 'stats explains why no injection is recorded yet');
 const injected = digestHost.prompts[0].text({ scope: { id: 'session-fixture' } });
 matches(injected, /记忆速览|Memory digest/, 'digest section is injected');
 ok(injected.includes('部署 example.com 的注入问题'), 'injected digest contains the stored summary');
+const digestStats = await digestHost.tools[0].execute({ action: 'stats' });
+ok(digestStats.injection && digestStats.injection.digestCount >= 1, 'stats reports the real injected digest count');
+equal(digestStats.injection.digestReason, null, 'no blocker reason when the digest was injected');
+ok(digestStats.injection.chars > 0, 'stats keeps the injected prompt size');
 await digestHost.dispose();
+
+// Digest count (b): when only the current session has summaries, nothing is
+// injected and stats must report a real 0 with an explicit reason (never a stale
+// or approximated count).
+const noDigestStorage = makeStorage();
+await seedRow(noDigestStorage, indexOnlyRow({
+  id: 'ex-current-only',
+  sessionId: 'session-fixture',
+  time: Date.now() - 60000,
+  user: digestUser,
+  assistant: digestReply,
+}));
+const noDigestHost = makeHost(noDigestStorage);
+apply(noDigestHost.ctx, { autoIndexSessions: false, warmup: false, capture: true });
+await new Promise(resolve => setTimeout(resolve, 5));
+noDigestHost.emit('session-fixture', { type: 'user/message', data: message(digestUser) });
+const noDigestText = noDigestHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(!/记忆速览|Memory digest/.test(noDigestText), 'current-session-only summaries are not injected');
+const noDigestStats = await noDigestHost.tools[0].execute({ action: 'stats' });
+equal(noDigestStats.injection.digestCount, 0, 'digestCount is 0 when only the current session has summaries');
+matches(noDigestStats.injection.digestReason, /no cross-session summaries/, 'digestCount 0 carries an explicit reason');
+await noDigestHost.dispose();
 
 // ---------------------------------------------------------------------------
 // Repair (index-only): rebuilding missing user text must never write plaintext

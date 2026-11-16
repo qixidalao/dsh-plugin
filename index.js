@@ -1032,7 +1032,7 @@ export function sharedCueWords(text, userText, stopwords = new Set()) {
   return count;
 }
 
-export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords, ttl, halfLifeDays, now, locale, messages: injectedMessages, facetList, userLabels, selfFacetList, selfLabels }) {
+export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords, ttl, halfLifeDays, now, locale, messages: injectedMessages, facetList, userLabels, selfFacetList, selfLabels, onInject }) {
   const pack = injectedMessages || packFor(locale || 'zh').injection;
   const facets = Array.isArray(facetList) && facetList.length ? facetList : FACETS;
   const labels = userLabels || packFor('zh').labels.facets;
@@ -1191,11 +1191,31 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   }
   const gapMode = Boolean(gap && gap.gapDays !== null && gap.gapDays >= (gapDays || DEFAULT_GAP_DAYS));
   const lastUserEntities = new Set(entitiesOf(lastUserText || ''));
-  const relevantDigest = gapMode ? [] : digest.filter(row => {
+  const digestCandidates = Array.isArray(digest) ? digest : [];
+  const relevantDigest = gapMode ? [] : digestCandidates.filter(row => {
     const overlap = jaccard([...new Set(tokensOf(lastUserText || ''))], [...new Set(tokensOf(String(row.user || ''), row.summary))]);
     if (overlap >= 0.06) return true;
     return rowEntities(row).some(entity => lastUserEntities.has(entity));
   });
+  // The real injection point: report the number of digest entries that are actually
+  // rendered into this prompt. stats must never re-derive this with a different filter.
+  let digestReason = null;
+  if (!digestCandidates.length) digestReason = 'no cross-session summaries';
+  else if (gapMode) digestReason = 'suppressed by long gap';
+  else if (!String(lastUserText || '').trim()) digestReason = 'no user prompt for this session yet';
+  else if (!relevantDigest.length) digestReason = 'no summary overlaps the current request';
+  if (typeof onInject === 'function') {
+    try {
+      onInject({
+        digestCount: relevantDigest.length,
+        digestTotal: digestCandidates.length,
+        digestReason: relevantDigest.length ? null : digestReason,
+        at: Number.isFinite(now) ? now : Date.now(),
+      });
+    } catch {
+      // A reporting hook must never break prompt assembly.
+    }
+  }
   if (relevantDigest.length) {
     sections.push(
       tr('digestHeader'),
@@ -2277,6 +2297,9 @@ async function start(ctx, config) {
 
   const captures = new Map();
   const lastUserBySession = new Map();
+  // Last prompt-assembly injection result per session: digestCount is recorded by
+  // renderContext (the real injection point), never re-approximated by stats.
+  const injectionSnapshots = new Map();
   const consolidationTimers = new Map();
   const scheduleConsolidation = sessionKey => {
     if (consolidationTimers.has(sessionKey)) return;
@@ -2376,36 +2399,10 @@ async function start(ctx, config) {
     let injection = null;
     if (agent) {
       const sessionKey = String(agent.id);
-      const digest = digestRows(sessionKey);
-      const text = renderContext({
-        portraitRows: portrait,
-        portraitChars,
-        portraitBudget,
-        selfRows: injectAssistantPortrait ? selfPortrait : undefined,
-        selfChars,
-        selfBudget,
-        digest,
-        digestChars,
-        lastUserText: lastUserBySession.get(sessionKey) || '',
-        gap,
-        gapDays,
-        staleFacets: new Set(stale),
-        identity: identityNoticeEnabled ? strongIdentityReport(sessionKey) : undefined,
-        observations: currentObservations(20),
-        locale: sessionLocaleFor(sessionKey),
-        messages: packFor(sessionLocaleFor(sessionKey)).injection,
-        facetList: userFacets,
-        userLabels: labelsFor(sessionLocaleFor(sessionKey)).user,
-        selfFacetList: assistantFacets,
-        selfLabels: labelsFor(sessionLocaleFor(sessionKey)).self,
-        observationChars,
-        observationBudget,
-        stopwords: stopwordsFor(),
-        ttl: ttlConfig,
-        halfLifeDays: inferenceHalfLifeDays,
-        now: Date.now(),
-      });
-      injection = { chars: text.length, digestCount: digest.filter(row => jaccard([...new Set(tokensOf(lastUserBySession.get(sessionKey) || ''))], [...new Set(tokensOf(String(row.user || ''), row.summary))]) >= 0.06).length };
+      const snapshot = injectionSnapshots.get(sessionKey);
+      injection = snapshot
+        ? { ...snapshot }
+        : { chars: 0, digestCount: 0, digestTotal: 0, digestReason: 'no prompt injection recorded for this session yet', at: null };
     }
     return {
       exchanges: rowsById.size,
@@ -2978,6 +2975,7 @@ async function start(ctx, config) {
       return () => {
         commit(key, state);
         captures.delete(key);
+        injectionSnapshots.delete(key);
         stopTool();
         setups.delete(agent);
       };
@@ -3119,7 +3117,8 @@ async function start(ctx, config) {
           if (!sessionId) return '';
           const rows = rowsBySession.get(sessionId) || [];
           const now = Date.now();
-          return renderContext({
+          let digestReport = null;
+          const text = renderContext({
             portraitRows: portrait,
             portraitChars,
             portraitBudget,
@@ -3148,8 +3147,20 @@ async function start(ctx, config) {
             stopwords: stopwordsFor(),
             ttl: ttlConfig,
             halfLifeDays: inferenceHalfLifeDays,
-            now: Date.now(),
+            now,
+            onInject: report => { digestReport = report; },
           });
+          // Snapshot the real injection: what renderContext rendered, not a re-approximation.
+          injectionSnapshots.set(sessionId, {
+            chars: text.length,
+            digestCount: digestReport ? digestReport.digestCount : 0,
+            digestTotal: digestReport ? digestReport.digestTotal : 0,
+            digestReason: digestReport && digestReport.digestCount
+              ? null
+              : (digestReport && digestReport.digestReason) || 'digest report unavailable',
+            at: digestReport && digestReport.at ? digestReport.at : now,
+          });
+          return text;
         },
       })
     : undefined;
