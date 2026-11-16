@@ -677,4 +677,175 @@ equal(migrateStats.plaintextRows, 0, 'migrate leaves plaintextRows at 0');
 ok(existsSync(migrateExportPath), 'migrate wrote the rollback export before stripping');
 await unlink(migrateExportPath).catch(() => {});
 
+// ---------------------------------------------------------------------------
+// Consent (C1-C4): conservative defaults, the tool action and /dmem command share
+// one implementation, memory off stops capture + injection, and the choice survives
+// a restart because it is persisted (never reopened by a later default).
+// ---------------------------------------------------------------------------
+const tick = () => new Promise(resolve => setTimeout(resolve, 10));
+const emitTurn = (host, user, assistant = '好的，收到') => {
+  host.emit('session-fixture', { type: 'user/message', data: message(user) });
+  host.emit('session-fixture', { type: 'assistant/message', data: { message: message(assistant) } });
+  host.emit('session-fixture', { type: 'turn/end', data: {} });
+};
+
+const consentStorage = makeStorage();
+const consentHost = makeHost(consentStorage);
+apply(consentHost.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const defaultConsent = await consentHost.tools[0].execute({ action: 'consent' });
+equal(defaultConsent.consent.memory, 'on', 'C1 defaults on for compatibility');
+equal(defaultConsent.consent.inject, 'on', 'C2 defaults on');
+equal(defaultConsent.consent.profile, 'unified', 'C3 defaults to a unified portrait');
+equal(defaultConsent.consent.sensitive, 'off', 'C4 defaults off (conservative)');
+const defaultStatus = await consentHost.commands[0].handler({ agent: consentHost.agent, rawInput: 'consent status' });
+matches(defaultStatus.text, /C1 跨会话记忆：on/, '/dmem consent status reports C1');
+matches(defaultStatus.text, /C4 敏感观察：off/, '/dmem consent status reports C4');
+
+const consentOff = await consentHost.commands[0].handler({ agent: consentHost.agent, rawInput: 'consent off' });
+matches(consentOff.text, /C1 跨会话记忆：off/, '/dmem consent off switches memory off');
+equal(consentHost.prompts[0].text({ scope: { id: 'session-fixture' } }), '', 'memory off suppresses injection');
+emitTurn(consentHost, '这条在同意关闭后不该被记住');
+await tick();
+const consentOffStats = await consentHost.tools[0].execute({ action: 'stats' });
+equal(consentOffStats.exchanges, 0, 'memory off captures nothing');
+equal(consentOffStats.capture, 'paused', 'memory off reports capture paused');
+equal(consentOffStats.consent.memory, 'off', 'stats exposes the consent state');
+equal(consentOffStats.injection.digestReason, 'memory consent is off', 'stats explains the suppressed injection');
+await consentHost.dispose();
+ok(consentStorage.tables.get('consent').has('state'), 'consent state is written to durable storage');
+
+// Restart with the same storage: the persisted user choice wins over the defaults.
+const consentHost2 = makeHost(consentStorage);
+apply(consentHost2.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const persistedConsent = await consentHost2.tools[0].execute({ action: 'consent' });
+equal(persistedConsent.consent.memory, 'off', 'consent survives a restart');
+equal(consentHost2.prompts[0].text({ scope: { id: 'session-fixture' } }), '', 'injection stays off after restart');
+const consentOn = await consentHost2.commands[0].handler({ agent: consentHost2.agent, rawInput: 'consent on' });
+matches(consentOn.text, /C1 跨会话记忆：on/, '/dmem consent on re-enables memory');
+emitTurn(consentHost2, '重新开启之后这条应该被记住');
+await tick();
+const consentOnStats = await consentHost2.tools[0].execute({ action: 'stats' });
+equal(consentOnStats.exchanges, 1, 'capture resumes after consent on');
+equal(consentOnStats.capture, 'on', 'capture reports on again');
+const invalidToggle = await consentHost2.tools[0].execute({ action: 'consent', consent: { sensitive: 'maybe' } });
+matches(invalidToggle.error, /must be on\/off/, 'invalid consent values are rejected');
+const consentProfileUsage = await consentHost2.commands[0].handler({ agent: consentHost2.agent, rawInput: 'consent profile' });
+matches(consentProfileUsage.text, /consent profile unified\|situational\|off/, 'missing profile mode prints usage');
+await consentHost2.dispose();
+
+// C2 in isolation: injection off keeps capture, but the prompt receives nothing.
+const injectStorage = makeStorage();
+const injectUser = '继续修复部署 example.com 的注入问题并给出验证结果';
+await seedRow(injectStorage, indexOnlyRow({
+  id: 'ex-inject-off',
+  sessionId: 'session-other',
+  time: Date.now() - 60000,
+  user: injectUser,
+  assistant: '注入问题已修复，复验通过',
+}));
+const injectHost = makeHost(injectStorage);
+apply(injectHost.ctx, { autoIndexSessions: false, warmup: false, consent: { inject: false } });
+await tick();
+const injectOffStatus = await injectHost.tools[0].execute({ action: 'consent' });
+equal(injectOffStatus.consent.inject, 'off', 'config.consent.inject override is applied');
+injectHost.emit('session-fixture', { type: 'user/message', data: message(injectUser) });
+equal(injectHost.prompts[0].text({ scope: { id: 'session-fixture' } }), '', 'inject off suppresses the prompt section');
+injectHost.emit('session-fixture', { type: 'assistant/message', data: { message: message('注入关闭但捕获仍写') } });
+injectHost.emit('session-fixture', { type: 'turn/end', data: {} });
+await tick();
+const injectOffStats = await injectHost.tools[0].execute({ action: 'stats' });
+equal(injectOffStats.exchanges, 2, 'inject off still captures the turn');
+equal(injectOffStats.injection.digestReason, 'injection consent is off', 'stats names the injection consent reason');
+const injectOn = await injectHost.commands[0].handler({ agent: injectHost.agent, rawInput: 'consent inject on' });
+matches(injectOn.text, /C2 自动注入：on/, '/dmem consent inject on switches injection on');
+const injectRestored = injectHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(injectRestored.length > 0, 'inject on restores the prompt section');
+matches(injectRestored, /记忆速览|Memory digest/, 'restored injection renders the digest');
+equal((await injectHost.tools[0].execute({ action: 'stats' })).injection.digestCount, 1, 'stats counts the restored digest');
+await injectHost.dispose();
+
+// C3: profile off suppresses portrait injection and refuses portrait writes.
+const profileStorage = makeStorage();
+await profileStorage.domain.table('portrait').put('p_habits', {
+  facet: 'habits',
+  content: '深夜 提交 代码 的 习惯',
+  updatedAt: Date.now(),
+  keywords: ['深夜'],
+  history: [],
+  sourceExchangeIds: [],
+  sourceObservationIds: [],
+  needsRecompute: false,
+});
+const profileHost = makeHost(profileStorage);
+apply(profileHost.ctx, { autoIndexSessions: false, warmup: false, consent: { profile: 'off' } });
+await tick();
+const profileOffStatus = await profileHost.tools[0].execute({ action: 'consent' });
+equal(profileOffStatus.consent.profile, 'off', 'config.consent.profile override is applied');
+const profileOffPrompt = profileHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(!profileOffPrompt.includes('深夜 提交 代码'), 'profile off suppresses portrait injection');
+const profileLearnRefused = await profileHost.tools[0].execute({ action: 'learn', facet: 'preferences', content: '画像关闭时不该写入' });
+matches(profileLearnRefused.error, /profile consent is off/, 'profile off refuses portrait writes');
+const profileOn = await profileHost.tools[0].execute({ action: 'consent', consent: { profile: 'unified' } });
+equal(profileOn.consent.profile, 'unified', 'tool action consent switches the portrait mode');
+const profileLearn = await profileHost.tools[0].execute({ action: 'learn', facet: 'preferences', content: '偏好先给结论' });
+ok(!profileLearn.error, 'profile writes resume after consent on');
+const profileOnPrompt = profileHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(profileOnPrompt.includes('深夜 提交 代码'), 'profile on injects the portrait again');
+const situational = await profileHost.commands[0].handler({ agent: profileHost.agent, rawInput: 'consent profile situational' });
+matches(situational.text, /C3 画像：situational/, 'situational portrait mode is persisted');
+const badProfile = await profileHost.tools[0].execute({ action: 'consent', consent: { profile: 'personality' } });
+matches(badProfile.error, /profile must be one of/, 'unknown portrait modes are rejected');
+await profileHost.dispose();
+
+// C4: sensitive observations are injected only with explicit consent; private never.
+const sensitiveStorage = makeStorage();
+const sensitiveHost = makeHost(sensitiveStorage);
+apply(sensitiveHost.ctx, { autoIndexSessions: false, warmup: false, consent: { sensitive: true } });
+await tick();
+equal((await sensitiveHost.tools[0].execute({ action: 'consent' })).consent.sensitive, 'on', 'config.consent.sensitive override is applied');
+const sensitiveObs = await sensitiveHost.tools[0].execute({
+  action: 'observe',
+  type: 'constraint',
+  content: '用户健康限制；作息限制',
+  sensitivity: 'sensitive',
+  mention: 'if_asked',
+});
+ok(sensitiveObs.id, 'sensitive observation stored');
+sensitiveHost.emit('session-fixture', { type: 'user/message', data: message('请检查健康限制和作息限制并给出建议') });
+const sensitiveVisible = sensitiveHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(sensitiveVisible.includes('健康限制'), 'sensitive observation is injected only after consent');
+const sensitiveOff = await sensitiveHost.commands[0].handler({ agent: sensitiveHost.agent, rawInput: 'consent sensitive off' });
+matches(sensitiveOff.text, /C4 敏感观察：off/, '/dmem consent sensitive off switches C4 off');
+const sensitiveHidden = sensitiveHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(!sensitiveHidden.includes('健康限制'), 'sensitive observation is not injected while C4 is off');
+await sensitiveHost.tools[0].execute({ action: 'consent', consent: { sensitive: true } });
+const privateObs = await sensitiveHost.tools[0].execute({
+  action: 'observe',
+  type: 'constraint',
+  content: '私密观察内容不可注入',
+  sensitivity: 'private',
+});
+ok(privateObs.id, 'private observation stored');
+const privateHidden = sensitiveHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+ok(!privateHidden.includes('私密观察内容不可注入'), 'private observations are never injected even after C4 consent');
+equal((await sensitiveHost.tools[0].execute({ action: 'stats' })).consent.sensitive, 'on', 'stats reflects the C4 switch');
+await sensitiveHost.dispose();
+
+// Config-level master switch: consent.memory=false must behave like /dmem consent off.
+const configOffStorage = makeStorage();
+const configOffHost = makeHost(configOffStorage);
+apply(configOffHost.ctx, { autoIndexSessions: false, warmup: false, consent: { memory: false } });
+await tick();
+equal((await configOffHost.tools[0].execute({ action: 'consent' })).consent.memory, 'off', 'config.consent.memory=false is honored');
+configOffHost.emit('session-fixture', { type: 'user/message', data: message('配置层面关闭记忆') });
+configOffHost.emit('session-fixture', { type: 'assistant/message', data: { message: message('不该写入') } });
+configOffHost.emit('session-fixture', { type: 'turn/end', data: {} });
+await tick();
+const configOffStats = await configOffHost.tools[0].execute({ action: 'stats' });
+equal(configOffStats.exchanges, 0, 'config-off memory captures nothing');
+equal(configOffHost.prompts[0].text({ scope: { id: 'session-fixture' } }), '', 'config-off memory injects nothing');
+await configOffHost.dispose();
+
 console.log(`host fixture: ${checks} checks passed`);

@@ -233,6 +233,29 @@ const SELF_LABELS = {
 const ASSISTANT_TARGET = 'assistant';
 const USER_TARGET = 'user';
 
+// Consent model (CONSENT.md C1-C4). Defaults stay compatible with existing installs
+// (memory/inject on), but profile writes and sensitive injection are explicit choices.
+// "situational" is accepted and persisted now; per-workspace grouping lands with the panel.
+const PROFILE_MODES = ['unified', 'situational', 'off'];
+const CONSENT_DEFAULTS = Object.freeze({ memory: true, inject: true, profile: 'unified', sensitive: false });
+const consentToggle = value => {
+  if (value === true || value === 'on' || value === 'true') return true;
+  if (value === false || value === 'off' || value === 'false') return false;
+  return null;
+};
+/** Merge a partial consent record over a base, ignoring unknown/invalid values. */
+const normalizeConsent = (raw, base = CONSENT_DEFAULTS) => {
+  const next = { ...base };
+  if (!raw || typeof raw !== 'object') return next;
+  for (const key of ['memory', 'inject', 'sensitive']) {
+    if (raw[key] === undefined) continue;
+    const value = consentToggle(raw[key]);
+    if (value !== null) next[key] = value;
+  }
+  if (raw.profile !== undefined && PROFILE_MODES.includes(raw.profile)) next.profile = raw.profile;
+  return next;
+};
+
 const DOMAIN_SPEC = {
   name: 'dynamic_memory',
   version: 1,
@@ -351,6 +374,20 @@ const DOMAIN_SPEC = {
         },
       },
     },
+    // C1-C4 consent state. One row under "state"; a reload must never reopen what the
+    // user turned off, so this table is read before anything else is served.
+    consent: {
+      valueSchema: {
+        parse(value) {
+          if (value === null || typeof value !== 'object') throw new Error('dynamic-memory consent must be an object');
+          const next = normalizeConsent(value, CONSENT_DEFAULTS);
+          return {
+            ...next,
+            updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
+          };
+        },
+      },
+    },
   },
 };
 
@@ -360,9 +397,20 @@ const TOOL = {
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates'] },
+      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates', 'consent'] },
       mode: { type: 'string', enum: ['strip'], description: 'For migrate: only mode=strip is supported; it removes legacy plaintext (user/assistant) while keeping summary, keywords, entities, textHash and pointer.' },
       confirm: { type: 'boolean', description: 'For migrate: must be true. The destructive strip runs only after an export file is written to the export path.' },
+      consent: {
+        type: 'object',
+        description: 'For consent: change C1-C4 switches; omit to read the current status.',
+        properties: {
+          memory: { type: 'boolean', description: 'C1 cross-session memory. Off = no capture and no injection.' },
+          inject: { type: 'boolean', description: 'C2 automatic memory injection into prompts.' },
+          profile: { type: 'string', enum: PROFILE_MODES, description: 'C3 portrait: unified (default), situational (accepted; per-workspace grouping later), off (no portrait injection or writes).' },
+          sensitive: { type: 'boolean', description: 'C4 inject sensitive observations. Private observations are never injected.' },
+        },
+        additionalProperties: false,
+      },
       query: { type: 'string', description: 'Search keywords; several words are scored together.' },
       id: { type: 'string', description: 'Exchange id from a recent or search result.' },
       summary: { type: 'string', description: 'Concise impression: what the user wanted, what was done, the reply, and durable details.' },
@@ -1032,7 +1080,7 @@ export function sharedCueWords(text, userText, stopwords = new Set()) {
   return count;
 }
 
-export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords, ttl, halfLifeDays, now, locale, messages: injectedMessages, facetList, userLabels, selfFacetList, selfLabels, onInject }) {
+export function renderContext({ portraitRows, portraitChars, portraitBudget, selfRows, selfChars, selfBudget, digest, digestChars, lastUserText, legacyRecent, recentLimit, promptChars, gap, gapDays, staleFacets, identity, observations, observationChars, observationBudget, stopwords, ttl, halfLifeDays, now, locale, messages: injectedMessages, facetList, userLabels, selfFacetList, selfLabels, onInject, sensitiveAllowed = true }) {
   const pack = injectedMessages || packFor(locale || 'zh').injection;
   const facets = Array.isArray(facetList) && facetList.length ? facetList : FACETS;
   const labels = userLabels || packFor('zh').labels.facets;
@@ -1063,9 +1111,13 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   const obs = Array.isArray(observations) ? observations.filter(row => row && row.status === 'current') : [];
   const clock = Number.isFinite(now) ? now : Date.now();
   const ttlConfig = ttl || SCOPE_TTL_DAYS;
+  // C4: sensitive observations are injectable only after explicit consent. Private
+  // observations are never injected, regardless of consent.
+  const sensitiveVisible = sensitiveAllowed !== false;
   const active = obs
     .filter(row => !observationExpired(row, clock, ttlConfig))
     .filter(row => row.sensitivity !== 'private')
+    .filter(row => sensitiveVisible || row.sensitivity !== 'sensitive')
     .filter(row => mentionOf(row) !== 'never');
   const expiredHidden = obs.filter(row => observationExpired(row, clock, ttlConfig)).length;
   const privateHidden = obs.filter(row => row.sensitivity === 'private' && !observationExpired(row, clock, ttlConfig)).length;
@@ -1330,6 +1382,10 @@ async function start(ctx, config) {
   const portraitTable = domain ? domain.table('portrait') : undefined;
   const selfTable = domain ? domain.table('self') : undefined;
   const observationsTable = domain ? domain.table('observations') : undefined;
+  const consentTable = domain ? domain.table('consent') : undefined;
+  // C1-C4 consent. Defaults stay compatible with existing installs, config.consent can
+  // override them, and the persisted user choice (loaded below) wins on reload.
+  let consent = normalizeConsent(config.consent, CONSENT_DEFAULTS);
   const rowsById = new Map();
   const rowsBySession = new Map();
   const portrait = new Map();
@@ -1433,6 +1489,65 @@ async function start(ctx, config) {
       if (row && typeof row === 'object' && typeof row.id === 'string') observations.set(row.id, row);
     }
   }
+  if (consentTable) {
+    for (const [, row] of consentTable.entries()) {
+      if (row && typeof row === 'object') consent = normalizeConsent(row, consent);
+    }
+  }
+
+  const persistConsent = async () => {
+    if (!consentTable) return;
+    await trackWrite(consentTable.put('state', { ...consent, updatedAt: Date.now() }))
+      .catch(error => logger.warn(`dynamic-memory: cannot persist consent: ${String(error)}`));
+  };
+  const consentStatus = () => ({
+    memory: consent.memory ? 'on' : 'off',
+    inject: consent.inject ? 'on' : 'off',
+    profile: consent.profile,
+    sensitive: consent.sensitive ? 'on' : 'off',
+    storage: consentTable ? 'durable' : 'memory-only',
+  });
+  const consentUsage = '/dmem consent [status|on|off|profile unified|situational|off|sensitive on|off|inject on|off]';
+  const consentLines = () => {
+    const status = consentStatus();
+    return [
+      '同意状态（CONSENT C1-C4）：',
+      `- C1 跨会话记忆：${status.memory}`,
+      `- C2 自动注入：${status.inject}`,
+      `- C3 画像：${status.profile}`,
+      `- C4 敏感观察：${status.sensitive}`,
+      `修改：${consentUsage}（持久化，重载后保留）`,
+    ].join('\n');
+  };
+  /** Apply a partial consent patch, persist it, and report what changed. */
+  const setConsent = async patch => {
+    if (!patch || typeof patch !== 'object') return { error: 'consent must be an object' };
+    const next = { ...consent };
+    for (const key of ['memory', 'inject', 'sensitive']) {
+      if (patch[key] === undefined) continue;
+      const value = consentToggle(patch[key]);
+      if (value === null) return { error: `consent.${key} must be on/off` };
+      next[key] = value;
+    }
+    if (patch.profile !== undefined) {
+      if (!PROFILE_MODES.includes(patch.profile)) return { error: `consent.profile must be one of ${PROFILE_MODES.join(', ')}` };
+      next.profile = patch.profile;
+    }
+    const changed = next.memory !== consent.memory || next.inject !== consent.inject
+      || next.profile !== consent.profile || next.sensitive !== consent.sensitive;
+    consent = next;
+    if (changed) {
+      await persistConsent();
+      // Turning memory off must not commit a turn that was already buffering.
+      if (!consent.memory) {
+        for (const state of captures.values()) {
+          state.pendingUser = '';
+          state.pendingAssistant = '';
+        }
+      }
+    }
+    return { consent: consentStatus(), changed };
+  };
 
   const persistObservation = async row => {
     if (!observationsTable) return;
@@ -2324,6 +2439,8 @@ async function start(ctx, config) {
     if (!user || !assistant) return;
     state.pendingUser = '';
     state.pendingAssistant = '';
+    // C1: no cross-session memory is written while the consent switch is off.
+    if (!consent.memory) return;
     if (duplicateOf(key, user, assistant)) return;
     const row = {
       id: uuid(),
@@ -2361,7 +2478,8 @@ async function start(ctx, config) {
     const key = String(session.id);
     const state = captures.get(key);
     if (!state) return;
-    if (!captureEnabled) return;
+    // C1: memory consent off means no capture at all, even before /dmem pause|resume.
+    if (!captureEnabled || !consent.memory) return;
     if (typeof event.time === 'number') state.lastTime = event.time;
     if (event.type === 'turn/start') {
       state.pendingAssistant = '';
@@ -2442,7 +2560,9 @@ async function start(ctx, config) {
       injection,
       exportPath,
       command: commandName,
-      capture: captureEnabled ? 'on' : 'paused',
+      // C1 off reports paused even if /dmem resume was issued: consent wins.
+      capture: captureEnabled && consent.memory ? 'on' : 'paused',
+      consent: consentStatus(),
       storage: storageState,
     };
   };
@@ -2564,6 +2684,20 @@ async function start(ctx, config) {
           }
           if (action === 'entities') return topEntities(Math.max(1, Math.min(50, Number(args.limit) || 15)), typeof args.entity === 'string' ? args.entity : undefined);
           if (action === 'stats') return statsSnapshot(agent);
+          if (action === 'consent') {
+            if (args.consent !== undefined && args.consent !== null) {
+              const result = await setConsent(args.consent);
+              if (result.error) return result;
+              return {
+                ...result,
+                note: 'Consent changes are persisted and take effect immediately; C1 off also stops capture and injection.',
+              };
+            }
+            return {
+              consent: consentStatus(),
+              note: `Pass consent={memory?,inject?,profile?,sensitive?} to change. Command: ${consentUsage}`,
+            };
+          }
           if (action === 'identity') {
             const report = identityReport(key);
             return {
@@ -2870,6 +3004,8 @@ async function start(ctx, config) {
             };
           }
           if (action === 'learn') {
+            // C3: profile off disables portrait writes (and the prompt no longer injects them).
+            if (consent.profile === 'off') return { error: 'profile consent is off: portrait writes are disabled. Re-enable with /dmem consent profile unified (or situational).' };
             const target = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
             const valid = facetsOf(target);
             if (!valid.includes(args.facet)) return { error: `facet must be one of ${valid.join(', ')} for target=${target}` };
@@ -2969,7 +3105,7 @@ async function start(ctx, config) {
             await dropExchangeReferences(row.id);
             return { forgotten: row.id, referencesCleared: true };
           }
-          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, entities, export, index, repair, migrate or archive.' };
+          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, consent, entities, export, index, repair, migrate or archive.' };
         },
       });
       return () => {
@@ -3005,6 +3141,7 @@ async function start(ctx, config) {
         `- 画像：${snapshot.portraitFacets} 个 facet，实体：${snapshot.entities} 个`,
         `- 平均重要度：${snapshot.avgImportance}，未写印象：${snapshot.withoutSummary}`,
         `- 捕获：${snapshot.capture}，存储：${snapshot.storage}，工作区：${workspace || '未知'}`,
+        `- 同意：记忆=${snapshot.consent.memory} 注入=${snapshot.consent.inject} 画像=${snapshot.consent.profile} 敏感=${snapshot.consent.sensitive}`,
       ].join('\n');
     }
     if (input === 'pause' || input === 'resume' || input === 'capture') {
@@ -3013,6 +3150,27 @@ async function start(ctx, config) {
       return input === 'capture'
         ? `自动捕获：${captureEnabled ? 'on' : 'paused'}`
         : `自动捕获已${captureEnabled ? '开启' : '暂停'}（/dmem ${captureEnabled ? 'pause' : 'resume'} 可切换）`;
+    }
+    // C1-C4 consent: status|on|off|profile <mode>|sensitive on|off|inject on|off.
+    if (input === 'consent' || input.startsWith('consent ')) {
+      const tokens = input.split(/\s+/).slice(1);
+      const sub = (tokens[0] || 'status').toLowerCase();
+      if (sub === 'status') return consentLines();
+      if (sub === 'on' || sub === 'off') {
+        const result = await setConsent({ memory: sub === 'on' });
+        return result.error ? `同意设置失败：${result.error}` : consentLines();
+      }
+      if (sub === 'profile') {
+        if (!tokens[1]) return `用法：/dmem consent profile ${PROFILE_MODES.join('|')}`;
+        const result = await setConsent({ profile: tokens[1].toLowerCase() });
+        return result.error ? `同意设置失败：${result.error}` : consentLines();
+      }
+      if (sub === 'sensitive' || sub === 'inject') {
+        if (!tokens[1]) return `用法：/dmem consent ${sub} on|off`;
+        const result = await setConsent({ [sub]: tokens[1].toLowerCase() });
+        return result.error ? `同意设置失败：${result.error}` : consentLines();
+      }
+      return `用法：${consentUsage}`;
     }
     if (input === 'portrait' || input === 'self') {
       const assistant = input === 'self';
@@ -3058,10 +3216,12 @@ async function start(ctx, config) {
         result.note,
       ].join('\n');
     }
-    const methods = commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture|migrate]';
-    // Locale packs may not list the operator-only migrate action yet; keep it discoverable.
-    if (methods.includes('migrate')) return methods;
-    return `${methods}\n- migrate: /dmem migrate mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）`;
+    const methods = commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture|consent|migrate]';
+    // Locale packs may not list newer operator commands yet; keep them discoverable.
+    const extra = [];
+    if (!methods.includes('migrate')) extra.push('- migrate: /dmem migrate mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）');
+    if (!methods.includes('consent')) extra.push(`- consent: ${consentUsage}（C1-C4，状态持久化，重载后保留）`);
+    return extra.length ? `${methods}\n${extra.join('\n')}` : methods;
   };
 
   const stopCommand = commands
@@ -3070,7 +3230,7 @@ async function start(ctx, config) {
           return commands.register({
             name: 'dmem',
             description: 'Inspect or export the dynamic memory store',
-            input: { hint: 'stats | portrait | self | export | search <关键词> | migrate (tool action: mode=strip confirm=true)' },
+            input: { hint: 'stats | portrait | self | export | search <关键词> | consent status|on|off|profile <mode>|sensitive <on|off> | migrate (tool action: mode=strip confirm=true)' },
             handler: async invocation => {
               try {
                 return { kind: 'success', text: await commandText(invocation, invocation.rawInput) };
@@ -3115,14 +3275,26 @@ async function start(ctx, config) {
           const scope = assembleContext && assembleContext.scope;
           const sessionId = scope && scope.id !== undefined ? String(scope.id) : undefined;
           if (!sessionId) return '';
-          const rows = rowsBySession.get(sessionId) || [];
           const now = Date.now();
+          // C1/C2: no memory or no injection consent means the prompt gets nothing.
+          if (!consent.memory || !consent.inject) {
+            injectionSnapshots.set(sessionId, {
+              chars: 0,
+              digestCount: 0,
+              digestTotal: 0,
+              digestReason: !consent.memory ? 'memory consent is off' : 'injection consent is off',
+              at: now,
+            });
+            return '';
+          }
+          const rows = rowsBySession.get(sessionId) || [];
           let digestReport = null;
           const text = renderContext({
-            portraitRows: portrait,
+            // C3: profile off removes both user and assistant portrait sections.
+            portraitRows: consent.profile === 'off' ? new Map() : portrait,
             portraitChars,
             portraitBudget,
-            selfRows: injectAssistantPortrait ? selfPortrait : undefined,
+            selfRows: consent.profile === 'off' || !injectAssistantPortrait ? undefined : selfPortrait,
             selfChars,
             selfBudget,
             digest: digestRows(sessionId),
@@ -3149,6 +3321,8 @@ async function start(ctx, config) {
             halfLifeDays: inferenceHalfLifeDays,
             now,
             onInject: report => { digestReport = report; },
+            // C4: sensitive observations require explicit consent.
+            sensitiveAllowed: consent.sensitive,
           });
           // Snapshot the real injection: what renderContext rendered, not a re-approximation.
           injectionSnapshots.set(sessionId, {
@@ -3165,7 +3339,8 @@ async function start(ctx, config) {
       })
     : undefined;
 
-  const autoIndexTimer = config.autoIndexSessions === false
+  // C1: background indexing also writes memory, so it stays off while consent is off.
+  const autoIndexTimer = config.autoIndexSessions === false || !consent.memory
     ? undefined
     : setTimeout(() => {
         void indexUnseen(Math.max(1, Math.min(50, Number(config.indexBudget) || 10))).catch(error => logger.warn(`dynamic-memory: background index failed: ${String(error)}`));
