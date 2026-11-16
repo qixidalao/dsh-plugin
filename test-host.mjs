@@ -2,11 +2,16 @@
 // In-memory mock host fixture: exercises the plugin lifecycle without a real Harness.
 // Covers: durable open, prompt/tool registration, session capture, dispose ordering
 // (in-flight writes are awaited before the domain closes), restart recovery, migrate
-// schema/command discovery, index-only hydration from fake local sessions (metadata
-// cleaning, repeated-prompt disambiguation + explicit failures), the summary-based
-// cross-session digest, and repair that never writes plaintext back.
+// schema/command discovery and execution, index-only hydration from fake local sessions
+// (metadata cleaning, repeated-prompt disambiguation + explicit failures), the
+// summary-based cross-session digest, and repair that never writes plaintext back
+// (with a live plaintext count).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { apply, extractiveSummary } from './index.js';
 
 const message = text => ({ content: [{ type: 'text', text }] });
@@ -536,9 +541,11 @@ ok(injected.includes('部署 example.com 的注入问题'), 'injected digest con
 await digestHost.dispose();
 
 // ---------------------------------------------------------------------------
-// Repair (index-only): rebuilding missing user text must not write plaintext
-// back into the store. Keywords/entities are refreshed from the summary and the
-// session prompt stays in memory only, so plaintextRows remains 0.
+// Repair (index-only): rebuilding missing user text must never write plaintext
+// back. Keywords/entities refresh from summary + in-memory session prompt, a
+// legacy "assistant-only" row gets its plaintext cleared, and plaintextRows is a
+// live count (a legacy row outside repair's scope keeps its plaintext, so repair
+// does not pretend the store is fully stripped).
 // ---------------------------------------------------------------------------
 const repairStorage = makeStorage();
 const repairTime = Date.now() - 300000;
@@ -560,19 +567,86 @@ await seedRow(repairStorage, indexOnlyRow({
   user: repairUser,
   assistant: repairAssistant,
 }));
+const legacyRow = ({ id, time, user = '', assistant = '' }) => ({
+  id,
+  sessionId: 'session-repair',
+  workspace: null,
+  kind: 'episodic',
+  time,
+  updatedAt: time,
+  user,
+  assistant,
+  textHash: '',
+  pointer: null,
+  summary: '',
+  keywords: [],
+  entities: [],
+  importance: 0.35,
+  accessCount: 0,
+  lastAccessAt: null,
+  supersededBy: null,
+  history: [],
+  sourceIds: [],
+});
+// Legacy "assistant-only" row: user text already gone, assistant plaintext survived.
+await seedRow(repairStorage, legacyRow({ id: 'ex-assistant-only', time: repairTime + 1200, assistant: '仅助手旧明文' }));
+// Legacy row that still has a user prompt: outside repair's scope; migrate strips it.
+await seedRow(repairStorage, legacyRow({ id: 'ex-legacy', time: repairTime + 1300, user: '旧明文用户', assistant: '旧明文回答' }));
 const repairHost = makeHost(repairStorage, { sessionQuery: makeSessionQuery({ 'session-repair': repairSession }) });
 apply(repairHost.ctx, { autoIndexSessions: false, warmup: false });
 await new Promise(resolve => setTimeout(resolve, 5));
 const repaired = await repairHost.tools[0].execute({ action: 'repair', limit: 5 });
-ok(repaired.repaired >= 1, 'repair rebuilt index metadata for the index-only row');
-equal(repaired.plaintextRows, 0, 'repair reports no plaintext rows');
+ok(repaired.repaired >= 2, 'repair rebuilt index metadata for both index-only rows');
+equal(repaired.plaintextCleared, 1, 'repair reports the assistant-only plaintext it cleared');
+equal(repaired.plaintextRows, 1, 'repair plaintextRows is a live count, not a hardcoded 0');
+matches(repaired.note, /assistant-only/, 'repair result explains the assistant-only clearing');
 const repairStats = await repairHost.tools[0].execute({ action: 'stats' });
-equal(repairStats.plaintextRows, 0, 'repair leaves plaintextRows at 0');
-equal(repairStats.missingUser, 1, 'row still has no plaintext user text');
+equal(repairStats.plaintextRows, 1, 'stats reports the same live plaintext count');
+equal(repairStats.missingUser, 2, 'both repaired rows still have no plaintext user text');
 const repairedRow = [...repairStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-repair');
 equal(repairedRow.user, '', 'repair does not restore user plaintext');
 equal(repairedRow.assistant, '', 'repair does not restore assistant plaintext');
 ok(repairedRow.keywords.length > 0, 'repair recovered keywords');
 ok(repairedRow.entities.includes('example.com'), 'repair recovered entities');
+const assistantOnlyRow = [...repairStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-assistant-only');
+equal(assistantOnlyRow.user, '', 'assistant-only row stays user-free');
+equal(assistantOnlyRow.assistant, '', 'assistant-only plaintext is cleared (index-only)');
+ok(assistantOnlyRow.keywords.length > 0, 'assistant-only row got index metadata from the session prompt');
+const legacyRowAfter = [...repairStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-legacy');
+equal(legacyRowAfter.user, '旧明文用户', 'legacy row outside repair scope is left untouched');
+equal(legacyRowAfter.assistant, '旧明文回答', 'legacy row plaintext is left for migrate to strip');
+
+// ---------------------------------------------------------------------------
+// /dmem migrate: the command must run the same strip implementation as the tool
+// action, refuse without confirm=true and reject unknown modes. The export goes
+// to a temp file so the fixture never touches the real store export.
+// ---------------------------------------------------------------------------
+const migrateStorage = makeStorage();
+const migrateTime = Date.now() - 600000;
+await seedRow(migrateStorage, legacyRow({ id: 'ex-migrate', time: migrateTime, user: '旧明文用户问题', assistant: '旧明文助手回答' }));
+const migrateExportPath = join(tmpdir(), `dmem-migrate-fixture-${process.pid}-${Date.now()}.md`);
+const migrateHost = makeHost(migrateStorage);
+apply(migrateHost.ctx, { autoIndexSessions: false, warmup: false, exportPath: migrateExportPath });
+await new Promise(resolve => setTimeout(resolve, 5));
+const migrateToolRefusal = await migrateHost.tools[0].execute({ action: 'migrate', mode: 'strip' });
+matches(migrateToolRefusal.error, /confirm=true/, 'tool migrate without confirm is refused');
+const migrateRefusal = await migrateHost.commands[0].handler({ agent: migrateHost.agent, rawInput: 'migrate mode=strip' });
+matches(migrateRefusal.text, /confirm=true/, '/dmem migrate without confirm is refused');
+const migrateBadMode = await migrateHost.commands[0].handler({ agent: migrateHost.agent, rawInput: 'migrate mode=erase confirm=true' });
+matches(migrateBadMode.text, /mode=strip/, '/dmem migrate rejects unknown modes');
+const migrateBefore = [...migrateStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-migrate');
+equal(migrateBefore.user, '旧明文用户问题', 'refused migrate leaves plaintext intact');
+const migrateDone = await migrateHost.commands[0].handler({ agent: migrateHost.agent, rawInput: 'migrate mode=strip confirm=true' });
+matches(migrateDone.text, /已移除明文 1 条/, '/dmem migrate executes the strip');
+const migrateAfter = [...migrateStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-migrate');
+equal(migrateAfter.user, '', 'migrate clears user plaintext');
+equal(migrateAfter.assistant, '', 'migrate clears assistant plaintext');
+ok(migrateAfter.summary.length > 0, 'migrate keeps an extractive summary');
+ok(migrateAfter.textHash, 'migrate keeps the text hash');
+ok(migrateAfter.pointer, 'migrate keeps the pointer');
+const migrateStats = await migrateHost.tools[0].execute({ action: 'stats' });
+equal(migrateStats.plaintextRows, 0, 'migrate leaves plaintextRows at 0');
+ok(existsSync(migrateExportPath), 'migrate wrote the rollback export before stripping');
+await unlink(migrateExportPath).catch(() => {});
 
 console.log(`host fixture: ${checks} checks passed`);

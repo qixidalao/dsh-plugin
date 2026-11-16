@@ -1316,6 +1316,8 @@ async function start(ctx, config) {
   const selfPortrait = new Map();
   const observations = new Map();
   const stats = { merged: 0, pruned: 0, superseded: 0, indexed: 0, knownSessions: null, lastConsolidatedAt: null };
+  /** Live count of rows that still carry legacy plaintext (index-only rows keep both fields empty). */
+  const countPlaintextRows = () => [...rowsById.values()].filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length;
 
   const addRow = row => {
     if (rowsById.has(row.id)) return;
@@ -1760,6 +1762,7 @@ async function start(ctx, config) {
       .slice(0, Math.max(1, Math.min(20, limit)));
     let repaired = 0;
     let skipped = 0;
+    let plaintextCleared = 0;
     let sessions = 0;
     const details = [];
     for (const [sessionId, list] of targets) {
@@ -1815,7 +1818,11 @@ async function start(ctx, config) {
         }
         matchedHere += 1;
         // In-memory only: recover index metadata from the stored summary plus the session
-        // prompt. Plaintext is deliberately not copied onto the row (plaintextRows stays 0).
+        // prompt. Plaintext is deliberately not copied onto the row. A legacy row whose user
+        // text is gone but whose assistant text survived ("assistant-only") is cleared too:
+        // index-only storage must stay plaintext-free, and the text is still hydratable from
+        // the local session via pointer/textHash.
+        if (String(row.assistant || '').trim()) plaintextCleared += 1;
         const recovered = String(row.summary || '').trim();
         const source = recovered ? `${recovered}\n${match.user}` : match.user;
         row.user = '';
@@ -1831,9 +1838,12 @@ async function start(ctx, config) {
     return {
       repaired,
       skipped,
+      plaintextCleared,
       sessions,
-      plaintextRows: 0,
-      note: 'Index-only repair: keywords/entities rebuilt from summary + session prompt; user/assistant plaintext is never written back.',
+      // Live count, not a constant: rows skipped above keep their legacy plaintext, and rows
+      // that still have a user prompt are outside repair's scope (migrate strips those).
+      plaintextRows: countPlaintextRows(),
+      note: 'Index-only repair: keywords/entities are rebuilt from the summary plus the in-memory session prompt; user/assistant plaintext is never written back. Matched assistant-only legacy rows have their plaintext cleared too (the text stays hydratable from the local session). Rows with no recoverable session text are reported as skipped and are left untouched.',
       details: details.slice(0, 8),
     };
   };
@@ -2230,6 +2240,41 @@ async function start(ctx, config) {
     return { path: exportPath, bytes: Buffer.byteLength(lines.join('\n'), 'utf8'), impressions: impressions.length, archived: archivedCount };
   };
 
+  /**
+   * Shared implementation of action=migrate mode=strip. It is called by both the tool action
+   * and the /dmem command so the two paths can never drift apart. The export is written
+   * first; only then are legacy plaintext fields cleared (summary/hash/pointer are kept).
+   */
+  const migrateStrip = async () => {
+    const exported = await exportMarkdown().catch(() => null);
+    let stripped = 0;
+    let bytesFreed = 0;
+    for (const row of rowsById.values()) {
+      if (!String(row.user || '').trim() && !String(row.assistant || '').trim()) continue;
+      const user = cleanUserText(row.user);
+      const assistant = String(row.assistant || '');
+      const before = user.length + assistant.length;
+      if (!row.summary) row.summary = extractiveSummary(user, assistant);
+      row.textHash = row.textHash || hashText(`${user}\n${assistant}`);
+      row.pointer = row.pointer || { sessionId: row.sessionId, time: row.time };
+      row.user = '';
+      row.assistant = '';
+      row.updatedAt = Date.now();
+      invalidateRow(row);
+      await persist(row);
+      stripped += 1;
+      bytesFreed += before;
+    }
+    return {
+      stripped,
+      bytesFreed,
+      plaintextRows: countPlaintextRows(),
+      exportPath: exported?.path || null,
+      exportFailed: exported ? undefined : true,
+      note: 'Plaintext removed; summary/hash/pointer kept, so search hydrates from local sessions on demand. Keep the exported file to roll back.',
+    };
+  };
+
   const captures = new Map();
   const lastUserBySession = new Map();
   const consolidationTimers = new Map();
@@ -2387,7 +2432,7 @@ async function start(ctx, config) {
         conditional: [...observations.values()].filter(row => (row.conditionalContradicts || []).length).length,
         expired: [...observations.values()].filter(row => row.status === 'current' && observationExpired(row, Date.now(), ttlConfig)).length,
       },
-      plaintextRows: [...rowsById.values()].filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length,
+      plaintextRows: countPlaintextRows(),
       portraitFacets: [...portrait.values()].filter(row => row.content.trim()).length,
       assistantFacets: [...selfPortrait.values()].filter(row => row.content.trim()).length,
       entities: buildEntityIndex([...rowsById.values()]).size,
@@ -2795,31 +2840,7 @@ async function start(ctx, config) {
           if (action === 'migrate') {
             if (args.mode !== 'strip') return { error: 'Only mode=strip is supported.' };
             if (args.confirm !== true) return { error: 'migrate strip is destructive: pass confirm=true. An export is written first.' };
-            const exported = await exportMarkdown().catch(() => null);
-            let stripped = 0;
-            let bytesFreed = 0;
-            for (const row of rowsById.values()) {
-              if (!String(row.user || '').trim() && !String(row.assistant || '').trim()) continue;
-              const user = cleanUserText(row.user);
-              const assistant = String(row.assistant || '');
-              const before = user.length + assistant.length;
-              if (!row.summary) row.summary = extractiveSummary(user, assistant);
-              row.textHash = row.textHash || hashText(`${user}\n${assistant}`);
-              row.pointer = row.pointer || { sessionId: row.sessionId, time: row.time };
-              row.user = '';
-              row.assistant = '';
-              row.updatedAt = Date.now();
-              invalidateRow(row);
-              await persist(row);
-              stripped += 1;
-              bytesFreed += before;
-            }
-            return {
-              stripped,
-              bytesFreed,
-              exportPath: exported?.path || null,
-              note: 'Plaintext removed; search hydrates from local sessions. Keep the exported file to roll back.',
-            };
+            return await migrateStrip();
           }
           if (action === 'export') {
             try {
@@ -3021,10 +3042,28 @@ async function start(ctx, config) {
         ...result.matches.map((match, index) => `${index + 1}. ${new Date(match.time).toISOString().slice(0, 10)} 用户：${truncate(match.user || '（仅助手回复）', 80)}\n   印象：${truncate(match.summary || '—', 120)}`),
       ].join('\n');
     }
+    // /dmem migrate mode=strip confirm=true runs the same implementation as the tool
+    // action (migrateStrip). Only key=value flags are parsed; a bare "confirm" never
+    // authorizes the destructive strip, and any mode other than strip is rejected.
+    if (input === 'migrate' || input.startsWith('migrate ')) {
+      const params = {};
+      for (const token of input.split(/\s+/).slice(1)) {
+        const separator = token.indexOf('=');
+        if (separator > 0) params[token.slice(0, separator).toLowerCase()] = token.slice(separator + 1);
+      }
+      if (params.mode !== 'strip') return 'migrate 只支持 mode=strip。用法：/dmem migrate mode=strip confirm=true';
+      if (params.confirm !== 'true') return '拒绝执行：migrate strip 会移除旧明文，必须显式写 confirm=true（执行前会先导出全部印象）。';
+      const result = await migrateStrip();
+      return [
+        `已移除明文 ${result.stripped} 条（${result.bytesFreed} 字符），剩余明文 ${result.plaintextRows} 条。`,
+        result.exportFailed ? '导出失败：请先手动 /dmem export 再重试（本次仍已移除明文，可从本地会话回填）。' : `导出：${result.exportPath}`,
+        result.note,
+      ].join('\n');
+    }
     const methods = commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture|migrate]';
     // Locale packs may not list the operator-only migrate action yet; keep it discoverable.
     if (methods.includes('migrate')) return methods;
-    return `${methods}\n- migrate: mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）`;
+    return `${methods}\n- migrate: /dmem migrate mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）`;
   };
 
   const stopCommand = commands
