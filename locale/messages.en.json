@@ -122,5 +122,25 @@
     "self_reported": "self-report",
     "inferred": "inference",
     "corrected": "correction"
+  },
+  "panel": {
+    "title": "Memory settings",
+    "storage": "Storage",
+    "exchanges": "Indexed",
+    "plaintextRows": "Plaintext rows",
+    "injectedChars": "Last injected",
+    "consentTitle": "Consent (C1–C4)",
+    "consentMemory": "C1 Cross-session memory",
+    "consentInject": "C2 Prompt injection",
+    "consentProfile": "C3 Portrait",
+    "consentSensitive": "C4 Sensitive content",
+    "callout": "Memory stays on this device: index, summary and hash; no plaintext, no telemetry, no cloud sync. Sensitive content is off by default.",
+    "export": "Export",
+    "copyStats": "Copy stats",
+    "exportToast": "Export started",
+    "copiedToast": "Status copied",
+    "helpToast": "Local · no telemetry · sensitive off",
+    "unknownToggle": "Unknown switch",
+    "unknownAction": "Unknown action"
   }
 }

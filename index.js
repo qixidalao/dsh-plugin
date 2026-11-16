@@ -1314,6 +1314,137 @@ export function renderContext({ portraitRows, portraitChars, portraitBudget, sel
   return sections.join('\n');
 }
 
+// ── dsh-go native panel (bridge 0.4.0) ───────────────────────────────────────
+// The dsh-go phone App does not execute the Web client bundle. Its engine provides
+// a `dshGo` Cordis service instead, whose declarative panel reads this plugin's
+// in-memory state and writes only through the existing `/dmem` command. Everything
+// below is pure apart from the registration inside start(): no network, no extra
+// file reads, and no dependency on a live agent.
+const DSH_GO_PANEL_ID = 'memory-settings';
+const dshGoLocaleOf = locale => {
+  const code = String(locale || '').toLowerCase();
+  if (code.startsWith('zh')) return 'zh';
+  return SUPPORTED_LOCALES.includes(code) ? code : 'en';
+};
+/** Localized copy for the dsh-go panel; a missing pack falls back to Chinese. */
+const dshGoPanelText = locale => {
+  const pack = packFor(dshGoLocaleOf(locale));
+  return (pack && pack.panel) || packFor('zh').panel || {};
+};
+/** Next C3 portrait mode in the documented cycle; never a dead end (off is reachable). */
+export function dshGoNextProfile(current) {
+  const index = PROFILE_MODES.indexOf(current);
+  return PROFILE_MODES[(index + 1) % PROFILE_MODES.length];
+}
+/**
+ * Translate one panel toggle into the existing `/dmem consent …` command.
+ * `on` is optional: the App row may omit it, in which case the next state is derived
+ * from the current consent status. `null` means the key is unknown.
+ */
+export function dshGoToggleCommand(key, on, consentView = {}) {
+  if (key === 'profile') {
+    if (typeof on === 'boolean') return on ? 'dmem consent profile unified' : 'dmem consent profile off';
+    const current = PROFILE_MODES.includes(consentView.profile) ? consentView.profile : 'unified';
+    return `dmem consent profile ${dshGoNextProfile(current)}`;
+  }
+  if (key === 'memory' || key === 'inject' || key === 'sensitive') {
+    const currentOn = consentView[key] === true || consentView[key] === 'on';
+    const nextOn = typeof on === 'boolean' ? on : !currentOn;
+    if (key === 'memory') return `dmem consent ${nextOn ? 'on' : 'off'}`;
+    return `dmem consent ${key} ${nextOn ? 'on' : 'off'}`;
+  }
+  return null;
+}
+/** Build the read-only snapshot emitted to the App; `—` when nothing was injected yet. */
+export function buildDshGoSnapshot(source = {}) {
+  const consent = source.consent || {};
+  const injected = source.injectedChars;
+  return {
+    storage: source.storage === 'durable' ? 'durable' : 'memory',
+    exchanges: Number.isFinite(source.exchanges) ? source.exchanges : 0,
+    plaintextRows: Number.isFinite(source.plaintextRows) ? source.plaintextRows : 0,
+    injectedChars: typeof injected === 'number' || (typeof injected === 'string' && injected !== '') ? injected : '—',
+    consent: {
+      memory: consent.memory === true || consent.memory === 'on' ? 'on' : 'off',
+      inject: consent.inject === true || consent.inject === 'on' ? 'on' : 'off',
+      profile: PROFILE_MODES.includes(consent.profile) ? consent.profile : 'unified',
+      sensitive: consent.sensitive === true || consent.sensitive === 'on' ? 'on' : 'off',
+    },
+  };
+}
+/** Compact one-line status used by the panel's Copy action (≤8000 chars). */
+export function dshGoStatsText(snapshot) {
+  const value = snapshot || buildDshGoSnapshot({});
+  return [
+    `storage=${value.storage}`,
+    `exchanges=${value.exchanges}`,
+    `plaintextRows=${value.plaintextRows}`,
+    `injectedChars=${value.injectedChars}`,
+    `consent=memory:${value.consent.memory},inject:${value.consent.inject},profile:${value.consent.profile},sensitive:${value.consent.sensitive}`,
+  ].join(' ');
+}
+/**
+ * The declarative v2 panel view (spec §4). Pure: one locale always yields the same
+ * document, and the App resolves `data.*` bindings against buildDshGoSnapshot().
+ */
+export function dshGoView(locale) {
+  const text = dshGoPanelText(locale);
+  return {
+    v: 2,
+    type: 'stack',
+    accent: 'teal',
+    title: text.title,
+    children: [
+      {
+        type: 'keyValue',
+        items: [
+          [text.storage, { $: 'data.storage' }],
+          [text.exchanges, { $: 'data.exchanges' }],
+          [text.plaintextRows, { $: 'data.plaintextRows' }],
+          [text.injectedChars, { $: 'data.injectedChars' }],
+        ],
+      },
+      { type: 'text', text: text.consentTitle, style: { size: 'title', weight: 'bold' } },
+      {
+        type: 'list',
+        items: [
+          { title: text.consentMemory, subtitle: { $: 'data.consent.memory' }, action: { id: 'toggle', args: { key: 'memory' } } },
+          { title: text.consentInject, subtitle: { $: 'data.consent.inject' }, action: { id: 'toggle', args: { key: 'inject' } } },
+          { title: text.consentProfile, subtitle: { $: 'data.consent.profile' }, action: { id: 'toggle', args: { key: 'profile' } } },
+          { title: text.consentSensitive, subtitle: { $: 'data.consent.sensitive' }, action: { id: 'toggle', args: { key: 'sensitive' } } },
+        ],
+      },
+      { type: 'callout', tone: 'info', text: text.callout },
+      {
+        type: 'actions',
+        items: [
+          { label: text.export, action: 'export' },
+          { label: text.copyStats, action: 'copyStats', style: 'plain' },
+        ],
+      },
+    ],
+  };
+}
+/**
+ * One panel action → one bounded effect. dsh-go effects are declarative: commands
+ * run through the App's slash-command path exactly like a typed `/dmem`, never by
+ * touching plugin storage directly.
+ */
+export function dshGoActionEffect(action, payload = {}, context = {}) {
+  const text = dshGoPanelText(context.locale);
+  if (action === 'toggle') {
+    const value = payload && typeof payload === 'object' ? payload : {};
+    const command = dshGoToggleCommand(value.key, value.on, context.consent || {});
+    return command ? { command, refresh: true } : { toast: text.unknownToggle };
+  }
+  if (action === 'pause') return { command: 'dmem pause', refresh: true };
+  if (action === 'resume') return { command: 'dmem resume', refresh: true };
+  if (action === 'export') return { command: 'dmem export', toast: text.exportToast };
+  if (action === 'copyStats') return { copy: dshGoStatsText(context.snapshot), toast: text.copiedToast };
+  if (action === 'consentHelp') return { toast: text.helpToast };
+  return { toast: text.unknownAction };
+}
+
 export function apply(ctx, config = {}) {
   return ctx.inject(['storageDomain', 'systemPrompt'], scoped => start(scoped, config));
 }
@@ -3405,6 +3536,68 @@ async function start(ctx, config) {
         }
       }, 5000);
   if (warmupTimer && typeof warmupTimer.unref === 'function') warmupTimer.unref();
+
+  // ── dsh-go native panel registration (no-op on Desktop/Web/CLI) ────────────
+  // Only the phone App's engine provides the `dshGo` service; elsewhere this child
+  // fiber never starts, so the Web client's composer panel stays the only surface.
+  // The snapshot is read-only: consent, storage state and last injection only.
+  const dshGoSnapshot = scope => {
+    const sessionKey = scope && scope.sessionId !== undefined && scope.sessionId !== null
+      ? String(scope.sessionId)
+      : null;
+    let injection = sessionKey ? injectionSnapshots.get(sessionKey) : undefined;
+    if (!injection) {
+      // No session-scoped snapshot (e.g. a `features` surface): show the latest one.
+      for (const snapshot of injectionSnapshots.values()) {
+        if (!snapshot || typeof snapshot.at !== 'number') continue;
+        if (!injection || snapshot.at > injection.at) injection = snapshot;
+      }
+    }
+    return buildDshGoSnapshot({
+      storage: storageState,
+      exchanges: rowsById.size,
+      plaintextRows: countPlaintextRows(),
+      injectedChars: injection && typeof injection.chars === 'number' ? injection.chars : undefined,
+      consent: consentStatus(),
+    });
+  };
+  let dshGoLocale = configuredLocale || 'zh';
+  ctx.inject(['dshGo'], goCtx => {
+    const dshGo = goCtx.dshGo;
+    if (!dshGo || typeof dshGo.panel !== 'function') {
+      logger.warn('dynamic-memory: dshGo service exposes no panel() method; panel not registered');
+      return;
+    }
+    const actionContext = scope => ({
+      consent: consentStatus(),
+      snapshot: dshGoSnapshot(scope),
+      locale: dshGoLocale,
+    });
+    goCtx.effect(() => {
+      const dispose = dshGo.panel(DSH_GO_PANEL_ID, {
+        // Re-registering the same id is idempotent for the bridge; the view is rebuilt
+        // per render so a locale switch inside the App follows caps.locale immediately.
+        view: (scope, caps) => {
+          dshGoLocale = dshGoLocaleOf(caps && caps.locale);
+          return dshGoView(dshGoLocale);
+        },
+        data: (scope, emit) => {
+          emit(dshGoSnapshot(scope));
+          return () => {};
+        },
+        actions: {
+          toggle: (scope, event) => dshGoActionEffect('toggle', event && event.value, actionContext(scope)),
+          pause: scope => dshGoActionEffect('pause', {}, actionContext(scope)),
+          resume: scope => dshGoActionEffect('resume', {}, actionContext(scope)),
+          export: scope => dshGoActionEffect('export', {}, actionContext(scope)),
+          copyStats: scope => dshGoActionEffect('copyStats', {}, actionContext(scope)),
+          consentHelp: scope => dshGoActionEffect('consentHelp', {}, actionContext(scope)),
+        },
+      });
+      return typeof dispose === 'function' ? dispose : () => {};
+    }, 'dynamic-memory: dsh-go memory-settings panel');
+    logger.info('dynamic-memory: dsh-go panel "memory-settings" registered');
+  });
 
   return ctx.effect(() => async () => {
     if (autoIndexTimer) clearTimeout(autoIndexTimer);

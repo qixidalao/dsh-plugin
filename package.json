@@ -1,8 +1,9 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "private": true,
   "type": "module",
+  "main": "index.js",
   "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, portrait versions with own sources, layered injection with disclosure policy, consolidation drafts, calibrated retrieval confidence and recycle bin",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -56,6 +57,33 @@
         "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "dshGo": {
+    "v": 1,
+    "title": {
+      "zh": "记忆",
+      "en": "Memory"
+    },
+    "icon": "settings",
+    "wants": [],
+    "contributes": {
+      "panels": [
+        {
+          "id": "memory-settings",
+          "title": {
+            "zh": "记忆设置",
+            "en": "Memory settings"
+          },
+          "icon": "settings",
+          "placement": [
+            "session.tab",
+            "features",
+            "chat.panel"
+          ],
+          "presentation": "page"
+        }
       ]
     }
   }

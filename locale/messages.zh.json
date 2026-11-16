@@ -122,5 +122,25 @@
     "self_reported": "自述",
     "inferred": "推断",
     "corrected": "纠正"
+  },
+  "panel": {
+    "title": "记忆设置",
+    "storage": "存储",
+    "exchanges": "索引",
+    "plaintextRows": "明文行",
+    "injectedChars": "上次注入",
+    "consentTitle": "同意开关（C1–C4）",
+    "consentMemory": "C1 跨会话记忆",
+    "consentInject": "C2 每轮注入",
+    "consentProfile": "C3 画像",
+    "consentSensitive": "C4 敏感内容",
+    "callout": "记忆只存本机：索引、摘要与哈希，不存原文；无遥测、无云同步。敏感内容默认关。",
+    "export": "导出",
+    "copyStats": "复制状态",
+    "exportToast": "已开始导出",
+    "copiedToast": "已复制状态",
+    "helpToast": "只存本机·无遥测·敏感默认关",
+    "unknownToggle": "未知开关",
+    "unknownAction": "未知操作"
   }
 }
