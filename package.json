@@ -1,6 +1,6 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "2.1.2",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "Durable long-term memory for DeepSeek Harness: evidence-layer observations, portrait versions with own sources, layered injection with disclosure policy, consolidation drafts, calibrated retrieval confidence and recycle bin",
