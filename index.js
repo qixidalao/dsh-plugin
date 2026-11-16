@@ -1520,6 +1520,9 @@ async function start(ctx, config) {
   const freshDays = Math.max(1, Math.min(36500, Number(config.freshDays) || DEFAULT_FRESH_DAYS));
   const autoArchive = config.autoArchive !== false;
   const archivedWeight = Math.max(0, Math.min(1, Number(config.archivedWeight) || DEFAULT_ARCHIVED_WEIGHT));
+  // Safety: dormant detection and GC deletion need a complete session inventory. When
+  // listSessions is missing/failed, live agents alone must never be treated as "deleted".
+  const gcRequireInventory = config.gcRequireInventory !== false;
   const exportPath = typeof config.exportPath === 'string' && config.exportPath.trim()
     ? config.exportPath
     : join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'storages', 'dynamic_memory', 'memory.md');
@@ -1607,8 +1610,10 @@ async function start(ctx, config) {
   //  3. ctx.agents.roots() vs list(): top-level agents (user sessions) are roots, while
   //     subagents/teammates are created through an owning agent context, so only roots
   //     are owner-level; anything live but non-root is delegated.
-  // Unknown identity fails closed (no read, no write) unless ownerAgentIds makes the
-  // owner explicit, so an unverifiable agent can never inherit the user's memory.
+  // A session header alone (no delegation markers) never proves ownership: older Harness
+  // builds may omit those fields, so such identities fail closed instead of inheriting
+  // the user's memory. Unknown identity fails closed (no read, no write) unless
+  // ownerAgentIds makes the owner explicit.
   const MEMORY_SCOPES = ['owner', 'agent', 'shared'];
   const memoryScope = MEMORY_SCOPES.includes(config.memoryScope) ? config.memoryScope : 'owner';
   const explicitOwnerIds = new Set((Array.isArray(config.ownerAgentIds) ? config.ownerAgentIds
@@ -1661,10 +1666,10 @@ async function start(ctx, config) {
         // fall through to the unknown state below
       }
     }
-    if (!role && header) {
-      role = 'owner';
-      source = 'session-header';
-    }
+    // No "has a header -> owner" fallback: a header without delegation markers cannot
+    // prove owner-level identity (an old Harness may omit parentSession/origin/
+    // delegationDepth), so it stays unknown and fails closed. Registry roots() or an
+    // explicit ownerAgentIds entry is what proves ownership.
     if (!role) {
       role = 'unknown';
       source = 'none';
@@ -1755,6 +1760,10 @@ async function start(ctx, config) {
   // When that agent no longer exists (its session was deleted), the portrait becomes
   // dormant instead of dangling: it is never injected and /dmem gc is the only remover.
   let knownSessionIds = new Set();
+  // Complete-inventory state. `verified` is true only after a successful listSessions()
+  // read; live agents alone are NOT an inventory, because an offline teammate session can
+  // still exist and its portrait must survive.
+  let sessionInventory = { verified: false, source: 'unknown', known: 0 };
   const refreshKnownSessions = async () => {
     const next = new Set();
     try {
@@ -1766,31 +1775,41 @@ async function start(ctx, config) {
     }
     if (!sessionQuery || typeof sessionQuery.listSessions !== 'function') {
       knownSessionIds = next;
-      return { source: 'live-only', known: next.size };
+      sessionInventory = { verified: false, source: 'listSessions-unavailable', known: next.size };
+      return sessionInventory;
     }
     try {
       const records = await sessionQuery.listSessions();
+      if (!Array.isArray(records)) throw new Error('listSessions did not return an array');
       for (const record of records) {
         const id = String(record && record.header ? record.header.id : record);
         if (id) next.add(id);
       }
       knownSessionIds = next;
-      return { source: 'session-list', known: next.size };
+      sessionInventory = { verified: true, source: 'session-list', known: next.size };
+      return sessionInventory;
     } catch {
       knownSessionIds = next;
-      return { source: 'session-list-unavailable', known: next.size };
+      sessionInventory = { verified: false, source: 'listSessions-failed', known: next.size };
+      return sessionInventory;
     }
   };
-  const scopeIsAlive = scopeId => {
+  const scopeHasLiveEvidence = scopeId => {
     if (!scopeId || scopeId === OWNER_SCOPE) return true;
     const id = scopeId.startsWith('agent:') ? scopeId.slice(6) : scopeId;
     if (sessionOf(id)) return true;
     try {
       if (agentsService && typeof agentsService.get === 'function' && agentsService.get(id)) return true;
     } catch {
-      // ignore registry errors: fall through to the session list
+      // ignore registry errors: fall through to the inventory
     }
     return knownSessionIds.has(id);
+  };
+  const scopeIsAlive = scopeId => {
+    if (scopeHasLiveEvidence(scopeId)) return true;
+    // A missing entry proves deletion only with a complete inventory. Without one
+    // (default gcRequireInventory=true) the scope is unknown, never dead.
+    return !sessionInventory.verified && gcRequireInventory;
   };
   const scopesWithFacets = () => {
     const scopes = new Map();
@@ -1803,12 +1822,43 @@ async function start(ctx, config) {
     }
     return [...scopes.values()];
   };
-  /** Mark (never unmark) portraits whose agent no longer exists; persists only on change. */
+  /** Portraits already flagged dormant by a verified inventory run (persisted state). */
+  const persistedDormantScopes = () => {
+    const scopes = new Map();
+    for (const { map, prefix, scopeId } of allFacetMaps()) {
+      if (scopeId === OWNER_SCOPE) continue;
+      for (const row of map.values()) {
+        if (row.dormant !== true) continue;
+        const entry = scopes.get(scopeId) || { scopeId, user: 0, self: 0 };
+        if (prefix === 'p_') entry.user += 1;
+        else entry.self += 1;
+        scopes.set(scopeId, entry);
+      }
+    }
+    return [...scopes.values()];
+  };
+  /**
+   * Mark (never unmark) portraits whose agent no longer exists. Without a verified session
+   * inventory nothing is marked: offline-but-existing agents must not become dormant.
+   */
   const refreshDormancy = async () => {
     await refreshKnownSessions();
+    const inventory = { ...sessionInventory };
+    const scopes = scopesWithFacets();
+    if (!inventory.verified && gcRequireInventory) {
+      return {
+        marked: 0,
+        aliveScopes: scopes.filter(entry => scopeIsAlive(entry.scopeId)).length,
+        dormantScopes: [],
+        // Scopes with no live evidence at all: reported as unknown, never marked/deleted.
+        unknownScopes: scopes.filter(entry => !scopeHasLiveEvidence(entry.scopeId)),
+        inventory,
+        reason: 'unverified-inventory',
+      };
+    }
     let marked = 0;
     let alive = 0;
-    for (const { scopeId } of scopesWithFacets()) {
+    for (const { scopeId } of scopes) {
       const dormant = !scopeIsAlive(scopeId);
       if (!dormant) {
         alive += 1;
@@ -1825,28 +1875,37 @@ async function start(ctx, config) {
       }
     }
     const dormantScopes = scopesWithFacets().filter(entry => !scopeIsAlive(entry.scopeId));
-    return { marked, aliveScopes: alive, dormantScopes };
+    return { marked, aliveScopes: alive, dormantScopes, unknownScopes: [], inventory, reason: null };
   };
-  const dormantFacetRows = () => allFacetMaps()
-    .filter(entry => entry.scopeId !== OWNER_SCOPE && !scopeIsAlive(entry.scopeId))
-    .flatMap(entry => [...entry.map.values()].filter(row => row.dormant === true).map(row => ({ row, entry, facet: row.facet })));
   /**
    * /dmem gc: dry-run by default. confirm=true removes only dormant portrait facets whose
-   * agent no longer exists; owner portraits and live agents are never touched.
+   * agent no longer exists. Without a verified session inventory (and gcRequireInventory,
+   * default true) nothing is detected or deleted; unknown scopes are only reported.
    */
   const gcPortraits = async confirm => {
     const state = await refreshDormancy();
-    const orphans = state.dormantScopes;
+    const inventory = state.inventory;
+    const blockedByInventory = gcRequireInventory && !inventory.verified;
+    const orphanScopes = blockedByInventory ? [] : state.dormantScopes;
+    const unknownScopes = blockedByInventory ? state.unknownScopes : (state.unknownScopes || []);
+    const persisted = persistedDormantScopes();
     const report = {
-      dryRun: confirm !== true,
+      dryRun: confirm !== true || blockedByInventory,
       mode: memoryScope,
-      orphanScopes: orphans,
-      dormantFacets: orphans.reduce((sum, entry) => sum + entry.user + entry.self, 0),
-      note: confirm === true
-        ? 'Dormant portraits for missing agents were deleted; owner portraits were never touched.'
-        : 'Dry-run only: nothing deleted. Pass confirm=true (tool) or /dmem gc confirm=true to delete dormant portraits.',
+      inventory,
+      reason: blockedByInventory ? 'unverified-inventory' : null,
+      orphanScopes,
+      unknownScopes,
+      dormantFacets: blockedByInventory
+        ? persisted.reduce((sum, entry) => sum + entry.user + entry.self, 0)
+        : orphanScopes.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+      note: blockedByInventory
+        ? 'gc disabled: no complete session inventory (listSessions missing/failed). Nothing was detected or deleted; unknown scopes are reported only. Set config gcRequireInventory=false only if you accept the risk.'
+        : confirm === true
+          ? 'Dormant portraits for missing agents were deleted; owner portraits were never touched.'
+          : 'Dry-run only: nothing deleted. Pass confirm=true (tool) or /dmem gc confirm=true to delete dormant portraits.',
     };
-    if (confirm !== true) return report;
+    if (blockedByInventory || confirm !== true) return report;
     let deletedFacets = 0;
     for (const entry of allFacetMaps()) {
       if (entry.scopeId === OWNER_SCOPE) continue;
@@ -3061,7 +3120,7 @@ async function start(ctx, config) {
       return row && isStale(row.updatedAt, Date.now(), freshDays);
     });
     const importance = scopedRows.reduce((sum, row) => sum + (Number(row.importance) || DEFAULT_IMPORTANCE), 0) / Math.max(1, scopedRows.length);
-    const dormantViews = scopesWithFacets().filter(entry => !scopeIsAlive(entry.scopeId));
+    const dormantViews = persistedDormantScopes();
     let injection = null;
     if (agent) {
       const sessionKey = String(agent.id);
@@ -3088,6 +3147,12 @@ async function start(ctx, config) {
       lastActivityAt: gap.lastActivityAt ? new Date(gap.lastActivityAt).toISOString() : null,
       staleFacets: stale,
       facetsNeedingRecompute: [...userFacetView.values(), ...selfFacetView.values()].filter(row => row.needsRecompute).length,
+      inventory: {
+        verified: sessionInventory.verified,
+        source: sessionInventory.source,
+        known: sessionInventory.known,
+        gcRequireInventory,
+      },
       observations: {
         current: scopedObservations.filter(row => row.status === 'current').length,
         inferred: scopedObservations.filter(row => row.kind === 'inferred').length,
@@ -3156,11 +3221,15 @@ async function start(ctx, config) {
           const own = (rowsBySession.get(key) || []).filter(row => canSeeRecord(row, policy));
           if (action === 'scope') {
             const dormancy = await refreshDormancy();
+            const persisted = persistedDormantScopes();
             return {
               ...scopeStatus(policy),
-              dormantFacets: dormancy.dormantScopes.reduce((sum, entry) => sum + entry.user + entry.self, 0),
-              dormantScopes: dormancy.dormantScopes,
-              note: `${scopeStatus(policy).note} Identity sources: config.ownerAgentIds > session header (parentSession/origin/delegationDepth) > agents.roots()/list().`,
+              dormantFacets: persisted.reduce((sum, entry) => sum + entry.user + entry.self, 0),
+              dormantScopes: persisted,
+              inventory: { ...dormancy.inventory, gcRequireInventory },
+              dormantReason: dormancy.reason,
+              unknownScopes: dormancy.unknownScopes || [],
+              note: `${scopeStatus(policy).note} Identity sources: config.ownerAgentIds > session header (parentSession/origin/delegationDepth) > agents.roots()/list(). Dormant/GC requires a verified session inventory (gcRequireInventory=${gcRequireInventory}).`,
             };
           }
           if (action === 'gc') {
@@ -3764,13 +3833,17 @@ async function start(ctx, config) {
     if (input === 'scope') {
       const dormancy = await refreshDormancy();
       const status = scopeStatus(policy);
+      const persisted = persistedDormantScopes();
       return [
         '记忆隔离状态：',
         `- 模式：${status.mode}（配置：${status.configured}）`,
         `- 当前身份：${status.identity.role}（来源：${status.identity.source}，会话：${status.identity.sessionId || '未知'}）`,
         `- 命名空间：${status.scopeId || '无'}，读：${status.canRead ? '允许' : '拒绝'}，写：${status.canWrite ? '允许' : '拒绝'}`,
         `- 显式 ownerAgentIds：${status.ownerAgentIds.length ? status.ownerAgentIds.join(', ') : '（未配置）'}`,
-        `- 孤儿(dormant)画像：${dormancy.dormantScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
+        `- 会话清单：${dormancy.inventory.verified ? `完整（${dormancy.inventory.source}，${dormancy.inventory.known} 个）` : `不可用（${dormancy.inventory.source}）`}，gcRequireInventory=${gcRequireInventory}`,
+        `- 孤儿(dormant)画像：${persisted.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') || '无'}`,
+        dormancy.reason === 'unverified-inventory' ? `- 未知作用域（清单不可用，未判 dormant/未删除）：${dormancy.unknownScopes.map(entry => entry.scopeId).join(', ') || '无'}` : '',
+        dormancy.reason === 'unverified-inventory' ? '- 原因：unverified-inventory（缺少完整会话清单，禁止自动 dormant 与 gc 删除）' : '',
         `- ${status.note}`,
         status.reason ? `- 原因：${status.reason}` : '',
       ].filter(Boolean).join('\n');
@@ -3781,6 +3854,8 @@ async function start(ctx, config) {
       const result = await gcPortraits(confirm);
       return [
         result.dryRun ? 'GC 预演（未删除任何画像）：' : 'GC 已执行：',
+        `- 会话清单：${result.inventory.verified ? `完整（${result.inventory.source}，${result.inventory.known} 个）` : `不可用（${result.inventory.source}）`}，gcRequireInventory=${gcRequireInventory}`,
+        result.reason === 'unverified-inventory' ? `- 拒绝删除：reason=unverified-inventory；未知作用域：${result.unknownScopes.map(entry => entry.scopeId).join(', ') || '无'}` : '',
         `- 孤儿 agent 作用域：${result.orphanScopes.length ? result.orphanScopes.map(entry => `${entry.scopeId}(${entry.user + entry.self})`).join(', ') : '无'}`,
         `- dormant facet 数：${result.dormantFacets}`,
         result.dryRun ? '' : `- 已删除 facet：${result.deletedFacets}`,

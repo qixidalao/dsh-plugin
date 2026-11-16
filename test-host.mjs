@@ -7,7 +7,9 @@
 // summary-based cross-session digest and its real injected-count stats, repair that
 // never writes plaintext back (with a live plaintext count), and multi-agent memory
 // isolation (owner/agent/shared scopes, delegated denial, per-agent namespaces,
-// dormant portraits for deleted agents, and explicit /dmem gc dry-run vs confirm).
+// dormant portraits for deleted agents, explicit /dmem gc dry-run vs confirm), and
+// the isolation safety rails: GC/dormancy refused without a verified session
+// inventory, plus fail-closed unknown identity (no header/registry/ownerAgentIds).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -80,10 +82,15 @@ function makeHost(storage, services = {}) {
   });
   const rootIds = new Set(services.roots || agents.map(record => record.id));
   // id -> { id, header }. Delegated sessions carry parentSession/origin/delegationDepth.
-  const sessions = services.sessions instanceof Map ? services.sessions : new Map();
-  if (!services.sessions) {
+  // services.sessions === null removes the sessions service (simulates an old/minimal host).
+  const sessions = services.sessions === undefined || services.sessions === null
+    ? new Map()
+    : services.sessions;
+  const sessionsAvailable = services.sessions !== null;
+  if (services.sessions === undefined) {
     for (const record of agents) sessions.set(record.id, { id: record.id, header: { id: record.id, isSeeded: false, cwd: null } });
   }
+  const registryAvailable = services.registry !== false;
   const liveAgents = () => agents;
   const agent = agents[0];
   const ctx = {
@@ -92,13 +99,14 @@ function makeHost(storage, services = {}) {
       if (name === 'systemPrompt') return { context: options => { prompts.push(options); return () => {}; } };
       if (name === 'storageDomain') return { open: async () => storage.domain };
       if (name === 'agents') {
+        if (!registryAvailable) return { list: () => [], roots: () => [], get: () => undefined };
         return {
           list: () => liveAgents(),
           roots: () => liveAgents().filter(record => rootIds.has(record.id)),
           get: id => liveAgents().find(record => record.id === String(id)),
         };
       }
-      if (name === 'sessions') return { get: id => sessions.get(String(id)) };
+      if (name === 'sessions') return sessionsAvailable ? { get: id => sessions.get(String(id)) } : undefined;
       if (name === 'commands') return { register: options => { commands.push(options); return () => {}; } };
       if (name === 'sessionQuery') return services.sessionQuery;
       return undefined;
@@ -117,6 +125,11 @@ function makeHost(storage, services = {}) {
     agent,
   };
   const emit = (sessionId, event) => handlers.get('session/event')?.({ id: sessionId, header: sessions.get(String(sessionId))?.header }, event);
+  const emitCreated = id => {
+    const record = agentsById.get(String(id));
+    if (!record) throw new Error(`unknown agent ${id}`);
+    return handlers.get('agent/created')?.({ agent: record, source: 'startup' });
+  };
   const toolsFor = id => tools.filter(tool => tool.__agentId === String(id));
   const dispose = async () => {
     for (const cleanup of effects.reverse()) {
@@ -130,7 +143,7 @@ function makeHost(storage, services = {}) {
     const index = agents.findIndex(record => record.id === key);
     if (index >= 0) agents.splice(index, 1);
   };
-  return { ctx, agent, agents, tools, toolsFor, prompts, commands, sessions, emit, dispose, dropAgent };
+  return { ctx, agent, agents, tools, toolsFor, prompts, commands, sessions, emit, emitCreated, dispose, dropAgent };
 }
 
 // Minimal stand-in for the host's sessionQuery service: readSession returns a snapshot,
@@ -1179,5 +1192,142 @@ const dormReloadStats = await dormReloadHost.tools[0].execute({ action: 'stats' 
 equal(dormReloadStats.dormantFacets.length, 0, 'gc state persists after reload');
 ok((await dormReloadHost.tools[0].execute({ action: 'portrait', facet: 'identity' })).portrait[0].content.includes('owner 身份画像'), 'owner portrait survives deletion + gc + reload');
 await dormReloadHost.dispose();
+
+// ---------------------------------------------------------------------------
+// GC safety: without a complete session inventory (listSessions missing/failed)
+// nothing may be marked dormant or deleted — an offline-but-existing agent's
+// portrait must survive, and /dmem gc must report reason=unverified-inventory.
+// ---------------------------------------------------------------------------
+const noInvStorage = makeStorage();
+const noInvOwner = 'session-noinv-owner';
+const noInvEmployee = 'session-noinv-employee';
+const noInvOwnerSession = { id: noInvOwner, header: { id: noInvOwner, isSeeded: false, cwd: null } };
+const noInvEmployeeSession = { id: noInvEmployee, header: { id: noInvEmployee, isSeeded: false, parentSession: noInvOwner, origin: 'subagent', delegationDepth: 1, cwd: null } };
+const noInvHost = makeHost(noInvStorage, {
+  agents: [{ id: noInvOwner }, { id: noInvEmployee }],
+  roots: [noInvOwner],
+  sessions: new Map([[noInvOwner, noInvOwnerSession], [noInvEmployee, noInvEmployeeSession]]),
+  // no sessionQuery: listSessions is unavailable, so the inventory cannot be verified
+});
+apply(noInvHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const noInvOwnerTool = noInvHost.toolsFor(noInvOwner)[0];
+const noInvEmployeeTool = noInvHost.toolsFor(noInvEmployee)[0];
+await noInvEmployeeTool.execute({ action: 'learn', facet: 'preferences', content: '离线员工也必须保住画像' });
+const noInvScopeBefore = await noInvOwnerTool.execute({ action: 'scope' });
+equal(noInvScopeBefore.inventory.verified, false, 'missing listSessions leaves the inventory unverified');
+equal(noInvScopeBefore.dormantFacets, 0, 'nothing is marked dormant without a verified inventory');
+noInvHost.dropAgent(noInvEmployee);
+noInvHost.sessions.delete(noInvEmployee);
+const noInvScope = await noInvOwnerTool.execute({ action: 'scope' });
+equal(noInvScope.dormantFacets, 0, 'offline agent is not marked dormant without an inventory');
+equal(noInvScope.dormantReason, 'unverified-inventory', 'scope reports the unverified inventory reason');
+ok(noInvScope.unknownScopes.some(entry => entry.scopeId.includes(noInvEmployee)), 'unknown scope is reported, never deleted');
+const noInvGc = await noInvOwnerTool.execute({ action: 'gc', confirm: true });
+equal(noInvGc.dryRun, true, 'gc refuses deletion without a verified inventory even with confirm=true');
+equal(noInvGc.reason, 'unverified-inventory', 'gc names the unverified-inventory reason');
+equal([...noInvStorage.tables.get('portrait').values()].filter(row => row.content.includes('离线员工')).length, 1, 'gc deletes nothing without an inventory');
+matches((await noInvHost.commands[0].handler({ agent: noInvHost.agent, rawInput: 'gc confirm=true' })).text, /unverified-inventory/, '/dmem gc reports unverified-inventory');
+await noInvHost.dispose();
+// A listSessions that throws is also an unverified inventory: no dormant, no deletion.
+const failedInvHost = makeHost(noInvStorage, {
+  agents: [{ id: noInvOwner }],
+  roots: [noInvOwner],
+  sessions: new Map([[noInvOwner, noInvOwnerSession]]),
+  sessionQuery: {
+    async readSession() { throw new Error('session read unavailable'); },
+    async listSessions() { throw new Error('inventory read failed'); },
+  },
+});
+apply(failedInvHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const failedInvTool = failedInvHost.tools[0];
+const failedInvScope = await failedInvTool.execute({ action: 'scope' });
+equal(failedInvScope.inventory.verified, false, 'failed listSessions leaves the inventory unverified');
+matches(failedInvScope.inventory.source, /failed/, 'inventory source reports the failed read');
+equal(failedInvScope.dormantFacets, 0, 'a failed inventory read marks nothing dormant');
+equal((await failedInvTool.execute({ action: 'gc', confirm: true })).reason, 'unverified-inventory', 'failed inventory blocks gc deletion');
+equal([...noInvStorage.tables.get('portrait').values()].filter(row => row.content.includes('离线员工')).length, 1, 'failed inventory deletes nothing');
+await failedInvHost.dispose();
+// Recovery: once a complete inventory exists, the orphan is detected and GC works.
+const noInvRecoverHost = makeHost(noInvStorage, {
+  agents: [{ id: noInvOwner }],
+  roots: [noInvOwner],
+  sessions: new Map([[noInvOwner, noInvOwnerSession]]),
+  sessionQuery: makeSessionQuery({ [noInvOwner]: { session: noInvOwnerSession, events: [] } }, { listSessions: true }),
+});
+apply(noInvRecoverHost.ctx, { memoryScope: 'agent', autoIndexSessions: false, warmup: false });
+await tick();
+const noInvRecoverTool = noInvRecoverHost.tools[0];
+equal((await noInvRecoverTool.execute({ action: 'scope' })).dormantFacets, 1, 'verified inventory detects the orphan portrait');
+equal((await noInvRecoverTool.execute({ action: 'gc', confirm: true })).deletedFacets, 1, 'verified inventory allows gc deletion');
+await noInvRecoverHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Unknown identity fails closed: no usable session header, no agent registry and
+// no ownerAgentIds must never fall back to owner memory (not even when owner data
+// exists in the same store).
+// ---------------------------------------------------------------------------
+const ghostStorage = makeStorage();
+await ghostStorage.domain.table('portrait').put('p_habits', {
+  facet: 'habits',
+  content: 'owner 私密画像不可泄露',
+  updatedAt: Date.now(),
+  keywords: [],
+  history: [],
+  sourceExchangeIds: [],
+  sourceObservationIds: [],
+  needsRecompute: false,
+});
+const ghostId = 'session-ghost';
+const ghostHost = makeHost(ghostStorage, { agents: [{ id: ghostId }], sessions: null, registry: false });
+apply(ghostHost.ctx, { memoryScope: 'owner', autoIndexSessions: false, warmup: false, capture: true });
+await tick();
+ghostHost.emitCreated(ghostId);
+await tick();
+const ghostTool = ghostHost.toolsFor(ghostId)[0];
+ok(ghostTool, 'agent is registered without registry and session header');
+const ghostScope = await ghostTool.execute({ action: 'scope' });
+equal(ghostScope.identity.role, 'unknown', 'unverifiable identity is unknown, not owner');
+equal(ghostScope.identity.source, 'none', 'no identity source is invented');
+equal(ghostScope.canRead, false, 'unverifiable identity cannot read');
+equal(ghostScope.canWrite, false, 'unverifiable identity cannot write');
+matches(ghostScope.reason, /unverifiable|ownerAgentIds/, 'fail-closed reason is explicit');
+const ghostStats = await ghostTool.execute({ action: 'stats' });
+equal(ghostStats.exchanges, 0, 'unknown identity sees zero exchanges');
+equal(ghostStats.portraitFacets, 0, 'unknown identity sees no owner portrait');
+const ghostSearch = await ghostTool.execute({ action: 'search', query: '私密画像' });
+equal(ghostSearch.matches.length, 0, 'unknown identity search returns nothing');
+equal(ghostSearch.isolated, true, 'unknown identity search is explicitly isolated');
+equal((await ghostTool.execute({ action: 'portrait', facet: 'habits' })).portrait.length, 0, 'unknown identity portrait read is denied');
+matches((await ghostTool.execute({ action: 'learn', facet: 'habits', content: '幽灵写入' })).error, /isolation/, 'unknown identity learn is refused');
+equal(ghostHost.prompts[0].text({ scope: { id: ghostId } }), '', 'unknown identity gets no injection');
+ok(!JSON.stringify(ghostStats).includes('私密画像'), 'unknown identity never reports owner memory');
+await ghostHost.dispose();
+
+// Old Harness: a header without parentSession/origin/delegationDepth does not prove
+// ownership. With no registry it fails closed; a registry roots() entry still does.
+const oldBareHeaderHost = makeHost(makeStorage(), {
+  agents: [{ id: 'old-agent' }],
+  sessions: new Map([['old-agent', { id: 'old-agent', header: { id: 'old-agent' } }]]),
+  registry: false,
+});
+apply(oldBareHeaderHost.ctx, { memoryScope: 'owner', autoIndexSessions: false, warmup: false });
+await tick();
+oldBareHeaderHost.emitCreated('old-agent');
+await tick();
+const oldBareScope = await oldBareHeaderHost.toolsFor('old-agent')[0].execute({ action: 'scope' });
+equal(oldBareScope.identity.role, 'unknown', 'bare header without delegation fields + no registry fails closed');
+equal(oldBareScope.canRead, false, 'old-Harness bare header cannot read owner memory');
+await oldBareHeaderHost.dispose();
+const oldRootHost = makeHost(makeStorage(), {
+  agents: [{ id: 'old-root' }],
+  roots: ['old-root'],
+  sessions: new Map([['old-root', { id: 'old-root', header: { id: 'old-root' } }]]),
+});
+apply(oldRootHost.ctx, { memoryScope: 'owner', autoIndexSessions: false, warmup: false });
+await tick();
+equal((await oldRootHost.tools[0].execute({ action: 'scope' })).identity.role, 'owner', 'registry roots() still proves owner on an old Harness');
+await oldRootHost.dispose();
 
 console.log(`host fixture: ${checks} checks passed`);
