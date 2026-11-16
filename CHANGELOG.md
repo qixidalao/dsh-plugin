@@ -2,6 +2,13 @@
 
 版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.5.0**（测试版：tag `v2.5.0` 已推送；**npm 未推送**——`private: true`、非 Latest；GitHub Release 页面状态本机未核实，不猜测）。
 
+## 2.5.1 — 隔离 GC 安全加固
+
+- `gcRequireInventory` 默认 true：只有 listSessions() 成功返回数组才算完整清单；缺失/报错/非数组时不标 dormant、gc 即使 confirm=true 也 dry-run（reason=unverified-inventory），零删除；
+- 去掉“有 session header 即 owner”回退：缺 parentSession/origin/delegationDepth 且无 registry/ownerAgentIds 时 role=unknown，读写/注入全拒，绝不静默用 owner；
+- scope/stats 暴露 inventory{verified,source,known,gcRequireInventory}、dormantReason、unknownScopes；
+- 测试 52 单元 + 269 host；真机 inventory verified=true、known=71、gc dry-run 零删除。
+
 ## 2.5.0 — 多智能体记忆隔离与 dormant 画像 GC
 
 **背景**：teammate/subagent 与主会话原先共享同一份记忆库，子 agent 能读到用户画像、也能写入 owner 记忆。2.5.0 引入显式命名空间：owner（用户）默认隔离，子 agent 注入为空、写入被拒。
@@ -12,7 +19,7 @@
 - **归档 vs 删除**：`archive` / `restore` 只动 exchange，**画像保持 active**；只有会话被删除（不在 live agents，也不在 session 列表）才把该 scope 的画像标 `dormant`——只标记、不删除、不再注入，`stats.dormantFacets` 与 `/dmem scope` 可见；owner 画像永不被标 dormant。
 - **`/dmem scope`**：输出模式（含 configured）、当前身份（role + source + sessionId）、命名空间、读/写权限、显式 `ownerAgentIds`、dormant 画像与说明；工具 `action=scope` 等价。
 - **`/dmem gc`**：默认 **dry-run**（只列孤儿 scope 与 dormant facet 数，不删任何东西）；`/dmem gc confirm=true`（工具 `action=gc` + `confirm=true`）**只删 dormant 画像**，不碰 owner、不碰活跃 agent；非 owner 级身份会被拒绝。实测 dry-run 无删除。
-- 测试：`test.mjs` **52**、`test-host.mjs` **236**（新增 owner 模式拒绝/注入为空、重载持久化、shared 兼容、显式 ownerAgentIds、agent 模式命名空间、归档保持 active、删除→dormant→不注入、gc dry-run/confirm、owner 不受影响）。
+- 测试：`test.mjs` **52**、`test-host.mjs` **269**（新增 owner 模式拒绝/注入为空、重载持久化、shared 兼容、显式 ownerAgentIds、agent 模式命名空间、归档保持 active、删除→dormant→不注入、gc dry-run/confirm、owner 不受影响）。
 - 评测（本机复跑，v2.5.0）：hit@3 **9/10**、MRR **0.750**（`--min-coverage 0.6` 时误报 **0/8**，无门控 1/8）；`--fixture` **5/5**。
 - **诚实限制**：① Harness **没有独立持久 agentId**——身份来自 session/agent id 与 header/registry，同一个人换会话无法自动认回；② 删除会话后**只能标 dormant**，没有"人已删除"的持久墓碑，新会话不会自动继承旧画像；③ **未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序（极短窗口内可能误判 dormant）；④ 2.5.0 为测试版，npm 未推送。
 

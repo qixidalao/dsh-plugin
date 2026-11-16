@@ -77,7 +77,7 @@ teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的
 - **归档 ≠ 删除**：`archive` 只归档 exchange，画像仍 active；会话真被删除才把对应画像标 `dormant`（不再注入，`stats.dormantFacets` 与 `/dmem scope` 可见），owner 画像永不受影响。
 - **`/dmem scope`**：看模式、身份来源、命名空间、读写权、dormant 画像；**`/dmem gc`**：默认 dry-run 不删，`/dmem gc confirm=true` 只删 dormant 画像，不碰 owner 与活跃 agent。
 - **实测**：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`、`dormantFacets=0`；gc dry-run 无删除。
-- **诚实限制**：Harness **没有独立持久 agentId**，同一个人换会话无法自动认回；删除会话后**只能 dormant 标记**（没有持久墓碑，新会话不继承旧画像）；**未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序。测试 52 + 236。
+- **诚实限制**：Harness **没有独立持久 agentId**，同一个人换会话无法自动认回；删除会话后**只能 dormant 标记**（没有持久墓碑，新会话不继承旧画像）；**未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序。测试 52 + 269。
 
 ## 面板：Web 与 dsh-go 手机 App
 
@@ -90,7 +90,7 @@ teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的
 - **写路径**：toggle 只发 `/dmem consent …`——memory → `/dmem consent on|off`，inject → `/dmem consent inject on|off`，sensitive → `/dmem consent sensitive on|off`，profile 按 `unified → situational → off` 循环；不直接写 storage，与工具/Web 面板共用同一持久化。**不新增网络请求**，不读剪贴板/输入框（`wants: []`）。
 - **安装/生效**：清单改动自动重读；`index.js` 改动需在 App「引擎」页重启引擎。若桥接只扫 `$DSH_HOME/dsh-go/plugins/`，还需 `dsh plugin --profile web add <包目录>`（发现规则**未确认**）。
 - **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板 = 重装 2.3.0，或移除 `dshGo` 清单（App 入口消失、数据不动）。
-- **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测（当前 52/236）不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
+- **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测（当前 52/269）不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
 
 ## 评测（真实集，本机；v2.5.0 复跑）
 
@@ -98,6 +98,11 @@ teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的
 - `node eval.mjs --min-coverage 0.6`：误报 **0/8**（无门控 1/8）；
 - `node eval.mjs --fixture`：**5/5**（MRR 1.000）；
 - 剩余 1 条真实损失：`部署 公网 首页 200`——摘要截断（90+60 字符）丢掉 `公网`/`首页`，属覆盖缺口（详见评测报告）。
+
+## 隔离 GC 安全（v2.5.1）
+
+- `gcRequireInventory: true`（默认）：没有 listSessions 完整清单时，不把任何画像标 dormant，`/dmem gc` 只报告（`reason=unverified-inventory`），即使 `confirm=true` 也不删除；
+- 旧 Harness 缺委派字段且未配置 `ownerAgentIds` 时，身份为 unknown，读写与注入被拒，不会回退 owner。
 
 ## 已知限制
 

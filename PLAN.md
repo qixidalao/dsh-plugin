@@ -12,7 +12,7 @@
 | 1.3 | 检索 haystack 支持"无原文"：用 summary/keywords/entities 打分 | 新记录可被关键词检索命中 | ✅ 完成 |
 | 1.4 | 检索结果水合：命中后按 pointer 读本地会话，返回片段（默认）或整段（`full=true`），失败标 `sourceAvailable:false` | search 在无原文时仍能返回片段；会话缺失时优雅降级 | ✅ 完成（真机抽检 **19/20 = 95%**；1 条显式 no-match，不伪造） |
 | 1.5 | `recent` 等列表允许"仅摘要"记录 | 不因缺 user/assistant 被过滤 | ✅ 完成 |
-| 1.6 | 测试：host fixture 断言捕获后无明文、summary 存在、search 命中 | test.mjs + test-host.mjs 通过 | ✅ 完成（本机实测 **52 + 236** 项：含水合、consent、migrate/repair、多智能体隔离与 dormant GC；**不含 dsh-go 断言**，dsh-go 仅由 `ui/verify-dshgo.mjs` 静态校验） |
+| 1.6 | 测试：host fixture 断言捕获后无明文、summary 存在、search 命中 | test.mjs + test-host.mjs 通过 | ✅ 完成（本机实测 **52 + 269** 项：含水合、consent、migrate/repair、多智能体隔离与 dormant GC；**不含 dsh-go 断言**，dsh-go 仅由 `ui/verify-dshgo.mjs` 静态校验） |
 | 1.7 | 文档：README/DOCS 说明"系统=原文，插件=索引" | 文档与行为一致 | ✅ 完成 |
 
 ### 已知限制与未完成项（截至 v2.5.0）

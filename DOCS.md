@@ -333,6 +333,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `assistantFacets` | 4 个默认 facet | 助手画像 facet 列表 |
 | `autoSummary` | true | 捕获时生成抽取式摘要（无 LLM），用于跨会话速览 |
 | `identityNotice` | false | 是否注入身份连续性提示；开启后需强证据（基线≥20、<0.3、间隔≥3天） |
+| `gcRequireInventory` | true | 判 dormant/GC 前必须拿到 listSessions 完整清单；缺失时 gc 只报告不删除 |
 | `capture` | true | false 时不自动捕获；运行中也可用 `/dmem pause` |
 | `memoryScope` | owner | `owner`（默认，仅 root agent 用 owner 记忆）/ `agent`（每个 agentId 独立命名空间）/ `shared`（旧行为，共用） |
 | `ownerAgentIds` | `[]` | 显式指定 owner 会话 id（数组或逗号串）；用于无法从 header/registry 判定身份的宿主 |
@@ -348,7 +349,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
 | `node test.mjs` | 52 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint。**不含 dsh-go 断言**（`grep dshGo test.mjs` 为 0） | ✅ 52/52 |
-| `node test-host.mjs` | 269 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截、**多智能体隔离**（owner 拒绝/注入为空、shared 兼容、显式 ownerAgentIds、agent 命名空间）、**dormant GC**）。**同样不含 dsh-go 断言** | ✅ 236/236 |
+| `node test-host.mjs` | 269 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截、**多智能体隔离**（owner 拒绝/注入为空、shared 兼容、显式 ownerAgentIds、agent 命名空间）、**dormant GC**）。**同样不含 dsh-go 断言** | ✅ 269/269 |
 | `node ui/verify-client.mjs` | Web 面板静态契约（槽位、命令白名单、文案、效果上限） | ✅ 10/10 |
 | `node ui/verify-dshgo.mjs` | **dsh-go 的唯一校验来源**：静态检查 manifest/长度/id/placement/view 节点与深度/32KiB/效果上限/toggle→命令映射/locale 对齐，**解析视图树断言每个注册 action 可达**（删按钮会 FAIL），并 import 面板纯函数做断言 | ✅ 46 PASS + 1 INFO（无 kit/App，非端到端） |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ✅ 本机 9/10、MRR 0.750、FP 1/8 |
@@ -637,7 +638,7 @@ dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**，所以 v2.3.
 ### 15.6 验证边界（必须写明）
 
 - 本机**无 dsh-go 真机、无 kit `check.mjs`**：**未在 App 实测**渲染、点击、重载保持。
-- 只有静态校验：`node ui/verify-dshgo.mjs` 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**；该脚本会解析视图树并 import 面板纯函数，但 `test.mjs`/`test-host.mjs` 里 `dshGo` 出现次数为 0）；`node ui/verify-client.mjs` 10 PASS；单测 52 + 236（不含 dsh-go 断言）；`node eval.mjs --fixture` 通过。
+- 只有静态校验：`node ui/verify-dshgo.mjs` 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**；该脚本会解析视图树并 import 面板纯函数，但 `test.mjs`/`test-host.mjs` 里 `dshGo` 出现次数为 0）；`node ui/verify-client.mjs` 10 PASS；单测 52 + 269（不含 dsh-go 断言）；`node eval.mjs --fixture` 通过。
 - spec §6 三个接口（同包双身份是否双加载、发现规则、`scope.sessionId` 在 placement 下是否有值）仍需真机确认。
 
 ## 16. 多智能体记忆隔离与 dormant 画像 GC（v2.5.0）
@@ -681,7 +682,7 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 
 - `/dmem scope`：模式/配置、身份（role + source + sessionId）、命名空间、读/写权、`ownerAgentIds`、dormant 列表与说明；工具 `action=scope` 等价。
 - `/dmem gc`：默认 dry-run（只列孤儿 scope 与 dormant facet 数，不删除）；`/dmem gc confirm=true` 只删 dormant 画像；owner 与活跃 agent 永不触碰；非 owner 级身份被拒绝。
-- 实测：`dormantFacets=0`；gc dry-run 无删除；测试 52 + 236。
+- 实测：`dormantFacets=0`；gc dry-run 无删除；测试 52 + 269。
 
 ### 16.7 诚实限制
 
@@ -696,7 +697,7 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 
 | 版本 | 内容 |
 |---|---|
-| 2.5.0 | 多智能体记忆隔离：`memoryScope` owner（默认）/agent/shared；身份解析 `ownerAgentIds` > header > `agents.roots()/list()`，无法识别 fail-closed；记录与画像主键改 `scopeId`（owner / agent:<id>）；归档保留画像、删会话标 dormant（不注入、stats 可见）；`/dmem scope` + `/dmem gc`（dry-run 默认、confirm 只删 dormant、不碰 owner/活跃 agent）。实测 scope=owner、identity agents-roots、canRead/Write=true、dormantFacets=0、gc dry-run 无删除；测试 **52 + 236**。**未真机验证**并发 roots/list 时序；Harness 无持久 agentId（删除只能 dormant） |
+| 2.5.0 | 多智能体记忆隔离：`memoryScope` owner（默认）/agent/shared；身份解析 `ownerAgentIds` > header > `agents.roots()/list()`，无法识别 fail-closed；记录与画像主键改 `scopeId`（owner / agent:<id>）；归档保留画像、删会话标 dormant（不注入、stats 可见）；`/dmem scope` + `/dmem gc`（dry-run 默认、confirm 只删 dormant、不碰 owner/活跃 agent）。实测 scope=owner、identity agents-roots、canRead/Write=true、dormantFacets=0、gc dry-run 无删除；测试 **52 + 269**。**未真机验证**并发 roots/list 时序；Harness 无持久 agentId（删除只能 dormant） |
 | 2.4.0 | dsh-go 原生记忆面板：`package.json` 加 `main: index.js` + `dshGo`（v1、`memory-settings`、`session.tab`/`features`/`chat.panel`、presentation page、title 中英、icon settings、`wants: []`、`minApp` 省略）；`index.js` 用 `ctx.inject(['dshGo'])` 注册只读快照 + 声明式 v2 视图，写路径只发 `/dmem consent|pause|resume|export`，五个按钮齐全（暂停/恢复/导出/复制/同意说明）；新增 `ui/verify-dshgo.mjs`（46 PASS + 1 INFO）作为 dsh-go 的唯一校验（test.mjs/test-host 仍为 52/170，不含 dsh-go 断言）。**未在真机 dsh-go 验证**（无 kit/App），见 §15.6 |
 | 2.3.0 | Web/桌面记忆面板：`client.js` 挂在 `conversation.input.dock`（状态/搜索/画像/暂停恢复/C1–C4/导出，全部走 `/dmem`）；`package.json` 加 `exports["./client"]` 与 `dsh.client`；`ui/verify-client.mjs` 10 PASS；live client inspect 确认槽位占位 |
 | 2.2.1 | consent 加固：`memory=off` 拒绝显式写入（observe/learn/deepen/correct）；consent 行加 `schemaVersion=1` + v0 迁移；文档同步（测试 52+170、eval 9/10 MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5） |

@@ -24,7 +24,7 @@ License: AGPL-3.0-only (see [LICENSE](./LICENSE)). Memory data is never stored i
 
 ```bash
 node test.mjs            # 52 pure-function checks
-node test-host.mjs       # 236 lifecycle checks against an in-memory mock host
+node test-host.mjs       # 269 lifecycle checks against an in-memory mock host
 node eval.mjs --fixture   # synthetic evaluation (no personal data)
 node eval.mjs             # real-store evaluation (reads the local store)
 node ui/verify-client.mjs  # Web panel static contract (10 PASS)
@@ -70,7 +70,7 @@ Teammates/subagents **cannot read or write** owner memory by default; one agent'
 - **Archive ≠ delete**: `archive` only archives exchanges, the portrait stays active; only a deleted session marks its portraits `dormant` (never injected; visible via `stats.dormantFacets` and `/dmem scope`), and owner portraits are never touched.
 - **`/dmem scope`** shows mode, identity source, namespace, read/write rights and dormant portraits; **`/dmem gc`** is dry-run by default, and `/dmem gc confirm=true` deletes only dormant portraits, never owner or live agents.
 - **Verified**: `scope=owner`, `identity source=agents-roots`, `canRead/canWrite=true`, `dormantFacets=0`; gc dry-run deleted nothing.
-- **Honest limits**: Harness has **no independent persistent agentId** (same human in a new session cannot be re-identified); a deleted session can only be marked dormant (**no persistent tombstone**; new sessions do not inherit old portraits); concurrent `agents.roots()` / `listSessions()` timing was **not verified on a real machine**. Tests 52 + 236.
+- **Honest limits**: Harness has **no independent persistent agentId** (same human in a new session cannot be re-identified); a deleted session can only be marked dormant (**no persistent tombstone**; new sessions do not inherit old portraits); concurrent `agents.roots()` / `listSessions()` timing was **not verified on a real machine**. Tests 52 + 269.
 
 ## Panels: Web and dsh-go app
 
@@ -83,7 +83,7 @@ Teammates/subagents **cannot read or write** owner memory by default; one agent'
 - **Write path**: toggles only emit `/dmem consent …` — memory → `/dmem consent on|off`, inject → `/dmem consent inject on|off`, sensitive → `/dmem consent sensitive on|off`, profile cycles `unified → situational → off`; nothing writes storage directly, so the app, tool and Web panel share one persistence path. **No new network requests**; no clipboard/input reads (`wants: []`).
 - **Install/activate**: manifest changes are re-read automatically; `index.js` changes need an engine restart from the app's "Engine" page. If the bridge only scans `$DSH_HOME/dsh-go/plugins/`, an extra `dsh plugin --profile web add <pkg dir>` is required (discovery rule **unconfirmed**).
 - **Uninstall/rollback**: `dsh plugin --profile web remove @local/dynamic-memory`, then delete the package directory; memory data under `$DSH_HOME/storages/dynamic_memory/` is untouched. Panel rollback = reinstall 2.3.0, or drop the `dshGo` manifest (entry disappears, data stays).
-- **Not tested on device**: this machine has **no dsh-go device and no kit `check.mjs`**, so rendering, taps and state-after-reload were **not tested in the app** — the only dsh-go check is `node ui/verify-dshgo.mjs` static 46 PASS + 1 INFO (the sole dsh-go verification, including rendered-action reachability), and tests (currently 52/236) contain **no dsh-go assertions** (`grep dshGo test*.mjs` = 0). The three interfaces (dual identity, discovery rule, `scope.sessionId`) remain unconfirmed.
+- **Not tested on device**: this machine has **no dsh-go device and no kit `check.mjs`**, so rendering, taps and state-after-reload were **not tested in the app** — the only dsh-go check is `node ui/verify-dshgo.mjs` static 46 PASS + 1 INFO (the sole dsh-go verification, including rendered-action reachability), and tests (currently 52/269) contain **no dsh-go assertions** (`grep dshGo test*.mjs` = 0). The three interfaces (dual identity, discovery rule, `scope.sessionId`) remain unconfirmed.
 
 ## Evaluation (real store, local; re-run at v2.5.0)
 
