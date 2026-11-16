@@ -1824,6 +1824,8 @@ async function start(ctx, config) {
    * message of that turn (turn/start discards a pending assistant text). Hydration must
    * reproduce exactly that pairing, because a turn can stream several assistant
    * messages and hashing only the first one can never match the stored textHash.
+   * `assistants` keeps every assistant text of the turn so a summary written from an
+   * earlier message (older captures) can still be verified without guessing.
    * Assumed local format: event.type, event.data (user message), event.data.message
    * (assistant message), event.time (epoch ms).
    */
@@ -1831,18 +1833,21 @@ async function start(ctx, config) {
     const pairs = [];
     let pendingUser = '';
     let pendingAssistant = '';
+    let assistants = [];
     let at = 0;
     const flush = () => {
       if (!pendingUser || !pendingAssistant) return;
-      pairs.push({ user: pendingUser, assistant: pendingAssistant, at });
+      pairs.push({ user: pendingUser, assistant: pendingAssistant, assistants, at });
       pendingUser = '';
       pendingAssistant = '';
+      assistants = [];
     };
     for (const event of events) {
       if (!event || typeof event !== 'object') continue;
       if (typeof event.time === 'number') at = event.time;
       if (event.type === 'turn/start') {
         pendingAssistant = '';
+        assistants = [];
         continue;
       }
       if (event.type === 'user/message') {
@@ -1854,7 +1859,10 @@ async function start(ctx, config) {
       }
       if (event.type === 'assistant/message') {
         const text = messageText(event.data && event.data.message);
-        if (text) pendingAssistant = text;
+        if (text) {
+          pendingAssistant = text;
+          assistants.push(text);
+        }
         continue;
       }
       if (event.type === 'turn/end') flush();
@@ -1907,6 +1915,69 @@ async function start(ctx, config) {
     if (bySummary) return bySummary;
     const bySummaryHead = verify(summaryHead, 'summary-prefix');
     if (bySummaryHead) return bySummaryHead;
+    // Short prompts leave the reply inside the stored summary ("继续 <assistant opening>"),
+    // and an impression written by deepen embeds the request plus the opening of the reply
+    // instead of the exact extractive prefix. Both are verified against the summary text
+    // itself; a candidate whose text is not present is never accepted.
+    const flat = value => String(value || '').replace(/\s+/g, '');
+    const assistantsOf = pair => (Array.isArray(pair.assistants) && pair.assistants.length ? pair.assistants : [pair.assistant])
+      .filter(text => String(text || '').trim());
+    const distinctTextPairs = candidates => {
+      const seen = new Set();
+      const out = [];
+      for (const candidate of candidates) {
+        const key = `${flat(candidate.pair.user)}\n${flat(candidate.assistant)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(candidate);
+      }
+      return out;
+    };
+    const preferNear = candidates => {
+      if (candidates.length === 1) return candidates[0];
+      const near = candidates.filter(candidate => target && candidate.pair.at && Math.abs(candidate.pair.at - target) <= HYDRATION_TIME_WINDOW_MS);
+      return near.length === 1 ? near[0] : null;
+    };
+    // (1) Exact excerpt match: the summary starts with the candidate user (or, for a
+    // one-token prompt like "继续", contains it) and the text after it is an exact prefix
+    // of one of the turn's assistant messages. This recovers rows captured with an
+    // earlier assistant message than the one hydration pairs last.
+    const byTail = distinctTextPairs(pairs.map(pair => {
+      const user = flat(pair.user);
+      if (!user) return null;
+      const starts = [];
+      if (summary.startsWith(user)) starts.push(user.length);
+      if (user.length <= 6 && summary.includes(user)) starts.push(summary.lastIndexOf(user) + user.length);
+      for (const start of starts) {
+        const tail = summary.slice(start);
+        if (tail.length < 8) continue;
+        const hit = assistantsOf(pair).find(text => flat(text).startsWith(tail));
+        if (hit) return { pair, assistant: hit };
+      }
+      return null;
+    }).filter(Boolean));
+    if (byTail.length) {
+      const picked = preferNear(byTail);
+      if (picked) return { user: picked.pair.user, assistant: picked.assistant };
+      throw new Error(`ambiguous summary-tail match (${byTail.length} candidates) in session ${sessionId}`);
+    }
+    // (2) Impression match: the summary mentions both the candidate user and the first
+    // ~15 characters of the candidate assistant. The row time narrows competing turns;
+    // if it cannot, hydration refuses instead of returning the wrong conversation text.
+    const byContains = distinctTextPairs(pairs.map(pair => {
+      const user = flat(pair.user);
+      if (!user || !summary.includes(user)) return null;
+      const hit = assistantsOf(pair).find(text => {
+        const head = flat(text).slice(0, 15);
+        return head.length >= 8 && summary.includes(head);
+      });
+      return hit ? { pair, assistant: pair.assistant } : null;
+    }).filter(Boolean));
+    if (byContains.length) {
+      const picked = preferNear(byContains);
+      if (picked) return { user: picked.pair.user, assistant: picked.assistant };
+      throw new Error(`ambiguous summary-content match (${byContains.length} candidates) in session ${sessionId}`);
+    }
     // Last resort for rows whose stored hash/summary no longer agree with the session:
     // only an unambiguous time-window candidate is used, and its text is cleaned like
     // every other hydration path.

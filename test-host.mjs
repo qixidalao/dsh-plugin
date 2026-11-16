@@ -324,4 +324,126 @@ equal(ambMatch && ambMatch.sourceAvailable, false, 'ambiguous hydration is refus
 equal(ambMatch && ambMatch.user, '', 'ambiguous hydration returns no text');
 matches(ambMatch && ambMatch.hydrationError, /ambiguous summary-prefix match/, 'ambiguity is reported');
 
+// ---------------------------------------------------------------------------
+// Hydration (d): a terse prompt ("继续") whose summary was revised into an
+// impression. The exact extractive prefix is gone, but the summary still quotes
+// the request and the opening of the reply; hydration must accept the unique
+// session pair and return its real assistant text (never the summary text).
+// ---------------------------------------------------------------------------
+const shortStorage = makeStorage();
+const shortUser = '继续';
+const shortAssistant = '当前 13 个已跟踪修改文件，先核对清单再提交';
+const shortTime = Date.now() - 120000;
+const shortSession = {
+  session: { id: 'session-short', cwd: null },
+  events: [
+    { type: 'user/message', time: shortTime, data: message(shortUser) },
+    { type: 'turn/start', time: shortTime, data: {} },
+    { type: 'assistant/message', time: shortTime + 800, data: { message: message('先读取 git status') } },
+    { type: 'assistant/message', time: shortTime + 1600, data: { message: message(shortAssistant) } },
+    { type: 'turn/end', time: shortTime + 2000, data: {} },
+  ],
+};
+const shortSeed = indexOnlyRow({
+  id: 'ex-short',
+  sessionId: 'session-short',
+  time: shortTime + 2000,
+  user: shortUser,
+  assistant: shortAssistant,
+});
+// Impression-style summary: requests + reply opening are quoted, separators differ.
+shortSeed.summary = '继续 当前 13 个已跟踪修改文件，先核对清单（另有 2 个待办）';
+shortSeed.textHash = hashText('stale hash from an older capture');
+await seedRow(shortStorage, shortSeed);
+const shortHost = makeHost(shortStorage, { sessionQuery: makeSessionQuery({ 'session-short': shortSession }) });
+apply(shortHost.ctx, { autoIndexSessions: false, warmup: false });
+await new Promise(resolve => setTimeout(resolve, 5));
+const shortFound = await shortHost.tools[0].execute({ action: 'search', query: '已跟踪修改文件' });
+const shortMatch = shortFound.matches.find(match => match.id === 'ex-short');
+ok(shortMatch, 'short-prompt row is searchable');
+equal(shortMatch && shortMatch.sourceAvailable, true, 'short prompt hydrates from the summary excerpt');
+equal(shortMatch && shortMatch.user, shortUser, 'short user text is exact');
+equal(shortMatch && shortMatch.assistant, shortAssistant, 'assistant text comes from the session, not the summary');
+
+// ---------------------------------------------------------------------------
+// Hydration (e): two turns repeat the terse prompt "继续" and their replies share
+// the same opening, so the revised summary cannot pick one. Hydration must refuse
+// with no text instead of returning one of them.
+// ---------------------------------------------------------------------------
+const repeatStorage = makeStorage();
+const repeatTime = Date.now() - 900000;
+const repeatHead = '公共开头完全相同但后面不同的回答';
+const repeatSession = {
+  session: { id: 'session-repeat', cwd: null },
+  events: [
+    { type: 'user/message', time: repeatTime, data: message('继续') },
+    { type: 'turn/start', time: repeatTime, data: {} },
+    { type: 'assistant/message', time: repeatTime + 500, data: { message: message(`${repeatHead}甲`) } },
+    { type: 'turn/end', time: repeatTime + 1000, data: {} },
+    { type: 'user/message', time: repeatTime + 2000, data: message('继续') },
+    { type: 'turn/start', time: repeatTime + 2000, data: {} },
+    { type: 'assistant/message', time: repeatTime + 2500, data: { message: message(`${repeatHead}乙`) } },
+    { type: 'turn/end', time: repeatTime + 3000, data: {} },
+  ],
+};
+const repeatSeed = indexOnlyRow({
+  id: 'ex-repeat',
+  sessionId: 'session-repeat',
+  time: repeatTime + 100000,
+  user: '继续',
+  assistant: `${repeatHead}甲`,
+});
+repeatSeed.summary = `用户说继续 ${repeatHead}`;
+repeatSeed.textHash = hashText('stale hash for the repeated prompt');
+await seedRow(repeatStorage, repeatSeed);
+const repeatHost = makeHost(repeatStorage, { sessionQuery: makeSessionQuery({ 'session-repeat': repeatSession }) });
+apply(repeatHost.ctx, { autoIndexSessions: false, warmup: false });
+await new Promise(resolve => setTimeout(resolve, 5));
+const repeated = await repeatHost.tools[0].execute({ action: 'search', query: '公共开头' });
+const repeatMatch = repeated.matches.find(match => match.id === 'ex-repeat');
+ok(repeatMatch, 'repeated-prompt row is still searchable');
+equal(repeatMatch && repeatMatch.sourceAvailable, false, 'ambiguous short-prompt hydration is refused');
+equal(repeatMatch && repeatMatch.user, '', 'ambiguous short prompt returns no user text');
+equal(repeatMatch && repeatMatch.assistant, '', 'ambiguous short prompt returns no assistant text');
+matches(repeatMatch && repeatMatch.hydrationError, /ambiguous summary-(tail|content) match/, 'short-prompt ambiguity is reported');
+
+// ---------------------------------------------------------------------------
+// Hydration (f): an older capture summarized the turn from its first assistant
+// message, while hydration pairs the last one. The summary tail is an exact
+// prefix of that earlier message, so the pair is recovered and the matched real
+// message is returned.
+// ---------------------------------------------------------------------------
+const tailStorage = makeStorage();
+const tailTime = Date.now() - 240000;
+const tailFirst = '先读取当前配置并核对清单';
+const tailLast = '当前 13 个已跟踪修改文件，已核对完成';
+const tailSession = {
+  session: { id: 'session-tail', cwd: null },
+  events: [
+    { type: 'user/message', time: tailTime, data: message('继续') },
+    { type: 'turn/start', time: tailTime, data: {} },
+    { type: 'assistant/message', time: tailTime + 700, data: { message: message(tailFirst) } },
+    { type: 'assistant/message', time: tailTime + 1400, data: { message: message(tailLast) } },
+    { type: 'turn/end', time: tailTime + 2000, data: {} },
+  ],
+};
+const tailSeed = indexOnlyRow({
+  id: 'ex-tail',
+  sessionId: 'session-tail',
+  time: tailTime + 2000,
+  user: '继续',
+  assistant: tailFirst,
+});
+tailSeed.textHash = hashText('stale hash from an older capture');
+await seedRow(tailStorage, tailSeed);
+const tailHost = makeHost(tailStorage, { sessionQuery: makeSessionQuery({ 'session-tail': tailSession }) });
+apply(tailHost.ctx, { autoIndexSessions: false, warmup: false });
+await new Promise(resolve => setTimeout(resolve, 5));
+const tailFound = await tailHost.tools[0].execute({ action: 'search', query: '读取当前配置' });
+const tailMatch = tailFound.matches.find(match => match.id === 'ex-tail');
+ok(tailMatch, 'older-capture row is searchable');
+equal(tailMatch && tailMatch.sourceAvailable, true, 'summary tail recovers an earlier assistant message');
+equal(tailMatch && tailMatch.user, '继续', 'tail hydration keeps the short user text');
+equal(tailMatch && tailMatch.assistant, tailFirst, 'tail hydration returns the verified message, not the last one');
+
 console.log(`host fixture: ${checks} checks passed`);
