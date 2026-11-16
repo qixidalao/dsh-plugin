@@ -31,13 +31,13 @@ const rows = readdirSync(dir)
   .map(row => ({ ...row, user: cleanUserText(row.user) }));
 
 const queries = [
-  '移动端上传 文件选择器',
-  '登录 没跳转',
+  '示例查询 文件上传',
+  '示例查询 登录跳转',
   '用户隔离 旧数据',
   '上下文压缩',
-  '部署 公网 200',
+  '示例查询 部署状态',
   'example.com',
-  'Dropdown.vue',
+  'ExampleComponent.vue',
   '语音 第三方 TTS',
   '动态记忆 插件',
   'AIOS 自托管',
@@ -62,7 +62,7 @@ for (let run = 0; run < runs; run += 1) {
   for (const query of queries) warm.push(time(() => rankExchanges(rows, { query, limit: 10 })));
 }
 
-const sample = rankExchanges(rows, { query: 'P0 完成版 BM25 检索', limit: 3 });
+const sample = rankExchanges(rows, { query: '示例查询 BM25 检索', limit: 3 });
 const terms = [...new Set(sample.searchedTerms)];
 const compactBytes = Buffer.byteLength(JSON.stringify(sample.matches.map(match => ({
   id: match.id,

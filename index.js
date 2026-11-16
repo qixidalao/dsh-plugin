@@ -658,28 +658,107 @@ function rowEntities(row) {
   return entities;
 }
 
-// Per-row token statistics reused across searches; invalidated whenever a row's text changes.
-const docCache = new WeakMap();
-function docOf(row) {
-  let doc = docCache.get(row);
-  if (!doc) {
-    const tokens = rowTokens(row);
-    const freq = new Map();
-    for (const token of tokens) freq.set(token, (freq.get(token) || 0) + 1);
-    doc = { freq, length: Math.max(1, tokens.length), tokenSet: new Set(tokens) };
-    docCache.set(row, doc);
-  }
-  return doc;
+// ── Retrieval index ──────────────────────────────────────────────────────────
+// Postings are built once per rows snapshot, so a query only walks the postings of its
+// own terms/entities instead of every row. Cache key = the caller's rows array identity;
+// `rankVersion` (the plugin's data epoch) forces a rebuild when a row changed even if the
+// caller reuses its array. Row text changes bump the epoch through invalidateRow().
+let rankDataEpoch = 0;
+export function currentRankEpoch() {
+  return rankDataEpoch;
+}
+export function bumpRankEpoch() {
+  rankDataEpoch += 1;
 }
 function invalidateRow(row) {
   tokenCache.delete(row);
-  docCache.delete(row);
   entityCache.delete(row);
+  bumpRankEpoch();
 }
-function haystackOf(row) {
-  const doc = docOf(row);
-  if (doc.haystack === undefined) doc.haystack = `${cleanUserText(row.user)}\n${row.assistant}\n${row.summary || ''}\n${(row.keywords || []).join(' ')}\n${(row.entities || []).join(' ')}`.toLowerCase().replace(/\s+/g, '');
-  return doc.haystack;
+
+const RANK_POOL_CACHE_LIMIT = 64;
+function rowHasText(row) {
+  return Boolean(String(row.user || '').trim() || String(row.assistant || '').trim() || String(row.summary || '').trim());
+}
+function inlineHaystack(row) {
+  return `${cleanUserText(row.user)}\n${row.assistant}\n${row.summary || ''}\n${(row.keywords || []).join(' ')}\n${(row.entities || []).join(' ')}`.toLowerCase().replace(/\s+/g, '');
+}
+function buildRankIndex(rows) {
+  const count = rows.length;
+  const lengths = new Int32Array(count);
+  const hasText = new Uint8Array(count);
+  const termBuild = new Map();
+  const entityBuild = new Map();
+  for (let index = 0; index < count; index += 1) {
+    const row = rows[index];
+    if (!row || typeof row !== 'object' || !rowHasText(row)) continue;
+    hasText[index] = 1;
+    const tokens = tokensOf(cleanUserText(row.user), row.assistant, row.summary, (row.keywords || []).join(' '));
+    lengths[index] = Math.max(1, tokens.length);
+    for (const entity of rowEntities(row)) {
+      let list = entityBuild.get(entity);
+      if (!list) {
+        list = [];
+        entityBuild.set(entity, list);
+      }
+      list.push(index);
+    }
+    if (!tokens.length) continue;
+    const freq = new Map();
+    for (const token of tokens) freq.set(token, (freq.get(token) || 0) + 1);
+    for (const [term, tf] of freq) {
+      let entry = termBuild.get(term);
+      if (!entry) {
+        entry = { docs: [], tfs: [] };
+        termBuild.set(term, entry);
+      }
+      entry.docs.push(index);
+      entry.tfs.push(tf);
+    }
+  }
+  const postings = new Map();
+  for (const [term, entry] of termBuild) {
+    let maxTf = 1;
+    for (const tf of entry.tfs) if (tf > maxTf) maxTf = tf;
+    const tfs = maxTf <= 255 ? Uint8Array.from(entry.tfs) : maxTf <= 65535 ? Uint16Array.from(entry.tfs) : Int32Array.from(entry.tfs);
+    postings.set(term, { docs: Int32Array.from(entry.docs), tfs });
+  }
+  const entityPostings = new Map();
+  for (const [entity, list] of entityBuild) entityPostings.set(entity, Int32Array.from(list));
+  return { size: count, lengths, hasText, postings, entityPostings, poolCache: new Map() };
+}
+const rankIndexCache = new WeakMap();
+function rankIndexFor(rows, version) {
+  let entry = rankIndexCache.get(rows);
+  if (!entry || (version !== undefined && entry.version !== version)) {
+    entry = { version: version === undefined ? null : version, index: buildRankIndex(rows) };
+    rankIndexCache.set(rows, entry);
+  }
+  return entry.index;
+}
+/** Candidate-pool totals (count/sum length) per filter signature; cached per index. */
+function rankPoolStats(index, rows, options, from, to) {
+  const includeArchived = options.includeArchived === true;
+  const signature = `${options.kind || ''}|${includeArchived ? 1 : 0}|${options.workspace || ''}|${options.scope || ''}|${from ?? ''}|${to ?? ''}`;
+  const cached = index.poolCache.get(signature);
+  if (cached) return cached;
+  let count = 0;
+  let sumLength = 0;
+  for (let position = 0; position < index.size; position += 1) {
+    if (!index.hasText[position]) continue;
+    const row = rows[position];
+    if (options.kind && row.kind !== options.kind) continue;
+    if (row.archivedAt && !includeArchived) continue;
+    if (options.workspace && options.scope !== 'all' && row.workspace && row.workspace !== options.workspace) continue;
+    if (from !== undefined && row.time < from) continue;
+    if (to !== undefined && row.time > to) continue;
+    count += 1;
+    sumLength += index.lengths[position];
+  }
+  const stats = { count, sumLength };
+  if (index.poolCache.size >= RANK_POOL_CACHE_LIMIT) index.poolCache.clear();
+  index.poolCache.set(signature, stats);
+  return stats;
 }
 
 export function confidenceFromScores(values, coverage = 1) {
@@ -736,34 +815,57 @@ export function rankExchanges(rows, options = {}) {
   const from = toTimestamp(options.from);
   const to = toTimestamp(options.to);
 
-  const candidates = rows.filter(row => {
-    if (!String(row.user || '').trim() && !String(row.assistant || '').trim() && !String(row.summary || '').trim()) return false;
+  const passFilter = row => {
     if (options.kind && row.kind !== options.kind) return false;
     if (row.archivedAt && !includeArchived) return false;
     if (options.workspace && options.scope !== 'all' && row.workspace && row.workspace !== options.workspace) return false;
     if (from !== undefined && row.time < from) return false;
     if (to !== undefined && row.time > to) return false;
     return true;
-  });
+  };
 
   const empty = { matches: [], total: 0, sort, searchedTerms: terms.slice(0, 24), timeWindow: { from: from ?? null, to: to ?? null } };
-  if (!candidates.length) return empty;
-
+  const index = rankIndexFor(rows, options.rankVersion);
+  const pool = rankPoolStats(index, rows, options, from, to);
+  if (!pool.count) return empty;
+  const avgLength = pool.sumLength / pool.count;
+  const total = pool.count;
   const queryEntities = new Set(entitiesOf(query));
-  const entityIndex = options.entityIndex || buildEntityIndex(candidates);
 
-  const docs = candidates.map(row => {
-    const doc = docOf(row);
-    return { row, freq: doc.freq, length: doc.length, tokenSet: doc.tokenSet };
-  });
-  const avgLength = docs.reduce((sum, doc) => sum + doc.length, 0) / docs.length;
+  // Candidate scan: walk only the postings of the query terms/entities, then filter.
   const documentFrequency = new Map();
-  for (const term of terms) {
+  const candidates = new Map();
+  for (let termIndex = 0; termIndex < terms.length; termIndex += 1) {
+    const term = terms[termIndex];
+    const posting = index.postings.get(term);
+    if (!posting) {
+      documentFrequency.set(term, 0);
+      continue;
+    }
     let count = 0;
-    for (const doc of docs) if (doc.tokenSet.has(term)) count += 1;
+    for (let position = 0; position < posting.docs.length; position += 1) {
+      const rowIndex = posting.docs[position];
+      if (!passFilter(rows[rowIndex])) continue;
+      count += 1;
+      let entry = candidates.get(rowIndex);
+      if (!entry) {
+        entry = new Array(terms.length).fill(0);
+        candidates.set(rowIndex, entry);
+      }
+      entry[termIndex] = posting.tfs[position];
+    }
     documentFrequency.set(term, count);
   }
-  const total = docs.length;
+  for (const entity of queryEntities) {
+    const posting = index.entityPostings.get(entity);
+    if (!posting) continue;
+    for (let position = 0; position < posting.length; position += 1) {
+      const rowIndex = posting[position];
+      if (!passFilter(rows[rowIndex])) continue;
+      if (!candidates.has(rowIndex)) candidates.set(rowIndex, new Array(terms.length).fill(0));
+    }
+  }
+
   const idfOf = term => {
     const df = documentFrequency.get(term) || 0;
     return Math.log(1 + (total - df + 0.5) / (df + 0.5));
@@ -780,28 +882,31 @@ const timeIntent = wantsLatest || /(当时|以前|去年|上周|上个月|那天
 const recencyWeight = timeIntent ? 1 : 0.3;
 
   const scored = [];
-  for (const doc of docs) {
-    const { row } = doc;
+  for (const [rowIndex, tfs] of candidates) {
+    const row = rows[rowIndex];
+    const length = index.lengths[rowIndex];
     let bm25 = 0;
     let matched = 0;
-    for (const term of terms) {
-      const freq = doc.freq.get(term) || 0;
+    let matchedIdf = 0;
+    for (let termIndex = 0; termIndex < terms.length; termIndex += 1) {
+      const freq = tfs[termIndex];
       if (!freq) continue;
       matched += 1;
-      const norm = 1.2 * (1 - 0.75 + 0.75 * (doc.length / avgLength));
-      bm25 += idfOf(term) * ((freq * 2.2) / (freq + norm));
+      const idf = idfOf(terms[termIndex]);
+      matchedIdf += idf;
+      const norm = 1.2 * (1 - 0.75 + 0.75 * (length / avgLength));
+      bm25 += idf * ((freq * 2.2) / (freq + norm));
     }
     const matchedEntities = rowEntities(row).filter(entity => queryEntities.has(entity));
     const entityHit = Math.min(3, matchedEntities.length);
     if (!matched && !entityHit) continue;
     const bm25n = (2.5 * bm25) / maxPossible;
-    const matchedIdf = terms.reduce((sum, term) => sum + (doc.freq.get(term) ? idfOf(term) : 0), 0);
     // IDF-weighted coverage: sharing only common bigrams ("所有", "练习") does not count as
     // knowing what the query is about, so weak matches keep a low confidence.
     const coverage = totalUnits
       ? Math.min(1, (matchedIdf + new Set(matchedEntities).size * avgIdf) / totalUnits)
       : 0;
-    const haystack = haystackOf(row);
+    const haystack = inlineHaystack(row);
     const phraseHit = phrase.length >= 2 && haystack.includes(phrase) ? 1 : 0;
     const impressionHit = terms.reduce((sum, term) => sum + ((row.summary || '').toLowerCase().includes(term) ? 1 : 0), 0);
     const reasons = [];
@@ -1977,6 +2082,7 @@ async function start(ctx, config) {
 
   const addRow = row => {
     if (rowsById.has(row.id)) return;
+    bumpRankEpoch();
     rowsById.set(row.id, row);
     let list = rowsBySession.get(row.sessionId);
     if (!list) {
@@ -2871,6 +2977,24 @@ async function start(ctx, config) {
     }
   };
 
+  // Reuse one rows array per (epoch, memory scope): rankExchanges caches its inverted
+  // index by array identity, so unchanged data must not be re-filtered per query.
+  const rankSnapshots = { epoch: -1, byScope: new Map() };
+  const rankRowsFor = policy => {
+    const epoch = currentRankEpoch();
+    if (rankSnapshots.epoch !== epoch) {
+      rankSnapshots.epoch = epoch;
+      rankSnapshots.byScope.clear();
+    }
+    const key = String(policy && policy.scopeId ? policy.scopeId : '*');
+    let snapshot = rankSnapshots.byScope.get(key);
+    if (!snapshot) {
+      snapshot = { epoch, rows: visibleRows(policy) };
+      rankSnapshots.byScope.set(key, snapshot);
+    }
+    return snapshot;
+  };
+
   const search = (args, workspace, policy) => {
     const query = String(args.query || '').trim();
     const terms = [...new Set(tokensOf(query))];
@@ -2878,8 +3002,10 @@ async function start(ctx, config) {
     if (args.from !== undefined && toTimestamp(args.from) === undefined) return { error: 'from must be an ISO date or epoch milliseconds' };
     if (args.to !== undefined && toTimestamp(args.to) === undefined) return { error: 'to must be an ISO date or epoch milliseconds' };
     const scope = args.scope === 'all' || args.scope === 'workspace' ? args.scope : defaultScope;
-    const scopedRows = visibleRows(policy);
+    const snapshot = rankRowsFor(policy);
+    const scopedRows = snapshot.rows;
     const ranked = rankExchanges(scopedRows, {
+      rankVersion: snapshot.epoch,
       query,
       from: args.from,
       to: args.to,
@@ -4177,7 +4303,16 @@ async function start(ctx, config) {
     ? undefined
     : setTimeout(() => {
         try {
-          rankExchanges([...rowsById.values()], { query: 'memory 记忆 任务', limit: 1 });
+          // Warm the per-scope inverted indexes that real searches will reuse, so the
+          // first user search does not pay the one-time build cost.
+          for (const agent of setups.keys()) {
+            try {
+              const snapshot = rankRowsFor(policyForAgent(agent));
+              rankExchanges(snapshot.rows, { query: 'memory 记忆 任务', limit: 1, rankVersion: snapshot.epoch });
+            } catch {
+              // one agent scope failing warmup must not block the others
+            }
+          }
         } catch (error) {
           logger.warn(`dynamic-memory: warmup failed: ${String(error)}`);
         }
