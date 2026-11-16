@@ -414,11 +414,11 @@ const DOMAIN_SPEC = {
 
 const TOOL = {
   name: 'dynamic_memory',
-  description: 'Cross-session memory: search/recent/entities (retrieval), deepen/learn/portrait (write/read), observe/correct/observations/contradict (evidence layer), identity (continuity evidence), reflect/review/recompute/duplicates, archive/restore/export/stats/index/repair/forget/migrate. search returns compact snippets with confidence; use full=true to quote. Details in README.',
+  description: 'Cross-session memory: search/recent/entities (retrieval), deepen/learn/portrait (write/read), observe/correct/observations/contradict (evidence layer), identity (continuity evidence), reflect/review/recompute/duplicates, archive/restore/export/stats/index/repair/forget/migrate, scope (multi-agent isolation status). search returns compact snippets with confidence; use full=true to quote. Details in README.',
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates', 'consent'] },
+      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates', 'consent', 'scope'] },
       mode: { type: 'string', enum: ['strip'], description: 'For migrate: only mode=strip is supported; it removes legacy plaintext (user/assistant) while keeping summary, keywords, entities, textHash and pointer.' },
       confirm: { type: 'boolean', description: 'For migrate: must be true. The destructive strip runs only after an export file is written to the export path.' },
       consent: {
@@ -1551,12 +1551,195 @@ async function start(ctx, config) {
   let consentFutureVersion = null;
   const rowsById = new Map();
   const rowsBySession = new Map();
+  // Owner-level portrait maps keep the legacy single namespace; delegated/agent-mode
+  // portraits live in scopedFacets keyed by their memory scope.
   const portrait = new Map();
   const selfPortrait = new Map();
+  const scopedFacets = new Map();
   const observations = new Map();
+  const scopedFacetMaps = scopeId => {
+    let entry = scopedFacets.get(scopeId);
+    if (!entry) {
+      entry = { user: new Map(), self: new Map() };
+      scopedFacets.set(scopeId, entry);
+    }
+    return entry;
+  };
+  const facetMapsFor = policy => {
+    if (memoryScope === 'shared' || !policy || !policy.canRead || policy.scopeId === OWNER_SCOPE || !policy.scopeId) {
+      return { user: portrait, self: selfPortrait, scopeId: OWNER_SCOPE };
+    }
+    return { ...scopedFacetMaps(policy.scopeId), scopeId: policy.scopeId };
+  };
+  /** Effective read view: agent-mode root agents also see pre-upgrade owner rows. */
+  const facetViewFor = (policy, target) => {
+    const maps = facetMapsFor(policy);
+    const map = target === ASSISTANT_TARGET ? maps.self : maps.user;
+    if (memoryScope === 'agent' && policy && policy.role === 'owner' && maps.scopeId !== OWNER_SCOPE) {
+      const legacy = target === ASSISTANT_TARGET ? selfPortrait : portrait;
+      return new Map([...legacy, ...map]);
+    }
+    return map;
+  };
+  const facetKey = (prefix, scopeId, facet) => (scopeId === OWNER_SCOPE ? `${prefix}${facet}` : `${prefix}${scopeId}:${facet}`);
+  const allFacetMaps = () => [
+    { map: portrait, table: portraitTable, prefix: 'p_', scopeId: OWNER_SCOPE },
+    { map: selfPortrait, table: selfTable, prefix: 's_', scopeId: OWNER_SCOPE },
+    ...[...scopedFacets].flatMap(([scopeId, entry]) => [
+      { map: entry.user, table: portraitTable, prefix: 'p_', scopeId },
+      { map: entry.self, table: selfTable, prefix: 's_', scopeId },
+    ]),
+  ];
   const stats = { merged: 0, pruned: 0, superseded: 0, indexed: 0, knownSessions: null, lastConsolidatedAt: null };
   /** Live count of rows that still carry legacy plaintext (index-only rows keep both fields empty). */
   const countPlaintextRows = () => [...rowsById.values()].filter(row => String(row.user || '').trim() || String(row.assistant || '').trim()).length;
+
+  // ── Multi-agent memory isolation ──────────────────────────────────────────
+  // Identity is resolved from the Harness runtime contract, in this order (no guessing):
+  //  1. explicit config.ownerAgentIds wins — the explicit mode for hosts/installs where
+  //     the agent registry or session headers are unavailable;
+  //  2. SessionHeader.parentSession / origin='subagent' / delegationDepth>0 marks a
+  //     delegated session (CreateAgentOptions.meta records these when a parent spawns);
+  //  3. ctx.agents.roots() vs list(): top-level agents (user sessions) are roots, while
+  //     subagents/teammates are created through an owning agent context, so only roots
+  //     are owner-level; anything live but non-root is delegated.
+  // Unknown identity fails closed (no read, no write) unless ownerAgentIds makes the
+  // owner explicit, so an unverifiable agent can never inherit the user's memory.
+  const MEMORY_SCOPES = ['owner', 'agent', 'shared'];
+  const memoryScope = MEMORY_SCOPES.includes(config.memoryScope) ? config.memoryScope : 'owner';
+  const explicitOwnerIds = new Set((Array.isArray(config.ownerAgentIds) ? config.ownerAgentIds
+    : typeof config.ownerAgentIds === 'string' ? config.ownerAgentIds.split(',') : [])
+    .map(value => String(value || '').trim()).filter(Boolean));
+  const sessionsService = ctx.get('sessions');
+  const OWNER_SCOPE = 'owner';
+  const agentScopeId = id => `agent:${String(id)}`;
+  const sessionOf = id => {
+    try {
+      return sessionsService && typeof sessionsService.get === 'function' ? sessionsService.get(String(id)) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const sessionHeaderOf = id => {
+    const session = sessionOf(id);
+    return session && session.header ? session.header : undefined;
+  };
+  const identityCache = new Map();
+  const resolveIdentity = (sessionId, headerHint) => {
+    const id = String(sessionId || '');
+    const header = headerHint || sessionHeaderOf(id);
+    const cached = identityCache.get(id);
+    if (cached) return cached;
+    let role = null;
+    let source = null;
+    if (explicitOwnerIds.size) {
+      role = explicitOwnerIds.has(id) ? 'owner' : 'delegate';
+      source = 'config:ownerAgentIds';
+    }
+    if (!role && header) {
+      const delegated = Boolean(header.parentSession || header.origin === 'subagent' || (Number(header.delegationDepth) || 0) > 0);
+      if (delegated) {
+        role = 'delegate';
+        source = 'session-header';
+      }
+    }
+    if (!role && agentsService && typeof agentsService.roots === 'function' && typeof agentsService.list === 'function') {
+      try {
+        const roots = new Set(agentsService.roots().map(entry => String(entry.id)));
+        if (roots.has(id)) {
+          role = 'owner';
+          source = 'agents-roots';
+        } else if (agentsService.list().some(entry => String(entry.id) === id)) {
+          role = 'delegate';
+          source = 'agents-roots';
+        }
+      } catch {
+        // fall through to the unknown state below
+      }
+    }
+    if (!role && header) {
+      role = 'owner';
+      source = 'session-header';
+    }
+    if (!role) {
+      role = 'unknown';
+      source = 'none';
+    }
+    const identity = { sessionId: id, agentId: id, role, source };
+    if (role !== 'unknown') identityCache.set(id, identity);
+    return identity;
+  };
+  const policyFor = (sessionId, headerHint) => {
+    const identity = resolveIdentity(sessionId, headerHint);
+    if (memoryScope === 'shared') {
+      return { ...identity, mode: 'shared', scopeId: '*', canRead: true, canWrite: true, reason: null };
+    }
+    if (identity.role === 'owner') {
+      return {
+        ...identity,
+        mode: memoryScope,
+        scopeId: memoryScope === 'agent' ? agentScopeId(identity.agentId) : OWNER_SCOPE,
+        canRead: true,
+        canWrite: true,
+        reason: null,
+      };
+    }
+    if (identity.role === 'delegate') {
+      if (memoryScope === 'agent') {
+        return { ...identity, mode: 'agent', scopeId: agentScopeId(identity.agentId), canRead: true, canWrite: true, reason: null };
+      }
+      return {
+        ...identity,
+        mode: 'owner',
+        scopeId: agentScopeId(identity.agentId),
+        canRead: false,
+        canWrite: false,
+        reason: 'memoryScope=owner: delegated agents (subagent/teammate) cannot read or write owner memory',
+      };
+    }
+    return {
+      ...identity,
+      mode: memoryScope,
+      scopeId: null,
+      canRead: false,
+      canWrite: false,
+      reason: explicitOwnerIds.size
+        ? 'session is not listed in ownerAgentIds'
+        : 'agent identity is unverifiable in this host (no session header or agent registry); set config.ownerAgentIds to enable explicit isolation',
+    };
+  };
+  const policyForAgent = agent => policyFor(agent && agent.id ? agent.id : '', sessionHeaderOf(agent && agent.id));
+  const recordScopeOf = row => (row && typeof row.scopeId === 'string' && row.scopeId ? row.scopeId : OWNER_SCOPE);
+  const canSeeRecord = (row, policy) => {
+    if (!policy || !policy.canRead) return false;
+    if (memoryScope === 'shared') return true;
+    const scope = recordScopeOf(row);
+    if (scope === policy.scopeId) return true;
+    // Pre-upgrade rows carry no scopeId: they belong to the owner namespace.
+    return scope === OWNER_SCOPE && policy.role === 'owner';
+  };
+  const visibleRows = policy => (policy && policy.canRead ? [...rowsById.values()].filter(row => canSeeRecord(row, policy)) : []);
+  const visibleObservations = policy => (policy && policy.canRead ? [...observations.values()].filter(row => canSeeRecord(row, policy)) : []);
+  const isolationRefusal = (action, policy) => ({
+    error: `${action} denied by memory isolation: ${policy.reason}`,
+    isolated: true,
+    isolation: { mode: policy.mode, role: policy.role, source: policy.source, sessionId: policy.sessionId },
+  });
+  const scopeStatus = policy => ({
+    mode: memoryScope,
+    configured: MEMORY_SCOPES.includes(config.memoryScope) ? config.memoryScope : 'default:owner',
+    ownerAgentIds: [...explicitOwnerIds],
+    identity: { sessionId: policy.sessionId, role: policy.role, source: policy.source },
+    scopeId: policy.scopeId,
+    canRead: policy.canRead,
+    canWrite: policy.canWrite,
+    reason: policy.reason,
+    note: memoryScope === 'owner'
+      ? 'Only top-level (root) agents use owner memory; delegated subagents/teammates are isolated.'
+      : memoryScope === 'agent'
+        ? 'Every agentId has its own memory namespace (legacy unscoped rows stay visible to root agents).'
+        : 'shared keeps the legacy profile-wide behavior: every agent sees the same memory.',
+  });
 
   const addRow = row => {
     if (rowsById.has(row.id)) return;

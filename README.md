@@ -23,10 +23,12 @@
 ## 验证
 
 ```bash
-node test.mjs          # 52 项纯函数测试
-node test-host.mjs     # 170 项生命周期（内存 mock host）
-node eval.mjs --fixture # 合成评测（不需要真实数据）
-node eval.mjs           # 真实集评测（读本机存储）
+node test.mjs            # 52 项纯函数测试
+node test-host.mjs       # 170 项生命周期（内存 mock host）
+node eval.mjs --fixture   # 合成评测（不需要真实数据）
+node eval.mjs             # 真实集评测（读本机存储）
+node ui/verify-client.mjs  # Web 面板静态契约（10 PASS）
+node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 ```
 
 ## 文档
@@ -62,10 +64,23 @@ node eval.mjs           # 真实集评测（读本机存储）
 
 - `consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机验证：**`memory=on inject=on profile=unified sensitive=off, storage=durable`**。
 - `/dmem consent` 看状态；`/dmem consent on|off`（C1）、`inject on|off`（C2）、`sensitive on|off`（C4）、`profile unified|situational|off`（C3）；工具 action 可传 `consent={memory,inject,profile,sensitive}`。
-- C1 关闭时：不捕获、不注入、后台索引停。
-- **未做**：面板 UI、说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、真机移动端未测；**memory off 的显式写入硬拦截正在修**。
+- C1 关闭时：不捕获、不注入、后台索引停；v2.2.1 起 `memory=off` 还会拒绝显式写入（`observe`/`learn`/`deepen`/`correct`），consent 行带 `schemaVersion=1`。
+- **仍未做**：说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、dsh-go 真机未测（仅静态校验）、多智能体记忆隔离 `memoryScope`（task-14 开发中，**不在 2.4.0 范围**）。
 
-## 评测（真实集，v2.2.0 本机）
+## 面板：Web 与 dsh-go 手机 App
+
+**为什么手机端要单独做**：dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**；v2.3.0 的 `client.js` 只在 Web/桌面可见，所以手机里需要独立的 `dshGo` 清单 + 声明式视图。
+
+- **Web / 桌面（v2.3.0）**：`client.js` 在输入框 dock（`conversation.input.dock`）提供记忆面板——状态、搜索、画像、暂停/恢复、C1–C4 开关、导出；读写都走 `/dmem`，破坏性操作只提示 `/dmem migrate`。已用 live client inspect 确认槽位占位（`id=dynamic-memory, order=30, active=true`）。
+- **dsh-go 手机 App（v2.4.0）**：`package.json` 加 `main: index.js` 与 `dshGo`（`v=1`；面板 `memory-settings`，placement `session.tab` / `features` / `chat.panel`，presentation page；title 中英；icon settings；`wants: []`；`minApp` 省略）。`index.js` 用 `ctx.inject(['dshGo'])` 注册，桌面/Web 无该服务时不执行。
+- **App 内入口**：对话详情 →「插件」→「记忆设置」；「全部功能」→「记忆设置」；输入框「插件」胶囊 → 弹层。
+- **面板内容**：存储健康（storage / 索引条数 / plaintextRows / 上次注入字符）、**四个 C1–C4 开关**、**五个按钮（暂停捕获、恢复捕获、导出、复制状态、同意说明）**；每个注册 action 都可点。
+- **写路径**：toggle 只发 `/dmem consent …`——memory → `/dmem consent on|off`，inject → `/dmem consent inject on|off`，sensitive → `/dmem consent sensitive on|off`，profile 按 `unified → situational → off` 循环；不直接写 storage，与工具/Web 面板共用同一持久化。**不新增网络请求**，不读剪贴板/输入框（`wants: []`）。
+- **安装/生效**：清单改动自动重读；`index.js` 改动需在 App「引擎」页重启引擎。若桥接只扫 `$DSH_HOME/dsh-go/plugins/`，还需 `dsh plugin --profile web add <包目录>`（发现规则**未确认**）。
+- **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板 = 重装 2.3.0，或移除 `dshGo` 清单（App 入口消失、数据不动）。
+- **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测 52/170 不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
+
+## 评测（真实集，本机；v2.4.0 复跑）
 
 - `node eval.mjs`：hit@3 **9/10**、MRR **0.750**（评测标签迁移后；标签迁移前 7/10、0.600）；
 - `node eval.mjs --min-coverage 0.6`：误报 **0/8**（无门控 1/8）；

@@ -1,6 +1,39 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.2.0**；**未发布**——无 Release、非 Latest、npm 未推送（`private: true`）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.4.0**；**未发布**——无 Release、非 Latest、npm 未推送（`private: true`）。
+
+## 2.4.0（未发布）— dsh-go 原生记忆面板
+
+**背景**：dsh-go 是 Flutter 原生界面，不执行 Web client 插件（v2.3.0 的 `client.js` 只在 Web/桌面可见），手机上看不到任何记忆入口。本次给同一包补一份 dsh-go 原生贡献。
+
+- **清单**：`package.json` 新增 `"main": "index.js"` 与 `dshGo`（`v: 1`、`title.zh/en` 为「记忆」/Memory、`icon: settings`、`wants: []`、`contributes.panels` 一项 `memory-settings`：title「记忆设置」/Memory settings、`placement: ["session.tab","features","chat.panel"]`、`presentation: "page"`）；版本升 2.4.0。`dsh.bundle.patch` 与 `exports["./client"]` 保留 → **Web/桌面面板行为不变**。
+- **注册**：`index.js` 末尾 `ctx.inject(['dshGo'], …)`（在既有 return 之前）。只有手机 App 引擎提供 `dshGo` 服务时才执行；桌面/Web/CLI 下子 fiber 不启动，不注册任何东西。
+- **只读快照** `dshGoSnapshot()`：读 `consentStatus()`、`storageState`、`rowsById.size`、`countPlaintextRows()` 与上一次注入的 `chars`；**不新开网络、不额外读文件、不依赖 agent**。无会话快照时回退到最近一次。
+- **面板能力**：存储健康（storage / 索引条数 / plaintextRows / 上次注入字符）+ **四个 C1–C4 开关行** + **五个按钮（暂停捕获、恢复捕获、导出、复制状态、同意说明）**。视图为声明式 v2（stack / keyValue / list / callout / actions），中英文案取 `locale/messages.*.json` 的 `panel.*`（**21 个键**，zh/en 对齐）；每个注册 action 都有可达入口。
+- **写路径只走命令**：toggle 只产生 `/dmem consent …`——memory → `/dmem consent on|off`（注意：不是 `consent memory …`），inject → `/dmem consent inject on|off`，sensitive → `/dmem consent sensitive on|off`，profile 按 `unified → situational → off → unified` 循环（off 可达）；导出发 `/dmem export`；暂停/恢复发 `/dmem pause|resume`。actions 只返回声明式 effect（`command`/`copy`/`toast`，单次 ≤4），**不直接写 storage**，状态与工具/Web 面板共用同一条持久化路径。
+- **App 内入口（按 spec）**：对话详情 →「插件」→「记忆设置」；「全部功能」→「记忆设置」；输入框「插件」胶囊 → 弹层（`chat.panel`）。
+- **隐私边界**：不新增网络请求；不读剪贴板/输入框/消息（`wants: []`）；导出只写本地 `$DSH_HOME/storages/dynamic_memory/memory.md`。
+- **安装/生效**：清单改动自动重读；`index.js` 改动需在 App「引擎」页重启引擎。若桥接只扫 `$DSH_HOME/dsh-go/plugins/` 而没走 profile 依赖发现，需再用 `dsh plugin --profile web add <包目录>`（发现规则仍需真机确认）。
+- **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板：重装 2.3.0（Web）或移除 `dshGo` 清单（App 入口消失，数据不动）。
+- **自检**：`node ui/verify-dshgo.mjs` 静态 **46 PASS + 1 INFO**（manifest 字段/长度/id 语法/placement/view 节点与深度/≤32KiB/效果上限/四个 toggle→命令映射/中英 locale 对齐，并**解析视图树断言每个注册 action 可达**——删除按钮行会得到 8 FAIL，而不是假 PASS；**dsh-go 的唯一校验来源**），`node test.mjs` **52**、`node test-host.mjs` **170**（二者不含 dsh-go 断言，`grep dshGo test*.mjs` 为 0）。
+- **补丁**：`a1589e0 fix(go): render pause/resume buttons in the dsh-go memory panel` —— 补渲染暂停/恢复/同意说明按钮，并加固 `ui/verify-dshgo.mjs` 的 action 可达性检查。
+- **未验证（诚实边界）**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；以上仅为静态校验 + 单测。`dshGo.minApp` 留空：本机无 kit/template，App 版本格式无法验证（bridge 0.4.0 是桥接版本，不是 App 版本号）。spec §6 三个接口（同包双身份是否双加载、发现规则、`panel.scope.sessionId` 是否有值）仍需真机确认。
+- **范围外（不属 2.4.0 交付）**：多智能体记忆隔离（`memoryScope`）由 task-14 开发中，未合入本版本。
+
+## 2.3.0 — Web/桌面记忆面板（live slot 验证）
+
+- 新增 `client.js`：在 Web 输入框 dock（`conversation.input.dock`）提供记忆操作面板——状态、搜索、用户/助手画像、暂停/恢复捕获、C1–C4 同意开关、导出；所有读写都走 `/dmem` 命令，破坏性操作只提示 `/dmem migrate`、不执行。
+- `package.json`：新增 `exports["./client"]`、`dsh.client`（platform web、immediately、inject 三个 client 服务）、`files` 增加 `client.js`。
+- 新增 `ui/verify-client.mjs`：10 项静态契约校验（PASS）。
+- 真机（Web client inspect）实测：槽位 `conversation.input.dock` 的 occupants 含 `id=dynamic-memory, order=30, active=true`。
+- 测试 52 + 170。
+
+## 2.2.1 — consent 加固与文档同步
+
+- `memory=off` 现在拒绝显式写入（`observe`/`learn`/`deepen`/`correct` 返回明确原因）；读与删除不受影响。
+- consent 行增加 `schemaVersion=1` 与 v0 迁移；`stats`/`consent` 暴露 `schemaVersion`。
+- 真机验证：consent 持久化 `durable`、`schemaVersion 1`。
+- 文档同步到当时真实数字：测试 52+170、eval 9/10 MRR 0.750、`--min-coverage 0.6` 时 FP 0/8、fixture 5/5。
 
 ## 2.2.0 — 同意开关、digest 实测与评测加固
 

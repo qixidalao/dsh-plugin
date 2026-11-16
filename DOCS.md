@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：2.0.1（`@local/dynamic-memory`）
+> 版本：2.4.0（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -77,16 +77,19 @@
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | 插件全部实现（抓取、存储、检索、注入、画像、证据层、命令） |
-| `package.json` | 包清单，`dsh.bundle.patch` 指向 `cordis.patch.yml` |
+| `index.js` | 插件全部实现（抓取、存储、检索、注入、画像、证据层、命令、dsh-go 面板注册） |
+| `client.js` | Web/桌面记忆面板（`dsh.client.platform = web`，输入框 dock 槽位；v2.3） |
+| `package.json` | 包清单：`dsh.bundle.patch`（Cordis bundle）+ `main`/`dshGo`（dsh-go 手机 App 清单，v2.4）+ `exports` |
 | `cordis.patch.yml` | 向 profile 插入插件行（`id: dynamic-memory`） |
+| `ui/verify-client.mjs` | Web 面板静态契约校验（10 项） |
+| `ui/verify-dshgo.mjs` | dsh-go 面板静态校验（46 项 PASS + 1 INFO；本机无 kit/App） |
 | `locale/zh.json`、`locale/en.json` | 插件列表里的标题与描述 |
-| `locale/messages.zh.json`、`locale/messages.en.json` | 运行时语言包：注入文案、facet 标签、工具描述、命令基础文案、词表/短语/停用词 |
-| `README.zh-CN.md` | 中文 README（英文为主版本） |
+| `locale/messages.zh.json`、`locale/messages.en.json` | 运行时语言包：注入文案、facet 标签、工具描述、命令基础文案、词表/短语/停用词、面板 `panel.*`（21 键，中英对齐） |
 | `icon.svg` | 插件图标 |
-| `README.md` | 面向使用者的说明（功能、配置、验证记录） |
+| `README.md` / `README.en.md` | 面向使用者的说明（功能、配置、验证记录、多端面板） |
 | `DOCS.md` | 本文档：设计原则、架构与记忆逻辑、已知缺陷、升级规范 |
-| `test.mjs` | 纯函数测试（34 项） |
+| `test.mjs` | 纯函数测试（52 项） |
+| `test-host.mjs` | 生命周期/mock host 测试（170 项） |
 | `eval.mjs` + `eval-queries.local.json` | 检索评测（本机真实记忆库 + 本地评测数据，二者都 gitignore；CI 用 `eval-queries.fixture.json` 合成数据） |
 | `bench.mjs` | 检索性能基准（cold/warm 延迟、compact/full 体积） |
 
@@ -285,10 +288,16 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `entities` | Top 实体或某实体的相关记录 |
 | `index` / `repair` | 索引未打开会话 / 从日志补回缺失用户原话 |
 | `archive` / `restore` | 回收区进出 |
-| `stats` | 记录/会话/类型/实体/重要度/回收区/间隔/过期/观察计数/`facetsNeedingRecompute`/注入长度/命令状态 |
+| `stats` | 记录/会话/类型/实体/重要度/回收区/间隔/过期/观察计数/`facetsNeedingRecompute`/注入长度/命令状态/`consent`（含 `schemaVersion`） |
+| `consent` | C1-C4 同意开关：读状态或传 `consent={memory,inject,profile,sensitive}` 改部分字段（持久化，重载保留） |
+| `migrate` | `mode=strip confirm=true`：先导出 memory.md，再剥离旧记录明文；缺 `confirm` 拒绝执行 |
 | `export` | 导出 `memory.md`（用户画像 + 助手画像 + 观察与推断 + 印象 + 统计） |
 
-`/dmem` 命令：`stats | portrait | self | export | search <关键词>`。
+`/dmem` 命令：`stats | portrait | self | export | search <关键词> | pause | resume | consent … | migrate …`。
+
+- `/dmem consent [status|on|off|inject on|off|sensitive on|off|profile unified|situational|off]`（唯一写同意状态的入口，工具/面板共用）
+- `/dmem migrate mode=strip confirm=true`（破坏性，先导出）
+- `/dmem pause|resume`（捕获开关；`memory=off` 时捕获恒停）
 
 ## 10. 配置项
 
@@ -333,12 +342,16 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
-| `node test.mjs` | 51 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint | ✅ 51/51 |
-| `node test-host.mjs` | 16 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源） | ✅ 16/16 |
-| `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ❌ 需要本机记忆库 |
+| `node test.mjs` | 52 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint。**不含 dsh-go 断言**（`grep dshGo test.mjs` 为 0） | ✅ 52/52 |
+| `node test-host.mjs` | 170 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截）。**同样不含 dsh-go 断言** | ✅ 170/170 |
+| `node ui/verify-client.mjs` | Web 面板静态契约（槽位、命令白名单、文案、效果上限） | ✅ 10/10 |
+| `node ui/verify-dshgo.mjs` | **dsh-go 的唯一校验来源**：静态检查 manifest/长度/id/placement/view 节点与深度/32KiB/效果上限/toggle→命令映射/locale 对齐，**解析视图树断言每个注册 action 可达**（删按钮会 FAIL），并 import 面板纯函数做断言 | ✅ 46 PASS + 1 INFO（无 kit/App，非端到端） |
+| `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ✅ 本机 9/10、MRR 0.750、FP 1/8 |
+| `node eval.mjs --min-coverage 0.6` | 同上，按 coverage 门控重分类低置信标签 | ✅ FP 0/8 |
+| `node eval.mjs --fixture` | 合成数据（CI 可跑，5 正 / 2 负） | ✅ 5/5、FP 0/2 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
-作者本机数据（2103 条记忆）：v1.11.0 起正样本 `10/10, MRR 0.883`，8 条负样本误报 `0/8`；v1.12.0 保持同一基线。bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
+作者本机数据（约 2141 条索引记录、0 条明文）：v1.11.0 全文明文基线为正样本 `10/10, MRR 0.883`；v2.1 剥离原文并按评测标签迁移后为 `9/10, MRR 0.750`（未迁移标签时表观 `7/10, MRR 0.600`），`--min-coverage 0.6` 时误报 `0/8`。剩余 1 条真实损失是摘要截断导致的覆盖缺口（`部署 公网 首页 200`）。bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
 
 **解读这些数字时请注意 K3**：10 条正样本仍小，权重（impression 0.05、phrase 3 等）是在同一批数据上调的；负样本也只有 8 条。`10/10` 是乐观上界，不是泛化结论。P3-1 会把评测集扩到 30+ 条并按 dev/test 划分。
 
@@ -554,12 +567,84 @@ v1.12.3 可靠性（✅）─► v1.13 mention + 画像来源集合 + 冻结评�
 
 ---
 
-## 15. 变更记录
+## 15. 面板与多端（v2.3 Web / v2.4 dsh-go）
 
-### 15.1 插件
+### 15.1 为什么需要两份面板
+
+| 端 | 载体 | 能看到的入口 |
+|---|---|---|
+| Web / 桌面 | `client.js`（`dsh.client.platform = web`） | 输入框 dock 的「记忆面板」（`conversation.input.dock` 槽位） |
+| dsh-go 手机 App | `package.json` 的 `dshGo` 清单 + `index.js` 的 `ctx.inject(['dshGo'])` 声明式面板 | 对话详情→插件、全部功能、输入框插件胶囊（`session.tab` / `features` / `chat.panel`） |
+| CLI | 无面板 | `/dmem` 命令 |
+
+dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**，所以 v2.3.0 的 `client.js` 在手机上看不到；v2.4.0 另加一份原生贡献。
+
+### 15.2 dsh-go 清单（`package.json`）
+
+```jsonc
+{
+  "version": "2.4.0",
+  "main": "index.js",
+  "dshGo": {
+    "v": 1,
+    "title": { "zh": "记忆", "en": "Memory" },
+    "icon": "settings",
+    "wants": [],
+    "contributes": {
+      "panels": [{
+        "id": "memory-settings",
+        "title": { "zh": "记忆设置", "en": "Memory settings" },
+        "icon": "settings",
+        "placement": ["session.tab", "features", "chat.panel"],
+        "presentation": "page"
+      }]
+    }
+  }
+}
+```
+
+- `minApp` 省略：本机无 kit/template，App 版本格式无法验证（bridge 0.4.0 是桥接版本，不是 App 版本号）。
+- `wants: []`：面板不读剪贴板/输入框/消息；`dsh.client.platform` 仍为 `web`，`dsh.bundle.patch` 与 `exports["./client"]` 保留，Web 面板行为不变。
+
+### 15.3 注册与数据边界
+
+- `ctx.inject(['dshGo'], …)`：只有手机 App 引擎提供 `dshGo` 服务时才执行；桌面/Web/CLI 下不注册（no-op）。
+- 只读快照 `dshGoSnapshot()`：`consentStatus()`、`storageState`、`rowsById.size`、`countPlaintextRows()`、上次注入 `chars`；无会话快照时回退最近一次。**不新开网络、不额外读文件、不依赖 agent**。
+- 写入**只走命令**：toggle → `/dmem consent …`；导出 → `/dmem export`；暂停/恢复 → `/dmem pause|resume`。actions 只返回声明式 effect（command/copy/toast，≤4），不直接写 storage。
+
+### 15.4 面板能力与视图
+
+- 存储健康：storage（durable/memory）、索引条数、`plaintextRows`、上次注入字符（无则 `—`）。
+- C1–C4：显示状态并切换；profile 按 `unified → situational → off → unified` 循环。
+- 导出；复制 stats（`storage=… exchanges=… plaintextRows=… injectedChars=… consent=…`）；同意说明 callout（只存本机/无遥测/敏感默认关）。
+- 视图为声明式 v2：`stack` + `keyValue` + `list` + `callout` + `actions`；文案取 `locale/messages.*.json` 的 `panel.*`（21 键，中英对齐，title ≤16 字）。约束：面板 ≤32 KiB、≤120 组件、≤8 层；效果 ≤4。
+- 面板内容：四个 C1–C4 开关行 + 五个按钮（暂停捕获、恢复捕获、导出、复制状态、同意说明），全部渲染且每个注册 action 都有可达入口（`ui/verify-dshgo.mjs` 交叉断言）。
+- 命令语法：memory 开关是 `/dmem consent on|off`（**不是** `consent memory …`）；inject/sensitive 才带键名；profile 走 `unified → situational → off` 循环。
+- **范围外**：多智能体记忆隔离（`memoryScope`）由 task-14 开发中，**不在 2.4.0 交付**。
+
+### 15.5 安装、生效与卸载
+
+- 清单改动自动重读；`index.js` 改动需 App「引擎」页重启引擎。
+- 若桥接只扫 `$DSH_HOME/dsh-go/plugins/` 而不走 profile 依赖发现：`dsh plugin --profile web add <包目录>`（发现规则**未确认**）。
+- 卸载：`dsh plugin --profile web remove @local/dynamic-memory`，再删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。
+- 回滚面板：重装 2.3.0（Web），或移除 `dshGo` 清单（App 入口消失，数据不动）。
+
+### 15.6 验证边界（必须写明）
+
+- 本机**无 dsh-go 真机、无 kit `check.mjs`**：**未在 App 实测**渲染、点击、重载保持。
+- 只有静态校验：`node ui/verify-dshgo.mjs` 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**；该脚本会解析视图树并 import 面板纯函数，但 `test.mjs`/`test-host.mjs` 里 `dshGo` 出现次数为 0）；`node ui/verify-client.mjs` 10 PASS；单测 52 + 170（不含 dsh-go 断言）；`node eval.mjs --fixture` 通过。
+- spec §6 三个接口（同包双身份是否双加载、发现规则、`scope.sessionId` 在 placement 下是否有值）仍需真机确认。
+
+## 16. 变更记录
+
+### 16.1 插件
 
 | 版本 | 内容 |
 |---|---|
+| 2.4.0 | dsh-go 原生记忆面板：`package.json` 加 `main: index.js` + `dshGo`（v1、`memory-settings`、`session.tab`/`features`/`chat.panel`、presentation page、title 中英、icon settings、`wants: []`、`minApp` 省略）；`index.js` 用 `ctx.inject(['dshGo'])` 注册只读快照 + 声明式 v2 视图，写路径只发 `/dmem consent|pause|resume|export`，五个按钮齐全（暂停/恢复/导出/复制/同意说明）；新增 `ui/verify-dshgo.mjs`（46 PASS + 1 INFO）作为 dsh-go 的唯一校验（test.mjs/test-host 仍为 52/170，不含 dsh-go 断言）。**未在真机 dsh-go 验证**（无 kit/App），见 §15.6 |
+| 2.3.0 | Web/桌面记忆面板：`client.js` 挂在 `conversation.input.dock`（状态/搜索/画像/暂停恢复/C1–C4/导出，全部走 `/dmem`）；`package.json` 加 `exports["./client"]` 与 `dsh.client`；`ui/verify-client.mjs` 10 PASS；live client inspect 确认槽位占位 |
+| 2.2.1 | consent 加固：`memory=off` 拒绝显式写入（observe/learn/deepen/correct）；consent 行加 `schemaVersion=1` + v0 迁移；文档同步（测试 52+170、eval 9/10 MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5） |
+| 2.2.0 | C1-C4 同意开关 + `/dmem consent`（持久化、重载保留、真机验证）；`digestCount` 改真实注入快照；eval 标签迁移与 `--min-coverage` 门控（9/10、MRR 0.750、FP 0/8） |
 | 2.0.1 | 文档发布版：补齐 v2.0 多语言/开放预设章节、配置项（locale/facets/assistantFacets/capture）、测试数（51 + host 16）、路线状态；README.zh-CN 重写；CHANGELOG 更新 |
 | 2.0.0 | 运行时国际化（locale/messages 包，auto 按会话语言）、词表/短语/停用词数据化、语言中立分词回退、facet 可配置、README 英文主版本 + 中文翻译；测试 49 → 51 |
 | 1.14.0 | 画像版本来源绑定（不跨版本累积，旧版本来源存入 history）；`mention` 披露策略（proactive/if_asked/never，默认由 sensitivity+scope+type 派生）；`reflect` 巩固草稿（≥3 会话，proposed 不注入）+ `review`；`recompute`；`duplicates` 跨层重复报告；eval 增加 calibration 分桶；测试 45 → 49；host fixture 16 项 |
@@ -571,8 +656,9 @@ v1.12.3 可靠性（✅）─► v1.13 mention + 画像来源集合 + 冻结评�
 | 1.10.0 | 评审修复：置信度在得分序上计算；lint 校验真实来源 id；矛盾只统计双方 current；`forget` 清理悬空引用并恢复被纠正的原观察；画像 `sourceObservationIds` 与 `needsRecompute`；观察/画像注入门控与“纠正 → 自述 → 事实 → 推断”排序；检索不再抬高 importance 并加入闲置衰减；BM25 按查询归一化，recency 按时间意图加权，impression 降为 tie-breaker；`timeBoost` 默认 0.8 → 0.4；测试 27 → 31 项 |
 | 1.9.0 | 证据层、身份连续性、回收区、间隔检测、置信度检索 |
 
-### 15.2 本文档
+### 16.2 本文档
 
+- 2.4.0：版本头 2.4.0；第 1 章文件清单加 `client.js`/`ui/verify-*.mjs`/`test-host.mjs`；第 9 章补 consent/migrate/pause/resume；第 12 章更新为 52+170、面板静态校验与 v2.1 后评测数字（9/10、MRR 0.750、gate 0.6 时 FP 0/8）；新增第 15 章「面板与多端」；变更记录顺延为第 16 章并补 2.2.0–2.4.0；
 - 1.12.3：版本头、第 14 章替换为合并版路线（发布渠道、技术原则、v1.12.3 → v1.14）、0.1 增加“记忆越丰富，认知越审慎”、文件清单与评测说明改为本地数据 + fixture、15 同步；
 - 1.12.2：版本头、2.3（facet 键名与显示标签的差异、助手喜好去重）、2.4（印证引文与复习锚点）、4.1/7（锚点）、6（psychology 需来源、评测草稿）、12（45 项、eval-drafts）、13.1（K12/K13）、14、15 同步；
 - 1.12.1：版本头、2.4（`lastCorroboratedAt`）、4.1（TTL 锚点与印证）、7（TTL 行）、12（43 项）、13.1（K9–K11）、14（P1-2 状态）、15 同步；
