@@ -664,16 +664,22 @@ function rowEntities(row) {
 // `rankVersion` (the plugin's data epoch) forces a rebuild when a row changed even if the
 // caller reuses its array. Row text changes bump the epoch through invalidateRow().
 let rankDataEpoch = 0;
+let rankEditEpoch = 0;
 export function currentRankEpoch() {
   return rankDataEpoch;
+}
+/** Bumped only by content edits: the index may append new rows, but must rebuild on edits. */
+export function currentRankEditEpoch() {
+  return rankEditEpoch;
 }
 export function bumpRankEpoch() {
   rankDataEpoch += 1;
 }
-function invalidateRow(row) {
+export function invalidateRow(row) {
   tokenCache.delete(row);
   entityCache.delete(row);
-  bumpRankEpoch();
+  rankEditEpoch += 1;
+  rankDataEpoch += 1;
 }
 
 const RANK_POOL_CACHE_LIMIT = 64;
@@ -789,20 +795,25 @@ function appendRankIndex(index, rows) {
   return index;
 }
 const rankIndexCache = new WeakMap();
-function rankIndexFor(rows, version) {
+function rankIndexFor(rows, version, editVersion) {
   let entry = rankIndexCache.get(rows);
   if (!entry) {
-    entry = { version: version === undefined ? null : version, index: buildRankIndex(rows) };
+    entry = { version: version === undefined ? null : version, editVersion: editVersion === undefined ? null : editVersion, index: buildRankIndex(rows) };
     rankIndexCache.set(rows, entry);
     return entry.index;
   }
   if (version === undefined || entry.version === version) return entry.index;
   const previous = entry.index;
-  // Append-only when every previously indexed position still holds the same row object.
-  const canAppend = rows.length >= previous.size
+  // Append-only when no content edit happened and every previously indexed position still
+  // holds the same row object. Edits (deepen/repair/archive/delete/restore) bump the edit
+  // epoch and force a full rebuild.
+  const editsSinceBuild = editVersion !== undefined && entry.editVersion !== editVersion;
+  const canAppend = !editsSinceBuild
+    && rows.length >= previous.size
     && previous.rowRefs.every((row, position) => rows[position] === row);
   entry.index = canAppend ? appendRankIndex(previous, rows) : buildRankIndex(rows);
   entry.version = version;
+  if (editVersion !== undefined) entry.editVersion = editVersion;
   return entry.index;
 }
 /** Candidate-pool totals (count/sum length) per filter signature; cached per index. */
@@ -894,7 +905,7 @@ export function rankExchanges(rows, options = {}) {
   };
 
   const empty = { matches: [], total: 0, sort, searchedTerms: terms.slice(0, 24), timeWindow: { from: from ?? null, to: to ?? null } };
-  const index = rankIndexFor(rows, options.rankVersion);
+  const index = rankIndexFor(rows, options.rankVersion, options.rankEditVersion);
   const pool = rankPoolStats(index, rows, options, from, to);
   if (!pool.count) return empty;
   const avgLength = pool.sumLength / pool.count;
@@ -3052,10 +3063,11 @@ async function start(ctx, config) {
   const rankSnapshots = new Map();
   const rankRowsFor = policy => {
     const epoch = currentRankEpoch();
+    const editEpoch = currentRankEditEpoch();
     const key = String(policy && policy.scopeId ? policy.scopeId : '*');
     let snapshot = rankSnapshots.get(key);
     if (!snapshot) {
-      snapshot = { epoch: -1, rows: [] };
+      snapshot = { epoch: -1, editEpoch: -1, rows: [] };
       rankSnapshots.set(key, snapshot);
     }
     if (snapshot.epoch !== epoch) {
@@ -3063,6 +3075,7 @@ async function start(ctx, config) {
       snapshot.rows.length = 0;
       for (const row of nextRows) snapshot.rows.push(row);
       snapshot.epoch = epoch;
+      snapshot.editEpoch = editEpoch;
     }
     return snapshot;
   };
@@ -3078,6 +3091,7 @@ async function start(ctx, config) {
     const scopedRows = snapshot.rows;
     const ranked = rankExchanges(scopedRows, {
       rankVersion: snapshot.epoch,
+      rankEditVersion: snapshot.editEpoch,
       query,
       from: args.from,
       to: args.to,
@@ -4380,7 +4394,7 @@ async function start(ctx, config) {
           for (const agent of setups.keys()) {
             try {
               const snapshot = rankRowsFor(policyForAgent(agent));
-              rankExchanges(snapshot.rows, { query: 'memory 记忆 任务', limit: 1, rankVersion: snapshot.epoch });
+              rankExchanges(snapshot.rows, { query: 'memory 记忆 任务', limit: 1, rankVersion: snapshot.epoch, rankEditVersion: snapshot.editEpoch });
             } catch {
               // one agent scope failing warmup must not block the others
             }
