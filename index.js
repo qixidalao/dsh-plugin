@@ -356,11 +356,13 @@ const DOMAIN_SPEC = {
 
 const TOOL = {
   name: 'dynamic_memory',
-  description: 'Cross-session memory: search/recent/entities (retrieval), deepen/learn/portrait (write/read), observe/correct/observations/contradict (evidence layer), identity (continuity evidence), reflect/review/recompute/duplicates, archive/restore/export/stats/index/repair/forget. search returns compact snippets with confidence; use full=true to quote. Details in README.',
+  description: 'Cross-session memory: search/recent/entities (retrieval), deepen/learn/portrait (write/read), observe/correct/observations/contradict (evidence layer), identity (continuity evidence), reflect/review/recompute/duplicates, archive/restore/export/stats/index/repair/forget/migrate. search returns compact snippets with confidence; use full=true to quote. Details in README.',
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates'] },
+      action: { type: 'string', enum: ['recent', 'search', 'deepen', 'forget', 'portrait', 'learn', 'stats', 'entities', 'export', 'index', 'repair', 'migrate', 'archive', 'restore', 'identity', 'observe', 'correct', 'observations', 'contradict', 'reflect', 'review', 'recompute', 'duplicates'] },
+      mode: { type: 'string', enum: ['strip'], description: 'For migrate: only mode=strip is supported; it removes legacy plaintext (user/assistant) while keeping summary, keywords, entities, textHash and pointer.' },
+      confirm: { type: 'boolean', description: 'For migrate: must be true. The destructive strip runs only after an export file is written to the export path.' },
       query: { type: 'string', description: 'Search keywords; several words are scored together.' },
       id: { type: 'string', description: 'Exchange id from a recent or search result.' },
       summary: { type: 'string', description: 'Concise impression: what the user wanted, what was done, the reply, and durable details.' },
@@ -1744,12 +1746,20 @@ async function start(ctx, config) {
     };
   };
 
+  /**
+   * Rebuild index metadata for rows that have no plaintext user text.
+   * v2.1 stores rows index-only (user/assistant empty, summary/hash/pointer kept), so the
+   * session text recovered here must never be written back onto the row: it is used only
+   * to rebuild keywords/entities. Rows with no recoverable session text are skipped and
+   * reported, never hidden.
+   */
   const repairMissingUser = async (limit) => {
     if (!sessionQuery) return { error: 'session query service is unavailable' };
     const targets = [...rowsBySession.entries()]
       .filter(([, list]) => list.some(row => !cleanUserText(row.user)))
       .slice(0, Math.max(1, Math.min(20, limit)));
     let repaired = 0;
+    let skipped = 0;
     let sessions = 0;
     const details = [];
     for (const [sessionId, list] of targets) {
@@ -1783,6 +1793,7 @@ async function start(ctx, config) {
       sessions += 1;
       let matchedHere = 0;
       let missingHere = 0;
+      let skippedHere = 0;
       for (const row of list) {
         if (cleanUserText(row.user)) continue;
         missingHere += 1;
@@ -1797,25 +1808,73 @@ async function start(ctx, config) {
           }
           match = best ? best.entry : undefined;
         }
-        if (!match || !match.user) continue;
+        if (!match || !match.user) {
+          skippedHere += 1;
+          skipped += 1;
+          continue;
+        }
         matchedHere += 1;
-        row.user = match.user;
-        row.keywords = [...new Set([...keywordsOf(row.user, row.assistant), ...row.keywords])].slice(0, MAX_KEYWORDS);
-        row.entities = [...new Set([...entitiesOf(row.user, row.assistant), ...row.entities])].slice(0, MAX_ENTITIES);
+        // In-memory only: recover index metadata from the stored summary plus the session
+        // prompt. Plaintext is deliberately not copied onto the row (plaintextRows stays 0).
+        const recovered = String(row.summary || '').trim();
+        const source = recovered ? `${recovered}\n${match.user}` : match.user;
+        row.user = '';
+        row.assistant = '';
+        row.keywords = [...new Set([...keywordsOf(source), ...(row.keywords || [])])].slice(0, MAX_KEYWORDS);
+        row.entities = [...new Set([...entitiesOf(source), ...(row.entities || [])])].slice(0, MAX_ENTITIES);
         invalidateRow(row);
         repaired += 1;
         await persist(row).catch(() => {});
       }
-      details.push({ sessionId, responses: responses.length, missing: missingHere, matched: matchedHere });
+      details.push({ sessionId, responses: responses.length, missing: missingHere, matched: matchedHere, skipped: skippedHere });
     }
-    return { repaired, sessions, details: details.slice(0, 8) };
+    return {
+      repaired,
+      skipped,
+      sessions,
+      plaintextRows: 0,
+      note: 'Index-only repair: keywords/entities rebuilt from summary + session prompt; user/assistant plaintext is never written back.',
+      details: details.slice(0, 8),
+    };
   };
 
   const HYDRATION_TIME_WINDOW_MS = 5000;
-  const distinctPairs = pairs => {
+  const flatPair = pair => `${String(pair.user || '').replace(/\s+/g, '')}\n${String(pair.assistant || '').replace(/\s+/g, '')}`;
+  /**
+   * Deduplicate complete user/assistant pairs, never the user prompt alone: two turns can
+   * repeat the same short prompt ("继续") with different replies, and collapsing them by
+   * user would silently return the wrong turn. Identical pairs at different times are the
+   * same text, so the copy nearest the stored row time is kept as the time tiebreak.
+   */
+  const distinctPairs = (pairs, target = 0) => {
     const seen = new Map();
-    for (const pair of pairs) if (!seen.has(pair.user)) seen.set(pair.user, pair);
+    for (const pair of pairs) {
+      const key = flatPair(pair);
+      const current = seen.get(key);
+      if (!current) {
+        seen.set(key, pair);
+        continue;
+      }
+      if (target && pair.at && current.at && Math.abs(pair.at - target) < Math.abs(current.at - target)) seen.set(key, pair);
+    }
     return [...seen.values()];
+  };
+  /** Return the single candidate closest to the row time, or null when the nearest is tied. */
+  const nearestByTime = (candidates, target) => {
+    if (!target) return null;
+    let best = null;
+    let tied = false;
+    for (const candidate of candidates) {
+      if (!candidate.at) continue;
+      const distance = Math.abs(candidate.at - target);
+      if (best === null || distance < best.distance) {
+        best = { candidate, distance };
+        tied = false;
+      } else if (distance === best.distance) {
+        tied = true;
+      }
+    }
+    return best && !tied ? best.candidate : null;
   };
 
   /**
@@ -1889,7 +1948,7 @@ async function start(ctx, config) {
     const pairs = pairsFromEvents(Array.isArray(read?.events) ? read.events : []);
     if (!pairs.length) throw new Error(`session ${sessionId} has no complete user/assistant pair`);
     if (storedHash) {
-      const byHash = distinctPairs(pairs.filter(pair => hashText(`${pair.user}\n${pair.assistant}`) === storedHash));
+      const byHash = distinctPairs(pairs.filter(pair => hashText(`${pair.user}\n${pair.assistant}`) === storedHash), target);
       if (byHash.length === 1) return { user: byHash[0].user, assistant: byHash[0].assistant };
       if (byHash.length > 1) throw new Error(`ambiguous hash match (${byHash.length} candidates) in session ${sessionId}`);
     }
@@ -1902,7 +1961,7 @@ async function start(ctx, config) {
       const candidates = distinctPairs(pairs.filter(pair => {
         const combined = `${pair.user}${pair.assistant}`.replace(/\s+/g, '');
         return combined.startsWith(needle) && combined.length >= needle.length;
-      }));
+      }), target);
       if (candidates.length === 1) return { user: candidates[0].user, assistant: candidates[0].assistant };
       if (candidates.length > 1) {
         const near = candidates.filter(pair => target && pair.at && Math.abs(pair.at - target) <= HYDRATION_TIME_WINDOW_MS);
@@ -1979,11 +2038,16 @@ async function start(ctx, config) {
       throw new Error(`ambiguous summary-content match (${byContains.length} candidates) in session ${sessionId}`);
     }
     // Last resort for rows whose stored hash/summary no longer agree with the session:
-    // only an unambiguous time-window candidate is used, and its text is cleaned like
-    // every other hydration path.
-    const byTime = distinctPairs(pairs.filter(pair => target && pair.at && Math.abs(pair.at - target) <= HYDRATION_TIME_WINDOW_MS));
+    // only a candidate whose text stays unambiguous is used. Repeated prompts ("继续")
+    // are distinct turns when their replies differ, so the row time must single one out;
+    // a tie keeps the explicit failure instead of guessing.
+    const byTime = distinctPairs(pairs.filter(pair => target && pair.at && Math.abs(pair.at - target) <= HYDRATION_TIME_WINDOW_MS), target);
     if (byTime.length === 1) return { user: byTime[0].user, assistant: byTime[0].assistant };
-    if (byTime.length > 1) throw new Error(`ambiguous time-window match (${byTime.length} candidates) in session ${sessionId}`);
+    if (byTime.length > 1) {
+      const nearest = nearestByTime(byTime, target);
+      if (nearest) return { user: nearest.user, assistant: nearest.assistant };
+      throw new Error(`ambiguous time-window match (${byTime.length} candidates) in session ${sessionId}`);
+    }
     throw new Error(`no matching user message in session ${sessionId} (${pairs.length} candidates)`);
   };
 
@@ -2887,7 +2951,7 @@ async function start(ctx, config) {
             await dropExchangeReferences(row.id);
             return { forgotten: row.id, referencesCleared: true };
           }
-          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, entities or export.' };
+          return { error: 'Unknown action; expected recent, search, deepen, forget, portrait, learn, stats, entities, export, index, repair, migrate or archive.' };
         },
       });
       return () => {
@@ -2957,7 +3021,10 @@ async function start(ctx, config) {
         ...result.matches.map((match, index) => `${index + 1}. ${new Date(match.time).toISOString().slice(0, 10)} 用户：${truncate(match.user || '（仅助手回复）', 80)}\n   印象：${truncate(match.summary || '—', 120)}`),
       ].join('\n');
     }
-    return commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture]';
+    const methods = commandMessages.methods || '用法：/dmem [stats|portrait|self|export|search <关键词>|pause|resume|capture|migrate]';
+    // Locale packs may not list the operator-only migrate action yet; keep it discoverable.
+    if (methods.includes('migrate')) return methods;
+    return `${methods}\n- migrate: mode=strip confirm=true（先导出全部印象，再移除旧明文 / exports first, then strips legacy plaintext）`;
   };
 
   const stopCommand = commands
@@ -2966,7 +3033,7 @@ async function start(ctx, config) {
           return commands.register({
             name: 'dmem',
             description: 'Inspect or export the dynamic memory store',
-            input: { hint: 'stats | portrait | self | export | search <关键词>' },
+            input: { hint: 'stats | portrait | self | export | search <关键词> | migrate (tool action: mode=strip confirm=true)' },
             handler: async invocation => {
               try {
                 return { kind: 'success', text: await commandText(invocation, invocation.rawInput) };
@@ -2983,10 +3050,13 @@ async function start(ctx, config) {
     : undefined;
   const commandName = stopCommand ? 'dmem' : null;
 
+  // Index-only rows (v2.1) keep no plaintext user text, so digest eligibility comes from
+  // the stored summary: a non-empty summary is required, the current session is excluded
+  // and archived rows stay hidden. Relevance is computed from the summary in renderContext.
   const digestRows = currentSessionId => {
     if (!digestImpressions) return [];
     return [...rowsById.values()]
-      .filter(row => row.summary && !row.archivedAt && row.sessionId !== currentSessionId && cleanUserText(row.user))
+      .filter(row => String(row.summary || '').trim() && !row.archivedAt && row.sessionId !== currentSessionId)
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, digestImpressions);
   };

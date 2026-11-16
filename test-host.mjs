@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // In-memory mock host fixture: exercises the plugin lifecycle without a real Harness.
 // Covers: durable open, prompt/tool registration, session capture, dispose ordering
-// (in-flight writes are awaited before the domain closes), restart recovery, and
-// index-only hydration from fake local sessions (metadata cleaning + explicit failures).
+// (in-flight writes are awaited before the domain closes), restart recovery, migrate
+// schema/command discovery, index-only hydration from fake local sessions (metadata
+// cleaning, repeated-prompt disambiguation + explicit failures), the summary-based
+// cross-session digest, and repair that never writes plaintext back.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { apply, extractiveSummary } from './index.js';
@@ -145,6 +147,15 @@ await new Promise(resolve => setTimeout(resolve, 5));
 equal(host.tools.length, 1, 'tool registered');
 equal(host.prompts.length, 1, 'system prompt registered');
 equal(host.commands.length, 1, 'command registered');
+
+// The migrate action exists in the handler but must also be reachable through the tool
+// schema (additionalProperties=false would otherwise reject mode/confirm).
+const actionSchema = host.tools[0].parameters.properties;
+ok(actionSchema.action.enum.includes('migrate'), 'migrate is accepted by the action enum');
+ok(actionSchema.mode && actionSchema.mode.enum.includes('strip'), 'migrate mode=strip is described');
+ok(actionSchema.confirm && actionSchema.confirm.type === 'boolean', 'migrate confirm is described');
+const commandHelp = await host.commands[0].handler({ agent: host.agent, rawInput: 'unknown-command' });
+matches(commandHelp.text, /migrate/, '/dmem command list mentions migrate');
 
 const before = storage.order.length;
 host.emit('session-fixture', { type: 'user/message', data: message('fixture 用户问题：部署 example.com') });
@@ -445,5 +456,123 @@ ok(tailMatch, 'older-capture row is searchable');
 equal(tailMatch && tailMatch.sourceAvailable, true, 'summary tail recovers an earlier assistant message');
 equal(tailMatch && tailMatch.user, '继续', 'tail hydration keeps the short user text');
 equal(tailMatch && tailMatch.assistant, tailFirst, 'tail hydration returns the verified message, not the last one');
+
+// ---------------------------------------------------------------------------
+// Hydration (g): two turns repeat the exact prompt "继续" with different replies
+// and no usable hash/summary prefix. Only the row time can pick the turn, so the
+// pair dedupe must be user+assistant (not user alone) and a time tie must fail
+// explicitly instead of returning the wrong reply.
+// ---------------------------------------------------------------------------
+const repeatPairStorage = makeStorage();
+const repeatPairTime = Date.now() - 1200000;
+const repeatPairSession = {
+  session: { id: 'session-repeat-pair', cwd: null },
+  events: [
+    { type: 'user/message', time: repeatPairTime, data: message('继续') },
+    { type: 'turn/start', time: repeatPairTime, data: {} },
+    { type: 'assistant/message', time: repeatPairTime + 800, data: { message: message('第一条完全不同的回答内容甲') } },
+    { type: 'turn/end', time: repeatPairTime + 1000, data: {} },
+    { type: 'user/message', time: repeatPairTime + 2000, data: message('继续') },
+    { type: 'turn/start', time: repeatPairTime + 2000, data: {} },
+    { type: 'assistant/message', time: repeatPairTime + 2800, data: { message: message('第二条完全不同的回答内容乙') } },
+    { type: 'turn/end', time: repeatPairTime + 3000, data: {} },
+  ],
+};
+const repeatPairSeed = (id, time) => {
+  const row = indexOnlyRow({
+    id,
+    sessionId: 'session-repeat-pair',
+    time,
+    user: '继续',
+    assistant: '第二条完全不同的回答内容乙',
+  });
+  row.summary = '印象：以前部署完成，这次完全不同的问题需要继续排查';
+  row.textHash = hashText(`stale hash for ${id}`);
+  return row;
+};
+await seedRow(repeatPairStorage, repeatPairSeed('ex-repeat-near', repeatPairTime + 3000));
+await seedRow(repeatPairStorage, repeatPairSeed('ex-repeat-tie', repeatPairTime + 2000));
+const repeatPairHost = makeHost(repeatPairStorage, { sessionQuery: makeSessionQuery({ 'session-repeat-pair': repeatPairSession }) });
+apply(repeatPairHost.ctx, { autoIndexSessions: false, warmup: false });
+await new Promise(resolve => setTimeout(resolve, 5));
+const repeatPairFound = await repeatPairHost.tools[0].execute({ action: 'search', query: '完全不同 排查' });
+const nearMatch = repeatPairFound.matches.find(match => match.id === 'ex-repeat-near');
+const tieMatch = repeatPairFound.matches.find(match => match.id === 'ex-repeat-tie');
+ok(nearMatch && tieMatch, 'repeated-prompt rows are searchable');
+equal(nearMatch && nearMatch.sourceAvailable, true, 'time-unique repeated prompt hydrates');
+equal(nearMatch && nearMatch.user, '继续', 'repeated prompt keeps the exact user text');
+equal(nearMatch && nearMatch.assistant, '第二条完全不同的回答内容乙', 'time tiebreak returns the correct repeated turn');
+equal(tieMatch && tieMatch.sourceAvailable, false, 'equidistant repeated prompt stays ambiguous');
+equal(tieMatch && tieMatch.user, '', 'ambiguous repeated prompt returns no user text');
+equal(tieMatch && tieMatch.assistant, '', 'ambiguous repeated prompt returns no assistant text');
+matches(tieMatch && tieMatch.hydrationError, /ambiguous time-window match/, 'time tie is reported as ambiguous');
+
+// ---------------------------------------------------------------------------
+// Digest (index-only): no row carries plaintext user text anymore, so the
+// injected cross-session digest must be built from summaries. A current-session
+// prompt that overlaps a stored summary must render that summary.
+// ---------------------------------------------------------------------------
+const digestStorage = makeStorage();
+const digestUser = '继续修复部署 example.com 的注入问题并给出验证结果';
+const digestReply = '注入问题已修复，复验通过';
+const digestSeed = indexOnlyRow({
+  id: 'ex-digest',
+  sessionId: 'session-other',
+  time: Date.now() - 60000,
+  user: digestUser,
+  assistant: digestReply,
+});
+digestSeed.summary = '部署 example.com 的注入问题已修复并复验通过';
+await seedRow(digestStorage, digestSeed);
+const digestHost = makeHost(digestStorage);
+apply(digestHost.ctx, { autoIndexSessions: false, warmup: false, capture: true });
+await new Promise(resolve => setTimeout(resolve, 5));
+digestHost.emit('session-fixture', { type: 'user/message', data: message(digestUser) });
+const digestStats = await digestHost.tools[0].execute({ action: 'stats' });
+ok(digestStats.injection && digestStats.injection.digestCount >= 1, 'stats counts index-only rows in the digest');
+const injected = digestHost.prompts[0].text({ scope: { id: 'session-fixture' } });
+matches(injected, /记忆速览|Memory digest/, 'digest section is injected');
+ok(injected.includes('部署 example.com 的注入问题'), 'injected digest contains the stored summary');
+await digestHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Repair (index-only): rebuilding missing user text must not write plaintext
+// back into the store. Keywords/entities are refreshed from the summary and the
+// session prompt stays in memory only, so plaintextRows remains 0.
+// ---------------------------------------------------------------------------
+const repairStorage = makeStorage();
+const repairTime = Date.now() - 300000;
+const repairUser = '修复部署 example.com 的注入问题';
+const repairAssistant = '注入问题已修复，复验通过';
+const repairSession = {
+  session: { id: 'session-repair', cwd: null },
+  events: [
+    { type: 'user/message', time: repairTime, data: message(repairUser) },
+    { type: 'turn/start', time: repairTime, data: {} },
+    { type: 'assistant/message', time: repairTime + 1000, data: { message: message(repairAssistant) } },
+    { type: 'turn/end', time: repairTime + 1500, data: {} },
+  ],
+};
+await seedRow(repairStorage, indexOnlyRow({
+  id: 'ex-repair',
+  sessionId: 'session-repair',
+  time: repairTime + 1500,
+  user: repairUser,
+  assistant: repairAssistant,
+}));
+const repairHost = makeHost(repairStorage, { sessionQuery: makeSessionQuery({ 'session-repair': repairSession }) });
+apply(repairHost.ctx, { autoIndexSessions: false, warmup: false });
+await new Promise(resolve => setTimeout(resolve, 5));
+const repaired = await repairHost.tools[0].execute({ action: 'repair', limit: 5 });
+ok(repaired.repaired >= 1, 'repair rebuilt index metadata for the index-only row');
+equal(repaired.plaintextRows, 0, 'repair reports no plaintext rows');
+const repairStats = await repairHost.tools[0].execute({ action: 'stats' });
+equal(repairStats.plaintextRows, 0, 'repair leaves plaintextRows at 0');
+equal(repairStats.missingUser, 1, 'row still has no plaintext user text');
+const repairedRow = [...repairStorage.tables.get('exchanges').values()].find(row => row.id === 'ex-repair');
+equal(repairedRow.user, '', 'repair does not restore user plaintext');
+equal(repairedRow.assistant, '', 'repair does not restore assistant plaintext');
+ok(repairedRow.keywords.length > 0, 'repair recovered keywords');
+ok(repairedRow.entities.includes('example.com'), 'repair recovered entities');
 
 console.log(`host fixture: ${checks} checks passed`);
