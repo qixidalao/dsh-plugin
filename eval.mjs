@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 // Offline retrieval evaluation.
 // Usage: node eval.mjs [--dir <exchanges dir>] [--k 3] [--queries <file>] [--fixture]
-//                      [--label-fields user,assistant,summary,keywords,entities] [--min-coverage 0.6]
+//                      [--split dev|test|all] [--label-fields user,assistant,summary,keywords,entities]
+//                      [--min-coverage 0.6]
 // Real evaluation data stays local (eval-queries.local.json, gitignored); the synthetic
 // fixture (eval-queries.fixture.json) is used by CI and when no local file exists.
 //
-// Labels: a query can carry `expectContains` (matched against `--label-fields`, default all
-// retained fields, so summary-only rows after the plaintext strip remain scoreable) and/or an
-// `expectedId` / `expectedIds` list (matched by row id, for labels whose literal wording the
-// strip removed). `expectIn` overrides `--label-fields` per query.
+// Labels: a query can carry an `expectedId` / `expectedIds` list (matched by row id — the
+// ground truth is fixed from the pre-strip full-text backup, so it cannot self-confirm against
+// the indexed fields) and/or `expectContains` (matched against `--label-fields`, default all
+// retained fields). `expectIn` overrides `--label-fields` per query.
+//
+// `--split dev|test|all` filters queries by their `split` field (default `all`; a query without
+// a split is treated as `test`). Keep weight experiments on `dev`; never tune on `test`.
+// The committed `--fixture` suite is synthetic and split-neutral.
 //
 // `--min-coverage N` reclassifies a medium/high confidence label as low when the reported
 // query coverage is below N. It only changes the false-positive/calibration reporting; ranking
@@ -31,6 +36,11 @@ const labelFields = (valueOf('--label-fields') || 'user,assistant,summary,keywor
   .split(',')
   .map(field => field.trim())
   .filter(Boolean);
+const split = valueOf('--split') || 'all';
+if (!['all', 'dev', 'test'].includes(split)) {
+  console.error(`--split must be one of all|dev|test (got ${split})`);
+  process.exit(2);
+}
 const minCoverage = Number(valueOf('--min-coverage'));
 const coverageGate = Number.isFinite(minCoverage) && minCoverage > 0 ? minCoverage : 0;
 
@@ -72,7 +82,8 @@ const localQueries = new URL('./eval-queries.local.json', import.meta.url);
 const fixtureQueries = new URL('./eval-queries.fixture.json', import.meta.url);
 const explicitQueries = valueOf('--queries');
 const queriesPath = explicitQueries || (fixtureMode ? fixtureQueries : (existsSync(localQueries) ? localQueries : fixtureQueries));
-const queries = JSON.parse(readFileSync(queriesPath, 'utf8'));
+const queries = JSON.parse(readFileSync(queriesPath, 'utf8'))
+  .filter(query => split === 'all' || (query.split || 'test') === split);
 const positives = queries.filter(query => !query.negative);
 const negatives = queries.filter(query => query.negative);
 
@@ -165,7 +176,7 @@ for (const query of negatives) {
 }
 
 const gateNote = coverageGate ? `, min-coverage: ${coverageGate}` : '';
-console.log(`memory rows: ${rows.length}${fixtureMode ? ' (fixture)' : ''}, positive: ${positives.length}, negative: ${negatives.length}, k=${k}, label-fields: ${labelFields.join('+')}${gateNote}`);
+console.log(`memory rows: ${rows.length}${fixtureMode ? ' (fixture)' : ''}, positive: ${positives.length}, negative: ${negatives.length}, k=${k}, split: ${split}, label-fields: ${labelFields.join('+')}${gateNote}`);
 console.log(lines.join('\n'));
 console.log('');
 const n = positives.length;
