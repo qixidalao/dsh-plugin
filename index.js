@@ -3047,20 +3047,22 @@ async function start(ctx, config) {
     }
   };
 
-  // Reuse one rows array per (epoch, memory scope): rankExchanges caches its inverted
-  // index by array identity, so unchanged data must not be re-filtered per query.
-  const rankSnapshots = { epoch: -1, byScope: new Map() };
+  // Reuse one mutable rows array per memory scope: rankExchanges caches its inverted
+  // index by array identity, so an epoch change can append new rows instead of rebuilding.
+  const rankSnapshots = new Map();
   const rankRowsFor = policy => {
     const epoch = currentRankEpoch();
-    if (rankSnapshots.epoch !== epoch) {
-      rankSnapshots.epoch = epoch;
-      rankSnapshots.byScope.clear();
-    }
     const key = String(policy && policy.scopeId ? policy.scopeId : '*');
-    let snapshot = rankSnapshots.byScope.get(key);
+    let snapshot = rankSnapshots.get(key);
     if (!snapshot) {
-      snapshot = { epoch, rows: visibleRows(policy) };
-      rankSnapshots.byScope.set(key, snapshot);
+      snapshot = { epoch: -1, rows: [] };
+      rankSnapshots.set(key, snapshot);
+    }
+    if (snapshot.epoch !== epoch) {
+      const nextRows = visibleRows(policy);
+      snapshot.rows.length = 0;
+      for (const row of nextRows) snapshot.rows.push(row);
+      snapshot.epoch = epoch;
     }
     return snapshot;
   };
