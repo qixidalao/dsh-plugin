@@ -3,7 +3,7 @@
   { "query": "缓存 失效", "expectContains": "缓存失效" },
   { "query": "登录 跳转", "expectContains": "登录后跳转" },
   { "query": "索引化 检索 摘要", "expectContains": "索引化检索只保留摘要" },
-  { "query": "Dropdown.vue", "expectContains": "dropdown.vue", "expectIn": ["entities"] },
+  { "query": "Dropdown.vue", "expectContains": "examplecomponent.vue", "expectIn": ["entities"] },
   { "query": "quantum 量子 纠错", "negative": true },
   { "query": "kubernetes ingress 证书", "negative": true }
 ]

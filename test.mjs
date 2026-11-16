@@ -41,7 +41,7 @@ const row = (overrides) => ({
 check('entities: host, dotted name, path, acronym', () => {
   const found = entitiesOf('部署到 https://example.com 后，用 ExampleComponent.vue 重建，路径 C:\\Users\\demo\\app，涉及 AIOS 与 WSL');
   assert.ok(found.includes('example.com'), 'host');
-  assert.ok(found.includes('dropdown.vue'), 'dotted');
+  assert.ok(found.includes('examplecomponent.vue'), 'dotted');
   assert.ok(found.includes('aios'), 'acronym');
   assert.ok(found.includes('wsl'), 'acronym 2');
 });

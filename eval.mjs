@@ -53,7 +53,7 @@ const synthRows = () => {
     { id: 'fixture-2', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 86400000, user: '缓存失效要怎么处理', assistant: '缓存失效时回源并重建', summary: '缓存失效处理', keywords: [], entities: [], importance: 0.5 },
     { id: 'fixture-3', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 2 * 86400000, user: '登录后没有跳转', assistant: '登录后跳转需要同步路由', summary: '登录跳转', keywords: [], entities: [], importance: 0.6 },
     { id: 'fixture-4', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 3 * 86400000, user: '', assistant: '', summary: '索引化检索只保留摘要与关键词', keywords: ['索引', '检索', '摘要', '关键词'], entities: [], importance: 0.7 },
-    { id: 'fixture-5', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 4 * 86400000, user: '', assistant: '', summary: '前端下拉框自适应修复', keywords: ['下拉', '拉框', '前端', '修复'], entities: ['dropdown.vue'], importance: 0.6 },
+    { id: 'fixture-5', sessionId: 'fixture', workspace: null, kind: 'episodic', time: now - 4 * 86400000, user: '', assistant: '', summary: '前端下拉框自适应修复', keywords: ['下拉', '拉框', '前端', '修复'], entities: ['examplecomponent.vue'], importance: 0.6 },
   ];
 };
 

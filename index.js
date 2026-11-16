@@ -725,15 +725,84 @@ function buildRankIndex(rows) {
   }
   const entityPostings = new Map();
   for (const [entity, list] of entityBuild) entityPostings.set(entity, Int32Array.from(list));
-  return { size: count, lengths, hasText, postings, entityPostings, poolCache: new Map() };
+  return { size: count, lengths, hasText, postings, entityPostings, poolCache: new Map(), rowRefs: rows.slice() };
+}
+/**
+ * Append newly added rows to an existing index in place (capture is append-mostly), so a
+ * normal turn does not rebuild a 50k-row index. Text edits/removals force a full rebuild.
+ */
+function appendRankIndex(index, rows) {
+  const previousSize = index.size;
+  const count = rows.length;
+  const lengths = new Int32Array(count);
+  lengths.set(index.lengths);
+  const hasText = new Uint8Array(count);
+  hasText.set(index.hasText);
+  const appendPosting = (term, rowIndex, tf) => {
+    const posting = index.postings.get(term);
+    if (!posting) {
+      index.postings.set(term, { docs: Int32Array.of(rowIndex), tfs: Uint8Array.of(tf) });
+      return;
+    }
+    const docs = new Int32Array(posting.docs.length + 1);
+    docs.set(posting.docs);
+    docs[posting.docs.length] = rowIndex;
+    const maxTf = posting.tfs instanceof Uint8Array ? 255 : posting.tfs instanceof Uint16Array ? 65535 : Number.MAX_SAFE_INTEGER;
+    let tfs;
+    if (tf <= maxTf) {
+      tfs = new posting.tfs.constructor(posting.tfs.length + 1);
+      tfs.set(posting.tfs);
+      tfs[posting.tfs.length] = tf;
+    } else {
+      tfs = Int32Array.from([...posting.tfs, tf]);
+    }
+    index.postings.set(term, { docs, tfs });
+  };
+  const appendEntity = (entity, rowIndex) => {
+    const posting = index.entityPostings.get(entity);
+    if (!posting) {
+      index.entityPostings.set(entity, Int32Array.of(rowIndex));
+      return;
+    }
+    const docs = new Int32Array(posting.length + 1);
+    docs.set(posting);
+    docs[posting.length] = rowIndex;
+    index.entityPostings.set(entity, docs);
+  };
+  for (let position = previousSize; position < count; position += 1) {
+    const row = rows[position];
+    if (!row || typeof row !== 'object' || !rowHasText(row)) continue;
+    hasText[position] = 1;
+    const tokens = tokensOf(cleanUserText(row.user), row.assistant, row.summary, (row.keywords || []).join(' '));
+    lengths[position] = Math.max(1, tokens.length);
+    for (const entity of rowEntities(row)) appendEntity(entity, position);
+    if (!tokens.length) continue;
+    const freq = new Map();
+    for (const token of tokens) freq.set(token, (freq.get(token) || 0) + 1);
+    for (const [term, tf] of freq) appendPosting(term, position, tf);
+  }
+  index.size = count;
+  index.lengths = lengths;
+  index.hasText = hasText;
+  index.rowRefs = rows.slice();
+  index.poolCache.clear();
+  return index;
 }
 const rankIndexCache = new WeakMap();
 function rankIndexFor(rows, version) {
   let entry = rankIndexCache.get(rows);
-  if (!entry || (version !== undefined && entry.version !== version)) {
+  if (!entry) {
     entry = { version: version === undefined ? null : version, index: buildRankIndex(rows) };
     rankIndexCache.set(rows, entry);
+    return entry.index;
   }
+  if (version === undefined || entry.version === version) return entry.index;
+  const previous = entry.index;
+  // Append-only when every previously indexed position still holds the same row object.
+  const canAppend = rows.length >= previous.size
+    && previous.rowRefs.every((row, position) => rows[position] === row);
+  entry.index = canAppend ? appendRankIndex(previous, rows) : buildRankIndex(rows);
+  entry.version = version;
   return entry.index;
 }
 /** Candidate-pool totals (count/sum length) per filter signature; cached per index. */
@@ -897,7 +966,8 @@ const recencyWeight = timeIntent ? 1 : 0.3;
       const norm = 1.2 * (1 - 0.75 + 0.75 * (length / avgLength));
       bm25 += idf * ((freq * 2.2) / (freq + norm));
     }
-    const matchedEntities = rowEntities(row).filter(entity => queryEntities.has(entity));
+    // Entity extraction is regex-heavy; skip it entirely when the query has no entities.
+    const matchedEntities = queryEntities.size ? rowEntities(row).filter(entity => queryEntities.has(entity)) : [];
     const entityHit = Math.min(3, matchedEntities.length);
     if (!matched && !entityHit) continue;
     const bm25n = (2.5 * bm25) / maxPossible;
