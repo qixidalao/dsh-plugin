@@ -873,7 +873,7 @@ export function confidenceFromScores(values, coverage = 1) {
  * Pure ranking function; also used by the offline evaluation script.
  * Options: query, from, to, sort, limit, kind, workspace, scope, now, timeBoost,
  * decayDays, phraseWeight, impressionWeight, entityWeight, importanceWeight,
- * includeSuperseded, entityIndex, touch.
+ * includeSuperseded, rankVersion, rankEditVersion, touch.
  */
 export function rankExchanges(rows, options = {}) {
   const query = String(options.query || '').trim();
