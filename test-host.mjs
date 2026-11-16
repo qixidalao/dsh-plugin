@@ -714,6 +714,7 @@ equal(consentOffStats.consent.memory, 'off', 'stats exposes the consent state');
 equal(consentOffStats.injection.digestReason, 'memory consent is off', 'stats explains the suppressed injection');
 await consentHost.dispose();
 ok(consentStorage.tables.get('consent').has('state'), 'consent state is written to durable storage');
+equal([...consentStorage.tables.get('consent').values()][0].schemaVersion, 1, 'persisted consent row carries schemaVersion');
 
 // Restart with the same storage: the persisted user choice wins over the defaults.
 const consentHost2 = makeHost(consentStorage);
@@ -847,5 +848,93 @@ const configOffStats = await configOffHost.tools[0].execute({ action: 'stats' })
 equal(configOffStats.exchanges, 0, 'config-off memory captures nothing');
 equal(configOffHost.prompts[0].text({ scope: { id: 'session-fixture' } }), '', 'config-off memory injects nothing');
 await configOffHost.dispose();
+
+// ---------------------------------------------------------------------------
+// Consent hardening: memory off must block explicit writes too (observe/learn/
+// deepen/correct), not only automatic capture. The persisted consent row carries a
+// schemaVersion so v0 rows (written before the field existed) migrate on read.
+// ---------------------------------------------------------------------------
+const writeBlockStorage = makeStorage();
+const writeBlockHost = makeHost(writeBlockStorage);
+apply(writeBlockHost.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const keptObs = await writeBlockHost.tools[0].execute({ action: 'observe', type: 'explicit_fact', content: '关闭前写入的观察' });
+ok(keptObs.id, 'observation written while memory consent is on');
+emitTurn(writeBlockHost, '关闭前记录的一轮对话', '关闭前写入的回复');
+await tick();
+const keptExchange = (await writeBlockHost.tools[0].execute({ action: 'recent', limit: 1 })).exchanges[0];
+ok(keptExchange && keptExchange.id, 'exchange captured while memory consent is on');
+await writeBlockHost.commands[0].handler({ agent: writeBlockHost.agent, rawInput: 'consent off' });
+const blockedObserve = await writeBlockHost.tools[0].execute({ action: 'observe', type: 'explicit_fact', content: '关闭后不该写入' });
+matches(blockedObserve.error, /memory consent is off: observe/, 'memory off rejects observe writes');
+const blockedLearn = await writeBlockHost.tools[0].execute({ action: 'learn', facet: 'habits', content: '关闭后不该写画像' });
+matches(blockedLearn.error, /memory consent is off: learn/, 'memory off rejects learn writes');
+const blockedDeepen = await writeBlockHost.tools[0].execute({ action: 'deepen', id: keptExchange.id, summary: '关闭后不该改印象' });
+matches(blockedDeepen.error, /memory consent is off: deepen/, 'memory off rejects deepen writes');
+const blockedCorrect = await writeBlockHost.tools[0].execute({ action: 'correct', id: keptObs.id, content: '关闭后不该纠正' });
+matches(blockedCorrect.error, /memory consent is off: correct/, 'memory off rejects correct writes');
+const blockedStats = await writeBlockHost.tools[0].execute({ action: 'stats' });
+equal(blockedStats.exchanges, 1, 'blocked writes do not add exchanges');
+equal(blockedStats.observations.current, 1, 'blocked writes do not add observations');
+const readOnlyRecent = await writeBlockHost.tools[0].execute({ action: 'recent', limit: 1 });
+equal(readOnlyRecent.total, 1, 'reads stay available while memory consent is off');
+await writeBlockHost.dispose();
+
+// A v0 consent row (no schemaVersion) must keep every value and migrate in place.
+const legacyConsentStorage = makeStorage();
+await legacyConsentStorage.domain.table('consent').put('state', {
+  memory: false,
+  inject: true,
+  profile: 'off',
+  sensitive: true,
+  updatedAt: Date.now() - 5000,
+});
+const legacyConsentHost = makeHost(legacyConsentStorage);
+apply(legacyConsentHost.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const legacyConsent = await legacyConsentHost.tools[0].execute({ action: 'consent' });
+equal(legacyConsent.consent.memory, 'off', 'legacy v0 row keeps its C1 value');
+equal(legacyConsent.consent.profile, 'off', 'legacy v0 row keeps its C3 value');
+equal(legacyConsent.consent.sensitive, 'on', 'legacy v0 row keeps its C4 value');
+equal(legacyConsent.consent.schemaVersion, 1, 'legacy v0 row is read as the current schema');
+const legacyStored = [...legacyConsentStorage.tables.get('consent').values()][0];
+equal(legacyStored.schemaVersion, 1, 'migrated v0 row is written back with schemaVersion');
+legacyConsentHost.emit('session-fixture', { type: 'user/message', data: message('旧数据迁移后仍然禁止写入') });
+legacyConsentHost.emit('session-fixture', { type: 'assistant/message', data: { message: message('不该写入') } });
+legacyConsentHost.emit('session-fixture', { type: 'turn/end', data: {} });
+await tick();
+equal((await legacyConsentHost.tools[0].execute({ action: 'stats' })).exchanges, 0, 'migrated legacy consent still blocks capture');
+const legacyWriteOff = await legacyConsentHost.tools[0].execute({ action: 'observe', type: 'explicit_fact', content: '旧数据下不该写入' });
+matches(legacyWriteOff.error, /memory consent is off/, 'migrated legacy consent still blocks explicit writes');
+await legacyConsentHost.dispose();
+const legacyConsentHost2 = makeHost(legacyConsentStorage);
+apply(legacyConsentHost2.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const reloadedConsent = await legacyConsentHost2.tools[0].execute({ action: 'consent' });
+equal(reloadedConsent.consent.memory, 'off', 'migrated consent survives the next restart');
+equal(reloadedConsent.consent.profile, 'off', 'migrated profile value survives the next restart');
+equal(reloadedConsent.consent.schemaVersion, 1, 'reloaded row stays on the current schema');
+await legacyConsentHost2.dispose();
+
+// A row from a newer build is read tolerantly (known fields only) and not rewritten.
+const futureConsentStorage = makeStorage();
+await futureConsentStorage.domain.table('consent').put('state', {
+  schemaVersion: 99,
+  memory: false,
+  inject: false,
+  profile: 'situational',
+  sensitive: true,
+  futureField: 'kept by the newer build',
+  updatedAt: Date.now() - 5000,
+});
+const futureConsentHost = makeHost(futureConsentStorage);
+apply(futureConsentHost.ctx, { autoIndexSessions: false, warmup: false });
+await tick();
+const futureConsent = await futureConsentHost.tools[0].execute({ action: 'consent' });
+equal(futureConsent.consent.memory, 'off', 'future row is read with the known fields');
+equal(futureConsent.consent.profile, 'situational', 'future row keeps a known profile value');
+const futureStored = [...futureConsentStorage.tables.get('consent').values()][0];
+equal(futureStored.schemaVersion, 99, 'future row is not blindly rewritten on read');
+await futureConsentHost.dispose();
 
 console.log(`host fixture: ${checks} checks passed`);

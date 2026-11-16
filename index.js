@@ -256,6 +256,26 @@ const normalizeConsent = (raw, base = CONSENT_DEFAULTS) => {
   return next;
 };
 
+// Version of the persisted consent record. v0 was written before this field existed:
+// it carried the same four switches, so reading it is a schema stamp, never a reset.
+const CONSENT_SCHEMA_VERSION = 1;
+/**
+ * Read a stored consent row and migrate it to the current schema. Values are always
+ * merged over `base`; unknown fields are ignored; a row from a *newer* build is read
+ * tolerantly with the fields this build knows (and is not rewritten blindly).
+ */
+const readConsentRow = (row, base = CONSENT_DEFAULTS) => {
+  const rawVersion = row && Number.isInteger(row.schemaVersion) && row.schemaVersion >= 0
+    ? row.schemaVersion
+    : 0;
+  return {
+    consent: { ...normalizeConsent(row, base), schemaVersion: CONSENT_SCHEMA_VERSION },
+    fromVersion: rawVersion,
+    migrationNeeded: rawVersion < CONSENT_SCHEMA_VERSION,
+    futureVersion: rawVersion > CONSENT_SCHEMA_VERSION,
+  };
+};
+
 const DOMAIN_SPEC = {
   name: 'dynamic_memory',
   version: 1,
@@ -375,14 +395,15 @@ const DOMAIN_SPEC = {
       },
     },
     // C1-C4 consent state. One row under "state"; a reload must never reopen what the
-    // user turned off, so this table is read before anything else is served.
+    // user turned off, so this table is read before anything else is served. schemaVersion
+    // lets v0 rows (written before the field existed) migrate on read instead of being lost.
     consent: {
       valueSchema: {
         parse(value) {
           if (value === null || typeof value !== 'object') throw new Error('dynamic-memory consent must be an object');
-          const next = normalizeConsent(value, CONSENT_DEFAULTS);
+          const { consent } = readConsentRow(value, CONSENT_DEFAULTS);
           return {
-            ...next,
+            ...consent,
             updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
           };
         },
@@ -1385,7 +1406,9 @@ async function start(ctx, config) {
   const consentTable = domain ? domain.table('consent') : undefined;
   // C1-C4 consent. Defaults stay compatible with existing installs, config.consent can
   // override them, and the persisted user choice (loaded below) wins on reload.
-  let consent = normalizeConsent(config.consent, CONSENT_DEFAULTS);
+  let consent = { ...normalizeConsent(config.consent, CONSENT_DEFAULTS), schemaVersion: CONSENT_SCHEMA_VERSION };
+  let consentMigratedFrom = null;
+  let consentFutureVersion = null;
   const rowsById = new Map();
   const rowsBySession = new Map();
   const portrait = new Map();
@@ -1491,7 +1514,11 @@ async function start(ctx, config) {
   }
   if (consentTable) {
     for (const [, row] of consentTable.entries()) {
-      if (row && typeof row === 'object') consent = normalizeConsent(row, consent);
+      if (!row || typeof row !== 'object') continue;
+      const read = readConsentRow(row, consent);
+      consent = read.consent;
+      if (read.migrationNeeded) consentMigratedFrom = read.fromVersion;
+      if (read.futureVersion) consentFutureVersion = read.fromVersion;
     }
   }
 
@@ -1500,11 +1527,21 @@ async function start(ctx, config) {
     await trackWrite(consentTable.put('state', { ...consent, updatedAt: Date.now() }))
       .catch(error => logger.warn(`dynamic-memory: cannot persist consent: ${String(error)}`));
   };
+  // Upgrade a v0 row in place so the next start needs no migration; never rewrite a
+  // row written by a newer build (unknown fields would be dropped).
+  if (consentMigratedFrom !== null) {
+    void persistConsent();
+    logger.info(`dynamic-memory: consent schema migrated v${consentMigratedFrom} -> v${CONSENT_SCHEMA_VERSION}`);
+  }
+  if (consentFutureVersion !== null) {
+    logger.warn(`dynamic-memory: consent row uses schema v${consentFutureVersion} (newer than v${CONSENT_SCHEMA_VERSION}); reading known fields only`);
+  }
   const consentStatus = () => ({
     memory: consent.memory ? 'on' : 'off',
     inject: consent.inject ? 'on' : 'off',
     profile: consent.profile,
     sensitive: consent.sensitive ? 'on' : 'off',
+    schemaVersion: consent.schemaVersion,
     storage: consentTable ? 'durable' : 'memory-only',
   });
   const consentUsage = '/dmem consent [status|on|off|profile unified|situational|off|sensitive on|off|inject on|off]';
@@ -1548,6 +1585,10 @@ async function start(ctx, config) {
     }
     return { consent: consentStatus(), changed };
   };
+  /** Explicit memory writes are refused while C1 is off. Reads and deletion stay allowed. */
+  const memoryWriteRefusal = action => ({
+    error: `memory consent is off: ${action} write is disabled. Re-enable with /dmem consent on first.`,
+  });
 
   const persistObservation = async row => {
     if (!observationsTable) return;
@@ -2711,6 +2752,8 @@ async function start(ctx, config) {
             };
           }
           if (action === 'observe') {
+            // C1: explicit writes are blocked while memory consent is off (reads stay allowed).
+            if (!consent.memory) return memoryWriteRefusal('observe');
             if (typeof args.corroborates === 'string' && args.corroborates) {
               const target = observations.get(args.corroborates);
               if (!target) return { error: 'Unknown observation id in corroborates.' };
@@ -2777,6 +2820,7 @@ async function start(ctx, config) {
             };
           }
           if (action === 'correct') {
+            if (!consent.memory) return memoryWriteRefusal('correct');
             const original = typeof args.id === 'string' ? observations.get(args.id) : undefined;
             if (!original) return { error: 'Unknown observation id.' };
             if (original.status !== 'current') return { error: 'Only current observations can be corrected.' };
@@ -3004,6 +3048,8 @@ async function start(ctx, config) {
             };
           }
           if (action === 'learn') {
+            // C1: no portrait writes while memory consent is off.
+            if (!consent.memory) return memoryWriteRefusal('learn');
             // C3: profile off disables portrait writes (and the prompt no longer injects them).
             if (consent.profile === 'off') return { error: 'profile consent is off: portrait writes are disabled. Re-enable with /dmem consent profile unified (or situational).' };
             const target = args.target === ASSISTANT_TARGET ? ASSISTANT_TARGET : USER_TARGET;
@@ -3036,6 +3082,7 @@ async function start(ctx, config) {
             };
           }
           if (action === 'deepen') {
+            if (!consent.memory) return memoryWriteRefusal('deepen');
             const row = typeof args.id === 'string' ? rowsById.get(args.id) : undefined;
             if (!row) return { error: 'Unknown exchange id. Read one with action=recent or action=search first.' };
             if (typeof args.summary !== 'string' || !args.summary.trim()) return { error: 'summary is required for action=deepen' };
