@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：2.5.0（`@local/dynamic-memory`）
+> 版本：2.5.2（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -102,7 +102,7 @@
   "kind": "episodic", "time": 1763000000000, "updatedAt": 1763000000000,
   "user": "用户原话（已清洗）", "assistant": "助手完整回复",
   "summary": "印象", "history": [{ "summary": "旧印象", "at": 1763000000000 }],
-  "keywords": ["..."], "entities": ["example.com", "dropdown.vue"],
+  "keywords": ["..."], "entities": ["example.com", "example-app"],
   "importance": 0.39, "accessCount": 2, "lastAccessAt": 1763000000000,
   "sourceIds": [], "supersededBy": null,
   "archivedAt": null, "archivedReason": null, "weight": 1 }
@@ -227,10 +227,9 @@ score = (bm25n + phrase + impression + entity + recency) × importance 乘子 ×
 ```
 full      hit@3 10/10  MRR 0.883  false-positive 0/8
 +entity   hit@3 10/10  MRR 0.883  false-positive 0/8
-bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 ```
 
-修复前（v1.10 仅按最大分归一化）：负样本 `false-positive 2/8`（`rust 所有权 生命周期`、`钢琴 和弦 练习` 被判 medium）。修复后同两条 coverage 分别 0.47 / 0.30，均降为 `low`。
+修复前（v1.10 仅按最大分归一化）：负样本 `false-positive 2/8`（两条共享常见二字组的查询被判 medium）。修复后同两条 coverage 分别 0.47 / 0.30，均降为 `low`。
 
 ## 6. 画像与证据层（对齐《人类复杂性模型》）
 
@@ -349,7 +348,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
 | `node test.mjs` | 52 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint。**不含 dsh-go 断言**（`grep dshGo test.mjs` 为 0） | ✅ 52/52 |
-| `node test-host.mjs` | 269 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截、**多智能体隔离**（owner 拒绝/注入为空、shared 兼容、显式 ownerAgentIds、agent 命名空间）、**dormant GC**）。**同样不含 dsh-go 断言** | ✅ 269/269 |
+| `node test-host.mjs` | 269 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截、**多智能体隔离**（owner 拒绝/注入为空、shared 兼容、显式 ownerAgentIds、agent 命名空间）、**dormant/GC**（清单未验证时零删除、身份无证明 fail-closed））。**同样不含 dsh-go 断言** | ✅ 269/269 |
 | `node ui/verify-client.mjs` | Web 面板静态契约（槽位、命令白名单、文案、效果上限） | ✅ 10/10 |
 | `node ui/verify-dshgo.mjs` | **dsh-go 的唯一校验来源**：静态检查 manifest/长度/id/placement/view 节点与深度/32KiB/效果上限/toggle→命令映射/locale 对齐，**解析视图树断言每个注册 action 可达**（删按钮会 FAIL），并 import 面板纯函数做断言 | ✅ 46 PASS + 1 INFO（无 kit/App，非端到端） |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ✅ 本机 9/10、MRR 0.750、FP 1/8 |
@@ -357,7 +356,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `node eval.mjs --fixture` | 合成数据（CI 可跑，5 正 / 2 负） | ✅ 5/5、FP 0/2 |
 | `node bench.mjs` | 12 条查询、5 轮预热的 cold/warm 延迟与 compact/full 体积 | ❌ 需要本机记忆库 |
 
-作者本机数据（约 2141 条索引记录、0 条明文）：v1.11.0 全文明文基线为正样本 `10/10, MRR 0.883`；v2.1 剥离原文并按评测标签迁移后为 `9/10, MRR 0.750`（未迁移标签时表观 `7/10, MRR 0.600`），`--min-coverage 0.6` 时误报 `0/8`。剩余 1 条真实损失是摘要截断导致的覆盖缺口（`部署 公网 首页 200`）。bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
+作者本机数据（约 2141 条索引记录、0 条明文）：v1.11.0 全文明文基线为正样本 `10/10, MRR 0.883`；v2.1 剥离原文并按评测标签迁移后为 `9/10, MRR 0.750`（未迁移标签时表观 `7/10, MRR 0.600`），`--min-coverage 0.6` 时误报 `0/8`。剩余 1 条真实损失是摘要截断导致的覆盖缺口（一个部署类查询）。**注意：真实集正样本 10 条、负样本 8 条，不是冻结测试集**，这些数字是本机回归基线。bench warm p50 ≈ 6.8ms、p95 ≈ 13.1ms，compact 3.4KB / full 12.6KB（约 27%）。
 
 **解读这些数字时请注意 K3**：10 条正样本仍小，权重（impression 0.05、phrase 3 等）是在同一批数据上调的；负样本也只有 8 条。`10/10` 是乐观上界，不是泛化结论。P3-1 会把评测集扩到 30+ 条并按 dev/test 划分。
 
@@ -450,7 +449,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 3. 置信度：`adjusted = blended × min(1, coverage / 0.6)`，并且 **coverage < 0.5 时一律 `low`**（不给 high/medium）。
 4. `phraseWeight=3 / entityWeight=0.9 / recency=0.4` 已在新增负样本的评测集上复核：正样本 10/10 MRR 0.883 不变，负样本误报 2/8 → 0/8。
 
-**验收结果**：小库单测 `aria2 断点续传` 的置信度显著高于 `量子计算最新进展`，后者不是 `high`；真实库负样本 `rust 所有权 生命周期`（coverage 0.47）与 `钢琴 和弦 练习`（coverage 0.30）均为 `low`；三种排序下置信度仍相同。
+**验收结果**：小库单测中，短语匹配类查询的置信度显著高于无关查询，后者不是 `high`；真实库两条负样本（共享常见二字组）coverage 0.47 / 0.30，均为 `low`；三种排序下置信度仍相同。
 
 ### P0-3 矛盾一致性（✅ v1.11）
 
@@ -662,7 +661,7 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 1. `config.ownerAgentIds`（数组或逗号串）——显式指定，`source=config:ownerAgentIds`；
 2. session header：`parentSession` / `origin=subagent` / `delegationDepth>0` → `delegate`，`source=session-header`；
 3. `agents.roots()` vs `list()`：roots 为 `owner`、其余为 `delegate`，`source=agents-roots`；
-4. 兜底：有 header → `owner`（`session-header`）；都没有 → `role=unknown`，**不读不写**，提示配置 `ownerAgentIds`。
+4. 以上都不能证明身份 → `role=unknown`，**不读不写**，提示配置 `ownerAgentIds`。**2.5.1 起去掉了"有 header 即 owner"的回退**，旧 Harness 无委派字段时同样 fail-closed。
 
 实测：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`。
 
@@ -676,20 +675,22 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 
 - `archive` / `restore` 只动 exchange；**画像仍 active**（会话还在，人还在）。
 - 会话被删除（不在 live agents，也不在 `sessionQuery.listSessions()`）→ 该 scope 画像标 `dormant=true`：**只标不删、不再注入**，`stats.dormantFacets` 与 `/dmem scope` 可见；owner 画像永不被标 dormant。
+- **2.5.1 起：只有清单已验证（`listSessions()` 成功返回数组）才会标 dormant**；清单缺失/报错/非数组时不标，只把未知 scope 记入 `unknownScopes`。
 - 新会话不会自动继承 dormant 画像（无跨会话身份关联，见 16.7）。
 
 ### 16.6 命令与实测
 
-- `/dmem scope`：模式/配置、身份（role + source + sessionId）、命名空间、读/写权、`ownerAgentIds`、dormant 列表与说明；工具 `action=scope` 等价。
+- `/dmem scope`：模式/配置、身份（role + source + sessionId）、命名空间、读/写权、`ownerAgentIds`、`inventory{verified,source,known,gcRequireInventory}`、`dormantReason`、`unknownScopes`、dormant 列表；工具 `action=scope` 等价。
 - `/dmem gc`：默认 dry-run（只列孤儿 scope 与 dormant facet 数，不删除）；`/dmem gc confirm=true` 只删 dormant 画像；owner 与活跃 agent 永不触碰；非 owner 级身份被拒绝。
-- 实测：`dormantFacets=0`；gc dry-run 无删除；测试 52 + 269。
+- **2.5.1 起：清单未验证时即使 `confirm=true` 也只报告**（`reason=unverified-inventory`，零删除）；`gcRequireInventory` 默认 true，设为 false 才回到"只看 live agents"的旧行为（有风险，不推荐）。
+- 实测：`dormantFacets=0`；inventory verified、gc dry-run 零删除；测试 52 + 269。
 
 ### 16.7 诚实限制
 
 1. **Harness 没有独立持久 agentId**：身份来自 session/agent id + header/registry，同一个人换会话无法自动认回。
 2. **删除会话后只能 dormant 标记**：没有"人已删除"的持久墓碑，新会话不继承旧画像；需人工 `/dmem gc confirm=true` 才真正清掉。
-3. **并发 `agents.roots()` / `listSessions()` 的时序未在真机验证**：极端窗口内可能把活跃 agent 误判为 dormant（只影响标记与注入，不删数据）。
-4. 版本 2.5.0 为测试版：npm 未推送、非 Latest。
+3. **并发 `agents.roots()` / `listSessions()` 的时序未在真机验证**：清单未验证时系统选择 fail-closed（不标 dormant、不删），因此可能"该清的没清"，但不会误删。
+4. 版本 2.5.2 为测试版：npm 未推送、非 Latest。
 
 ## 17. 变更记录
 
@@ -697,10 +698,12 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 
 | 版本 | 内容 |
 |---|---|
-| 2.5.0 | 多智能体记忆隔离：`memoryScope` owner（默认）/agent/shared；身份解析 `ownerAgentIds` > header > `agents.roots()/list()`，无法识别 fail-closed；记录与画像主键改 `scopeId`（owner / agent:<id>）；归档保留画像、删会话标 dormant（不注入、stats 可见）；`/dmem scope` + `/dmem gc`（dry-run 默认、confirm 只删 dormant、不碰 owner/活跃 agent）。实测 scope=owner、identity agents-roots、canRead/Write=true、dormantFacets=0、gc dry-run 无删除；测试 **52 + 269**。**未真机验证**并发 roots/list 时序；Harness 无持久 agentId（删除只能 dormant） |
-| 2.4.0 | dsh-go 原生记忆面板：`package.json` 加 `main: index.js` + `dshGo`（v1、`memory-settings`、`session.tab`/`features`/`chat.panel`、presentation page、title 中英、icon settings、`wants: []`、`minApp` 省略）；`index.js` 用 `ctx.inject(['dshGo'])` 注册只读快照 + 声明式 v2 视图，写路径只发 `/dmem consent|pause|resume|export`，五个按钮齐全（暂停/恢复/导出/复制/同意说明）；新增 `ui/verify-dshgo.mjs`（46 PASS + 1 INFO）作为 dsh-go 的唯一校验（test.mjs/test-host 仍为 52/170，不含 dsh-go 断言）。**未在真机 dsh-go 验证**（无 kit/App），见 §15.6 |
+| 2.5.2 | 文档漂移修正（docs-only，代码同 2.5.1）：统一测试数 52+269；2.4.0 状态改为测试版已发布；评测口径统一为本机实测 9/10、MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5，并标注"真实集样本少、非冻结测试集"；隐私清理（无真实域名/本机路径/真实查询原文） |
+| 2.5.1 | 隔离 GC 安全加固：`gcRequireInventory` 默认 true——只有 `listSessions()` 成功返回数组才算完整清单，缺失/报错/非数组不标 dormant、gc 即使 confirm=true 也只 dry-run（`reason=unverified-inventory`，零删除）；去掉"有 header 即 owner"回退，身份不可证明即 unknown、fail-closed；scope/stats 暴露 `inventory{verified,source,known,gcRequireInventory}`、`dormantReason`、`unknownScopes`；测试 52 + 269 |
+| 2.5.0 | 多智能体记忆隔离：`memoryScope` owner（默认）/agent/shared；身份解析 `ownerAgentIds` > header > `agents.roots()/list()`，无法识别 fail-closed；记录与画像主键改 `scopeId`（owner / agent:<id>）；归档保留画像、删会话标 dormant（不注入、stats 可见）；`/dmem scope` + `/dmem gc`（dry-run 默认、confirm 只删 dormant、不碰 owner/活跃 agent）。实测 scope=owner、identity agents-roots、canRead/Write=true、dormantFacets=0、gc dry-run 零删除；测试 52 + 269。**未真机验证**并发 roots/list 时序；Harness 无持久 agentId（删除只能 dormant） |
+| 2.4.0 | dsh-go 原生记忆面板：`package.json` 加 `main: index.js` + `dshGo`（v1、`memory-settings`、`session.tab`/`features`/`chat.panel`、presentation page、title 中英、icon settings、`wants: []`、`minApp` 省略）；`index.js` 用 `ctx.inject(['dshGo'])` 注册只读快照 + 声明式 v2 视图，写路径只发 `/dmem consent|pause|resume|export`，五个按钮齐全（暂停/恢复/导出/复制/同意说明）；新增 `ui/verify-dshgo.mjs`（46 PASS + 1 INFO）作为 dsh-go 的唯一校验（test.mjs/test-host 当时计数，当前基线 52+269；不含 dsh-go 断言）。**未在真机 dsh-go 验证**（无 kit/App），见 §15.6 |
 | 2.3.0 | Web/桌面记忆面板：`client.js` 挂在 `conversation.input.dock`（状态/搜索/画像/暂停恢复/C1–C4/导出，全部走 `/dmem`）；`package.json` 加 `exports["./client"]` 与 `dsh.client`；`ui/verify-client.mjs` 10 PASS；live client inspect 确认槽位占位 |
-| 2.2.1 | consent 加固：`memory=off` 拒绝显式写入（observe/learn/deepen/correct）；consent 行加 `schemaVersion=1` + v0 迁移；文档同步（测试 52+170、eval 9/10 MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5） |
+| 2.2.1 | consent 加固：`memory=off` 拒绝显式写入（observe/learn/deepen/correct）；consent 行加 `schemaVersion=1` + v0 迁移；文档同步（测试当时通过，当前基线 52+269；eval 9/10 MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5） |
 | 2.2.0 | C1-C4 同意开关 + `/dmem consent`（持久化、重载保留、真机验证）；`digestCount` 改真实注入快照；eval 标签迁移与 `--min-coverage` 门控（9/10、MRR 0.750、FP 0/8） |
 | 2.0.1 | 文档发布版：补齐 v2.0 多语言/开放预设章节、配置项（locale/facets/assistantFacets/capture）、测试数（51 + host 16）、路线状态；README.zh-CN 重写；CHANGELOG 更新 |
 | 2.0.0 | 运行时国际化（locale/messages 包，auto 按会话语言）、词表/短语/停用词数据化、语言中立分词回退、facet 可配置、README 英文主版本 + 中文翻译；测试 49 → 51 |
@@ -715,8 +718,10 @@ teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画�
 
 ### 17.2 本文档
 
+- 2.5.2：版本头 2.5.2；测试数统一 52+269；§16 补 2.5.1 清单验证语义（未验证清单不标 dormant、gc 零删除、无 header 回退）；§17.1 补 2.5.1/2.5.2 行；§17.2 记录本次文档修正；隐私清理（去掉真实域名/本机路径/真实查询原文，§5.1/第 9/12 章）；
+- 2.5.1：版本头 2.5.1；§16 补 `gcRequireInventory` 与 `inventory`/`dormantReason`/`unknownScopes` 字段；§12 测试数 269；
 - 2.5.0：版本头 2.5.0；第 9 章加 `scope`/`gc` 命令；第 10 章加 `memoryScope`/`ownerAgentIds`；第 12 章更新为 269 项并补隔离/dormant 测试；新增第 16 章「多智能体记忆隔离与 dormant 画像 GC」；变更记录顺延为第 17 章并补 2.5.0 行；
-- 2.4.0：版本头 2.4.0；第 1 章文件清单加 `client.js`/`ui/verify-*.mjs`/`test-host.mjs`；第 9 章补 consent/migrate/pause/resume；第 12 章更新为 52+170、面板静态校验与 v2.1 后评测数字（9/10、MRR 0.750、gate 0.6 时 FP 0/8）；新增第 15 章「面板与多端」；变更记录顺延为第 16 章并补 2.2.0–2.4.0；
+- 2.4.0：版本头 2.4.0；第 1 章文件清单加 `client.js`/`ui/verify-*.mjs`/`test-host.mjs`；第 9 章补 consent/migrate/pause/resume；第 12 章更新测试数（当前基线 52+269）、面板静态校验与 v2.1 后评测数字（9/10、MRR 0.750、gate 0.6 时 FP 0/8）；新增第 15 章「面板与多端」；变更记录顺延为第 16 章并补 2.2.0–2.4.0；
 - 1.12.3：版本头、第 14 章替换为合并版路线（发布渠道、技术原则、v1.12.3 → v1.14）、0.1 增加“记忆越丰富，认知越审慎”、文件清单与评测说明改为本地数据 + fixture、15 同步；
 - 1.12.2：版本头、2.3（facet 键名与显示标签的差异、助手喜好去重）、2.4（印证引文与复习锚点）、4.1/7（锚点）、6（psychology 需来源、评测草稿）、12（45 项、eval-drafts）、13.1（K12/K13）、14、15 同步；
 - 1.12.1：版本头、2.4（`lastCorroboratedAt`）、4.1（TTL 锚点与印证）、7（TTL 行）、12（43 项）、13.1（K9–K11）、14（P1-2 状态）、15 同步；

@@ -1,6 +1,14 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.5.0**（测试版：tag `v2.5.0` 已推送；**npm 未推送**——`private: true`、非 Latest；GitHub Release 页面状态本机未核实，不猜测）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.5.2**（测试版，tag 已推送；**npm 未推送**——`private: true`、非 Latest）。
+
+## 2.5.2（docs-only）— 文档漂移修正
+
+- 统一测试数为 **52 + 269**（README / DOCS / PLAN；历史条目只写"测试通过"，不再留旧计数）；
+- 修正版本状态：2.4.0 为**测试版、已发布**（与 tag `v2.4.0` 一致），不再是"未发布"；
+- 评测口径统一为本机实测：**9/10、MRR 0.750、`--min-coverage 0.6` 时 FP 0/8、fixture 5/5**，并标注"真实集样本少、非冻结测试集"；
+- 隐私清理：文档不再含真实域名、本机路径与真实评测查询原文；
+- **无运行时改动**，代码与 2.5.1 相同。
 
 ## 2.5.1 — 隔离 GC 安全加固
 
@@ -23,7 +31,7 @@
 - 评测（本机复跑，v2.5.0）：hit@3 **9/10**、MRR **0.750**（`--min-coverage 0.6` 时误报 **0/8**，无门控 1/8）；`--fixture` **5/5**。
 - **诚实限制**：① Harness **没有独立持久 agentId**——身份来自 session/agent id 与 header/registry，同一个人换会话无法自动认回；② 删除会话后**只能标 dormant**，没有"人已删除"的持久墓碑，新会话不会自动继承旧画像；③ **未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序（极短窗口内可能误判 dormant）；④ 2.5.0 为测试版，npm 未推送。
 
-## 2.4.0（未发布）— dsh-go 原生记忆面板
+## 2.4.0（测试版，已发布）— dsh-go 原生记忆面板
 
 **背景**：dsh-go 是 Flutter 原生界面，不执行 Web client 插件（v2.3.0 的 `client.js` 只在 Web/桌面可见），手机上看不到任何记忆入口。本次给同一包补一份 dsh-go 原生贡献。
 
@@ -36,10 +44,10 @@
 - **隐私边界**：不新增网络请求；不读剪贴板/输入框/消息（`wants: []`）；导出只写本地 `$DSH_HOME/storages/dynamic_memory/memory.md`。
 - **安装/生效**：清单改动自动重读；`index.js` 改动需在 App「引擎」页重启引擎。若桥接只扫 `$DSH_HOME/dsh-go/plugins/` 而没走 profile 依赖发现，需再用 `dsh plugin --profile web add <包目录>`（发现规则仍需真机确认）。
 - **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板：重装 2.3.0（Web）或移除 `dshGo` 清单（App 入口消失，数据不动）。
-- **自检**：`node ui/verify-dshgo.mjs` 静态 **46 PASS + 1 INFO**（manifest 字段/长度/id 语法/placement/view 节点与深度/≤32KiB/效果上限/四个 toggle→命令映射/中英 locale 对齐，并**解析视图树断言每个注册 action 可达**——删除按钮行会得到 8 FAIL，而不是假 PASS；**dsh-go 的唯一校验来源**），`node test.mjs` **52**、`node test-host.mjs` **170**（二者不含 dsh-go 断言，`grep dshGo test*.mjs` 为 0）。
+- **自检**：`node ui/verify-dshgo.mjs` 静态 **46 PASS + 1 INFO**（manifest 字段/长度/id 语法/placement/view 节点与深度/≤32KiB/效果上限/四个 toggle→命令映射/中英 locale 对齐，并**解析视图树断言每个注册 action 可达**——删除按钮行会得到 8 FAIL，而不是假 PASS；**dsh-go 的唯一校验来源**），`node test.mjs` 52、`node test-host.mjs`（当时计数；当前基线 52 + 269；二者不含 dsh-go 断言）。
 - **补丁**：`a1589e0 fix(go): render pause/resume buttons in the dsh-go memory panel` —— 补渲染暂停/恢复/同意说明按钮，并加固 `ui/verify-dshgo.mjs` 的 action 可达性检查。
 - **未验证（诚实边界）**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；以上仅为静态校验 + 单测。`dshGo.minApp` 留空：本机无 kit/template，App 版本格式无法验证（bridge 0.4.0 是桥接版本，不是 App 版本号）。spec §6 三个接口（同包双身份是否双加载、发现规则、`panel.scope.sessionId` 是否有值）仍需真机确认。
-- **范围外（不属 2.4.0 交付）**：多智能体记忆隔离（`memoryScope`）当时由 task-14 开发中，未合入 2.4.0——**已由 2.5.0 交付，见上**。
+- **范围外（不属 2.4.0 交付）**：多智能体记忆隔离（`memoryScope`）当时尚未合入 2.4.0——**已由 2.5.0 交付、2.5.1 加固，见上**。
 
 ## 2.3.0 — Web/桌面记忆面板（live slot 验证）
 
@@ -47,14 +55,14 @@
 - `package.json`：新增 `exports["./client"]`、`dsh.client`（platform web、immediately、inject 三个 client 服务）、`files` 增加 `client.js`。
 - 新增 `ui/verify-client.mjs`：10 项静态契约校验（PASS）。
 - 真机（Web client inspect）实测：槽位 `conversation.input.dock` 的 occupants 含 `id=dynamic-memory, order=30, active=true`。
-- 测试 52 + 170。
+- 测试通过（当时计数；当前基线 52 + 269）。
 
 ## 2.2.1 — consent 加固与文档同步
 
 - `memory=off` 现在拒绝显式写入（`observe`/`learn`/`deepen`/`correct` 返回明确原因）；读与删除不受影响。
 - consent 行增加 `schemaVersion=1` 与 v0 迁移；`stats`/`consent` 暴露 `schemaVersion`。
 - 真机验证：consent 持久化 `durable`、`schemaVersion 1`。
-- 文档同步到当时真实数字：测试 52+170、eval 9/10 MRR 0.750、`--min-coverage 0.6` 时 FP 0/8、fixture 5/5。
+- 文档同步到当时口径：测试通过、eval 9/10 MRR 0.750、`--min-coverage 0.6` 时 FP 0/8、fixture 5/5（当前基线 52 + 269）。
 
 ## 2.2.0 — 同意开关、digest 实测与评测加固
 
@@ -64,7 +72,7 @@
 - **命令与工具**：`/dmem consent` 看状态；`/dmem consent on|off`（C1）、`/dmem consent inject on|off`（C2）、`/dmem consent sensitive on|off`（C4）、`/dmem consent profile unified|situational|off`（C3）；工具 action 也可传 `consent={memory,inject,profile,sensitive}` 部分字段。
 - **digestCount 改真实快照**：`stats` 的 `digestCount` 取上一轮提示组装的实际注入结果（附 `digestTotal` / `digestReason`），不再硬编码；2.1.2 条目里的"真机待验证"由此收口。
 - **评测加固（真实集，本机亲手运行）**：迁移评测标签后 hit@3 **9/10**、MRR **0.750**（标签迁移前 7/10、0.600）；加 `--min-coverage 0.6` 后误报 **0/8**（无门控 1/8）；`--fixture` **5/5**（MRR 1.000、FP 0/2）。玩法：`node eval.mjs`、`node eval.mjs --min-coverage 0.6`、`node eval.mjs --fixture`。
-- **剩余 1 条真实损失**：`部署 公网 首页 200`——摘要截断（90+60 字符）使 `公网`/`首页` 未被保留，rank 47；属覆盖缺口，非打分问题（详见评测报告）。
+- **剩余 1 条真实损失**：一条部署类查询——摘要截断（90+60 字符）使关键 token 未被保留，rank 47；属覆盖缺口，非打分问题（详见评测报告）。
 - 测试（本机亲自运行，commit `d6f5b0c`）：`test.mjs` **52** 项、`test-host.mjs` **147** 项。
 - **明确未做（不写作已完成）**：① 面板 UI（阶段 4）；② 说话者归属（`speaker` 注册表 / exchange `origin` / 助手画像隔离，阶段 3.2）；③ situational 画像按情境分组（`profile=situational` 可选，但分组尚未实现）；④ 真机移动端未测；⑤ **memory off 时的显式写入硬拦截正在修**（当前 C1 关闭会停捕获/注入/后台索引，工具显式写入路径的拦截未完成）。
 
@@ -74,7 +82,7 @@
 
 - **存储**：新行只写 `summary` / `keywords` / `entities` / `time` / `textHash` / `pointer`（sessionId+时间）；`user` / `assistant` 为空串。`textHash` 是对"清洗后 user + `\n` + 最后一轮 assistant"的 SHA-256，只用于水合校验，不是加密，也不可还原内容。
 - **读取原文**：search 命中后按 pointer 读本地 Harness 会话，用 `textHash` → `summary` 前缀 → 单一时窗候选三级回退配对，返回片段（`full=true` 返回整段）。
-- **水合实测（真机抽检）**：20 条命中样本中 **19 条**成功回读（95%）；**1 条显式失败，不伪造片段**——会话 `session-be60e2ac…` 的该行（摘要以"p2继续，自动继续p3 p4…"开头）返回 `sourceAvailable:false`、`user`/`assistant` 为空、`hydrationError: no matching user message in session … (54 candidates)`；属 **no-match**，不是 ambiguous，也不是会话不可读。复跑：`search query="继续 修复 插件" limit=10` 第一条即该样本。
+- **水合实测（真机抽检）**：20 条命中样本中 **19 条**成功回读（95%）；**1 条显式失败，不伪造片段**——该行是重复"继续"类指令（原文略），会话内 54 个候选无法唯一定位，返回 `sourceAvailable:false`、`user`/`assistant` 为空、`hydrationError`（no-match）；不是 ambiguous，也不是会话不可读。
 - **失败语义（保持）**：任何未通过校验的命中一律置空并附 `hydrationError`（≤160 字符），哈希/摘要/时窗出现多候选时**拒绝猜测**；摘要、关键词、实体仍可参与检索与排序。
 - **迁移已可用**：工具 action `migrate mode=strip confirm=true` 与 `/dmem migrate mode=strip confirm=true` 共用 `migrateStrip`（先导出再剥离，缺 `confirm=true` 拒绝执行）；本机已用其剥离 **2120** 条旧记录原文，释放约 **2.9M** 字符。
 - **digest 注入**：代码已改为 summary-based 选取，host 测试断言 `digestCount ≥ 1` 通过；当时真机 `/dmem stats` 仍为 `digestCount=0`（重载后未复现），故当时标"测试通过，真机待验证"——**2.2.0 已改为真实快照，见上**。

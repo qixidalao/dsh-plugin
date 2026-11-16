@@ -17,7 +17,7 @@
 2. 用插件管理器把仓库路径作为 bundle 安装到当前 profile（`install_bundle`）；
 3. 重载后执行 `/dmem stats`，看到 `storage: durable` 即持久化生效；数据在 `$DSH_HOME/storages/dynamic_memory/`。
 
-发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。**2.5.0 为测试版**：tag `v2.5.0` 已推送；npm 未推送、非 Latest；GitHub Release 页面状态未核实。
+发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。**2.5.2 为测试版**（已打 tag 并推送；2.5.2 仅文档修正）；**npm 未推送**、非 Latest；未核实 GitHub Release 页面。
 许可证：AGPL-3.0-only（见 LICENSE）。记忆数据不进仓库；真实评测数据只在本机（gitignore）。
 
 ## 验证
@@ -49,7 +49,7 @@ node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 - 若只需要"偶尔翻历史"，官方 session search + `notes.md` 更省；本插件适合需要跨会话连续性、可纠正画像、证据链的场景。
 - `private` 观察在工具输出中默认打码，需 `includePrivate: true` 才显示原文。
 
-## v2.1 索引化捕获（已完成，未发布）
+## v2.1 索引化捕获（已完成）
 
 定位：**系统会话是原文唯一来源，插件只存本地派生索引**。不是加密产品，也不做云端同步。
 
@@ -65,19 +65,24 @@ node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 - `consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机验证：**`memory=on inject=on profile=unified sensitive=off, storage=durable`**。
 - `/dmem consent` 看状态；`/dmem consent on|off`（C1）、`inject on|off`（C2）、`sensitive on|off`（C4）、`profile unified|situational|off`（C3）；工具 action 可传 `consent={memory,inject,profile,sensitive}`。
 - C1 关闭时：不捕获、不注入、后台索引停；v2.2.1 起 `memory=off` 还会拒绝显式写入（`observe`/`learn`/`deepen`/`correct`），consent 行带 `schemaVersion=1`。
-- **仍未做**：说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、dsh-go 真机未测（仅静态校验）。多智能体记忆隔离已在 v2.5.0 交付（见下节）。
+- **仍未做**：说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、dsh-go 真机未测（仅静态校验）。多智能体记忆隔离已在 v2.5.0 交付、v2.5.1 加固（见下节）。
 
-## 多智能体记忆隔离（v2.5.0）
+## 多智能体记忆隔离（v2.5.0，v2.5.1 加固）
 
 teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的记忆不会串到另一个 agent。
 
 - **`memoryScope` 三档**：`owner`（默认，只有 root agent 用 owner 记忆，子 agent 注入空、写入被拒）、`agent`（每个 `agentId` 一个命名空间；root agent 仍可见升级前的旧行）、`shared`（旧行为，所有 agent 共用）。
-- **身份识别优先级**：`config.ownerAgentIds` > session header（`parentSession` / `origin=subagent` / `delegationDepth>0`）> `agents.roots()` vs `list()`；无法识别就 **fail-closed**（不读不写），并提示配置 `ownerAgentIds`。
+- **身份识别优先级**：`config.ownerAgentIds` > session header（`parentSession` / `origin=subagent` / `delegationDepth>0`）> `agents.roots()` vs `list()`；**无法证明身份就是 unknown，fail-closed**（不读不写）。2.5.1 起不再把"有 header"当作 owner 证明。
 - **画像主键是 `scopeId`**（`owner` 或 `agent:<agentId>`），不是 sessionId；每条 exchange/observation/portrait 带 scopeId，旧数据视为 owner。
 - **归档 ≠ 删除**：`archive` 只归档 exchange，画像仍 active；会话真被删除才把对应画像标 `dormant`（不再注入，`stats.dormantFacets` 与 `/dmem scope` 可见），owner 画像永不受影响。
-- **`/dmem scope`**：看模式、身份来源、命名空间、读写权、dormant 画像；**`/dmem gc`**：默认 dry-run 不删，`/dmem gc confirm=true` 只删 dormant 画像，不碰 owner 与活跃 agent。
-- **实测**：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`、`dormantFacets=0`；gc dry-run 无删除。
+- **`/dmem scope`**：看模式、身份来源、命名空间、读写权、清单是否已验证（inventory）、dormant 画像；**`/dmem gc`**：默认 dry-run 不删；**清单未验证时不标 dormant、不删除**（`reason=unverified-inventory`，即使 `confirm=true`）。
+- **实测**：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`、`dormantFacets=0`、inventory verified；gc dry-run 零删除。
 - **诚实限制**：Harness **没有独立持久 agentId**，同一个人换会话无法自动认回；删除会话后**只能 dormant 标记**（没有持久墓碑，新会话不继承旧画像）；**未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序。测试 52 + 269。
+
+## 隔离 GC 安全（v2.5.1）
+
+- `gcRequireInventory: true`（默认）：没有 listSessions 完整清单时，不把任何画像标 dormant，`/dmem gc` 只报告（`reason=unverified-inventory`），即使 `confirm=true` 也不删除；
+- 旧 Harness 缺委派字段且未配置 `ownerAgentIds` 时，身份为 unknown，读写与注入被拒，不会回退 owner。
 
 ## 面板：Web 与 dsh-go 手机 App
 
@@ -92,17 +97,13 @@ teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的
 - **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板 = 重装 2.3.0，或移除 `dshGo` 清单（App 入口消失、数据不动）。
 - **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测（当前 52/269）不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
 
-## 评测（真实集，本机；v2.5.0 复跑）
+## 评测（真实集，本机；v2.5.2 复跑）
 
 - `node eval.mjs`：hit@3 **9/10**、MRR **0.750**（评测标签迁移后；标签迁移前 7/10、0.600）；
 - `node eval.mjs --min-coverage 0.6`：误报 **0/8**（无门控 1/8）；
 - `node eval.mjs --fixture`：**5/5**（MRR 1.000）；
-- 剩余 1 条真实损失：`部署 公网 首页 200`——摘要截断（90+60 字符）丢掉 `公网`/`首页`，属覆盖缺口（详见评测报告）。
-
-## 隔离 GC 安全（v2.5.1）
-
-- `gcRequireInventory: true`（默认）：没有 listSessions 完整清单时，不把任何画像标 dormant，`/dmem gc` 只报告（`reason=unverified-inventory`），即使 `confirm=true` 也不删除；
-- 旧 Harness 缺委派字段且未配置 `ownerAgentIds` 时，身份为 unknown，读写与注入被拒，不会回退 owner。
+- 剩余 1 条真实损失：一条部署类查询——摘要截断（90+60 字符）丢掉关键 token，属覆盖缺口（详见评测报告）。
+- **口径限制**：真实集正样本只有 10 条、负样本 8 条，**不是冻结测试集**；数字用于回归对比，不是泛化结论。
 
 ## 已知限制
 
@@ -110,3 +111,4 @@ teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的
 - 身份连续性只是证据，不是认证。
 - `reflect` 草稿需要 ≥3 个不同会话；稀疏数据不会产出。
 - 中文已完整验证；英文/其他语言为功能性支持，仍需母语润色。
+- 评测样本少（10 正 / 8 负）且非冻结测试集：9/10、MRR 0.750 只代表本机回归基线。
