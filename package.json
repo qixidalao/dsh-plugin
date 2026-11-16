@@ -1,6 +1,6 @@
 {
   "name": "@local/dynamic-memory",
-  "version": "2.5.5",
+  "version": "2.5.6",
   "private": true,
   "type": "module",
   "main": "index.js",

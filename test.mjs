@@ -39,7 +39,7 @@ const row = (overrides) => ({
 });
 
 check('entities: host, dotted name, path, acronym', () => {
-  const found = entitiesOf('部署到 https://example.com 后，用 Dropdown.vue 重建，路径 C:\\Users\\demo\\app，涉及 AIOS 与 WSL');
+  const found = entitiesOf('部署到 https://example.com 后，用 ExampleComponent.vue 重建，路径 C:\\Users\\demo\\app，涉及 AIOS 与 WSL');
   assert.ok(found.includes('example.com'), 'host');
   assert.ok(found.includes('dropdown.vue'), 'dotted');
   assert.ok(found.includes('aios'), 'acronym');
@@ -136,7 +136,7 @@ check('reasons: phrase and entity matches are reported', () => {
 });
 
 check('entities: quoted names are extracted', () => {
-  const found = entitiesOf('把「记忆插件」接进《部署文档》，顺带看 “Dropdown.vue”');
+  const found = entitiesOf('把「记忆插件」接进《部署文档》，顺带看 “ExampleComponent.vue”');
   assert.ok(found.includes('记忆插件'), found.join(','));
   assert.ok(found.includes('部署文档'), found.join(','));
 });
@@ -150,9 +150,9 @@ check('snippet: prefers sentence boundaries', () => {
 
 check('confidence: a dominant hit beats a crowded field', () => {
   const strong = row({ id: 's1', assistant: 'example.com 部署完成，公网返回 200' });
-  const noise = ['a', 'b', 'c'].map(id => row({ id, assistant: 'cloud 部署 公网 200 的其它记录 alpha' }));
+  const noise = ['a', 'b', 'c'].map(id => row({ id, assistant: 'cloud 示例 部署 状态 的其它记录 alpha' }));
   const strongResult = rankExchanges([strong, ...noise], { query: 'example.com 公网 200', limit: 5 });
-  const crowdedResult = rankExchanges(noise.map((entry, index) => row({ id: `n${index}`, assistant: 'cloud 部署 公网 200 alpha' })), { query: 'cloud 部署 公网 200', limit: 5 });
+  const crowdedResult = rankExchanges(noise.map((entry, index) => row({ id: `n${index}`, assistant: 'cloud 示例 部署 状态 alpha' })), { query: 'cloud 示例 部署 状态', limit: 5 });
   assert.ok(strongResult.confidence.separation >= crowdedResult.confidence.separation, `${strongResult.confidence.separation} vs ${crowdedResult.confidence.separation}`);
 });
 
@@ -204,7 +204,7 @@ check('rank: archived rows are hidden by default and down-weighted when included
 check('injection: long gap shows a time boundary and suppresses the digest', () => {
   const now = Date.parse('2030-01-01T00:00:00Z');
   const gap = { lastActivityAt: Date.parse('2025-06-01T00:00:00Z'), gapDays: 1675 };
-  const digestRow = row({ id: 'd1', summary: '部署 公网', user: '部署到哪', time: Date.parse('2025-06-01T00:00:00Z') });
+  const digestRow = row({ id: 'd1', summary: '示例 部署', user: '部署到哪', time: Date.parse('2025-06-01T00:00:00Z') });
   const text = renderContext({
     portraitRows: new Map(),
     portraitChars: 240,
