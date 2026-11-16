@@ -17,14 +17,14 @@ This is a Cordis **bundle plugin** for DeepSeek Harness, not a standalone app.
 2. Install the repository path as a bundle into your Harness profile (plugin manager `install_bundle`).
 3. Reload, then run `/dmem stats`; `storage: durable` confirms persistence. Data lives in `$DSH_HOME/storages/dynamic_memory/`.
 
-Release channels: Preview (`main` + tags) → installable bundle → Stable (npm later; `package.json` is currently `private: true`). **Not released**: no Release, not Latest, npm not pushed.
+Release channels: Preview (`main` + tags) → installable bundle → Stable (npm later; `package.json` is currently `private: true`). **2.5.0 is a test version**: tag `v2.5.0` is pushed; npm not pushed, not Latest; the GitHub Release page was not verified here.
 License: AGPL-3.0-only (see [LICENSE](./LICENSE)). Memory data is never stored in the repo; real evaluation data is local-only and gitignored.
 
 ## Verify
 
 ```bash
 node test.mjs            # 52 pure-function checks
-node test-host.mjs       # 170 lifecycle checks against an in-memory mock host
+node test-host.mjs       # 236 lifecycle checks against an in-memory mock host
 node eval.mjs --fixture   # synthetic evaluation (no personal data)
 node eval.mjs             # real-store evaluation (reads the local store)
 node ui/verify-client.mjs  # Web panel static contract (10 PASS)
@@ -40,7 +40,7 @@ node ui/verify-dshgo.mjs   # dsh-go panel static checks (46 PASS + 1 INFO)
 
 ## Configuration highlights
 
-`locale` (`auto` by default: detect from the latest user message; set `en`/`zh` to force), `consent` (`memory` / `inject` / `profile` / `sensitive`), `facets`, `assistantFacets`, `capture`, `mention` defaults are derived from scope/type/sensitivity, `ttlTransientDays` / `ttlSituationalDays`, `inferenceHalfLifeDays`, `portraitBudget`, `observationBudget`.
+`locale` (`auto` by default: detect from the latest user message; set `en`/`zh` to force), `consent` (`memory` / `inject` / `profile` / `sensitive`), `memoryScope` (`owner` default / `agent` / `shared`), `ownerAgentIds` (explicit owner sessions), `facets`, `assistantFacets`, `capture`, `mention` defaults are derived from scope/type/sensitivity, `ttlTransientDays` / `ttlSituationalDays`, `inferenceHalfLifeDays`, `portraitBudget`, `observationBudget`.
 
 ## v2.1 Index-only capture (done, unreleased)
 
@@ -58,7 +58,19 @@ Positioning: **Harness sessions are the only source of plaintext; the plugin sto
 - `consent.memory / inject / profile / sensitive` persist in the storage `consent` table and survive reloads; verified on a real machine: **`memory=on inject=on profile=unified sensitive=off, storage=durable`**.
 - `/dmem consent` prints status; `/dmem consent on|off` (C1), `inject on|off` (C2), `sensitive on|off` (C4), `profile unified|situational|off` (C3); the tool action also accepts `consent={memory,inject,profile,sensitive}`.
 - C1 off: no capture, no injection, background indexing stops; since v2.2.1 `memory=off` also rejects explicit writes (`observe`/`learn`/`deepen`/`correct`), and the consent row carries `schemaVersion=1`.
-- **Still not done**: speaker attribution (`speaker`/`origin` isolation), situational portrait grouping, no real dsh-go device test (static checks only), and multi-agent memory isolation (`memoryScope`, in progress under task-14 — **not part of 2.4.0**).
+- **Still not done**: speaker attribution (`speaker`/`origin` isolation), situational portrait grouping, no real dsh-go device test (static checks only). Multi-agent memory isolation shipped in v2.5.0 (next section).
+
+## Multi-agent memory isolation (v2.5.0)
+
+Teammates/subagents **cannot read or write** owner memory by default; one agent's memory never leaks into another's.
+
+- **`memoryScope`**: `owner` (default; only root agents use owner memory, delegated agents inject nothing and their writes are refused), `agent` (each `agentId` gets its own namespace; root agents still see pre-upgrade rows), `shared` (legacy profile-wide behaviour).
+- **Identity resolution priority**: `config.ownerAgentIds` > session header (`parentSession` / `origin=subagent` / `delegationDepth>0`) > `agents.roots()` vs `list()`. Unresolvable identity **fails closed** (no read, no write) and tells you to set `ownerAgentIds`.
+- **Portrait primary key is `scopeId`** (`owner` or `agent:<agentId>`), never a session id; every exchange/observation/portrait carries it (old rows count as owner).
+- **Archive ≠ delete**: `archive` only archives exchanges, the portrait stays active; only a deleted session marks its portraits `dormant` (never injected; visible via `stats.dormantFacets` and `/dmem scope`), and owner portraits are never touched.
+- **`/dmem scope`** shows mode, identity source, namespace, read/write rights and dormant portraits; **`/dmem gc`** is dry-run by default, and `/dmem gc confirm=true` deletes only dormant portraits, never owner or live agents.
+- **Verified**: `scope=owner`, `identity source=agents-roots`, `canRead/canWrite=true`, `dormantFacets=0`; gc dry-run deleted nothing.
+- **Honest limits**: Harness has **no independent persistent agentId** (same human in a new session cannot be re-identified); a deleted session can only be marked dormant (**no persistent tombstone**; new sessions do not inherit old portraits); concurrent `agents.roots()` / `listSessions()` timing was **not verified on a real machine**. Tests 52 + 236.
 
 ## Panels: Web and dsh-go app
 
@@ -71,9 +83,9 @@ Positioning: **Harness sessions are the only source of plaintext; the plugin sto
 - **Write path**: toggles only emit `/dmem consent …` — memory → `/dmem consent on|off`, inject → `/dmem consent inject on|off`, sensitive → `/dmem consent sensitive on|off`, profile cycles `unified → situational → off`; nothing writes storage directly, so the app, tool and Web panel share one persistence path. **No new network requests**; no clipboard/input reads (`wants: []`).
 - **Install/activate**: manifest changes are re-read automatically; `index.js` changes need an engine restart from the app's "Engine" page. If the bridge only scans `$DSH_HOME/dsh-go/plugins/`, an extra `dsh plugin --profile web add <pkg dir>` is required (discovery rule **unconfirmed**).
 - **Uninstall/rollback**: `dsh plugin --profile web remove @local/dynamic-memory`, then delete the package directory; memory data under `$DSH_HOME/storages/dynamic_memory/` is untouched. Panel rollback = reinstall 2.3.0, or drop the `dshGo` manifest (entry disappears, data stays).
-- **Not tested on device**: this machine has **no dsh-go device and no kit `check.mjs`**, so rendering, taps and state-after-reload were **not tested in the app** — the only dsh-go check is `node ui/verify-dshgo.mjs` static 46 PASS + 1 INFO (the sole dsh-go verification, including rendered-action reachability), and tests 52/170 contain **no dsh-go assertions** (`grep dshGo test*.mjs` = 0). The three interfaces (dual identity, discovery rule, `scope.sessionId`) remain unconfirmed.
+- **Not tested on device**: this machine has **no dsh-go device and no kit `check.mjs`**, so rendering, taps and state-after-reload were **not tested in the app** — the only dsh-go check is `node ui/verify-dshgo.mjs` static 46 PASS + 1 INFO (the sole dsh-go verification, including rendered-action reachability), and tests (currently 52/236) contain **no dsh-go assertions** (`grep dshGo test*.mjs` = 0). The three interfaces (dual identity, discovery rule, `scope.sessionId`) remain unconfirmed.
 
-## Evaluation (real store, local; re-run at v2.4.0)
+## Evaluation (real store, local; re-run at v2.5.0)
 
 - `node eval.mjs`: hit@3 **9/10**, MRR **0.750** (after eval-label migration; 7/10, 0.600 before labels were migrated);
 - `node eval.mjs --min-coverage 0.6`: false positives **0/8** (1/8 without the gate);

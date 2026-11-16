@@ -17,14 +17,14 @@
 2. 用插件管理器把仓库路径作为 bundle 安装到当前 profile（`install_bundle`）；
 3. 重载后执行 `/dmem stats`，看到 `storage: durable` 即持久化生效；数据在 `$DSH_HOME/storages/dynamic_memory/`。
 
-发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。**当前未发布**：无 Release、非 Latest、npm 未推送。
+发布渠道：Preview（`main` + tag）→ 可安装 bundle → Stable（npm 待定；当前 `private: true`）。**2.5.0 为测试版**：tag `v2.5.0` 已推送；npm 未推送、非 Latest；GitHub Release 页面状态未核实。
 许可证：AGPL-3.0-only（见 LICENSE）。记忆数据不进仓库；真实评测数据只在本机（gitignore）。
 
 ## 验证
 
 ```bash
 node test.mjs            # 52 项纯函数测试
-node test-host.mjs       # 170 项生命周期（内存 mock host）
+node test-host.mjs       # 269 项生命周期（内存 mock host）
 node eval.mjs --fixture   # 合成评测（不需要真实数据）
 node eval.mjs             # 真实集评测（读本机存储）
 node ui/verify-client.mjs  # Web 面板静态契约（10 PASS）
@@ -40,7 +40,7 @@ node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 
 ## 主要配置
 
-`locale`（默认 auto，按会话语言；可强制 en/zh）、`consent`（`memory` / `inject` / `profile` / `sensitive`）、`facets`、`assistantFacets`、`capture`、`ttlTransientDays` / `ttlSituationalDays`、`inferenceHalfLifeDays`、`portraitBudget`、`observationBudget`。披露（mention）默认值由 scope/type/sensitivity 派生。
+`locale`（默认 auto，按会话语言；可强制 en/zh）、`consent`（`memory` / `inject` / `profile` / `sensitive`）、`memoryScope`（`owner` 默认 / `agent` / `shared`）、`ownerAgentIds`（显式指定 owner 会话）、`facets`、`assistantFacets`、`capture`、`ttlTransientDays` / `ttlSituationalDays`、`inferenceHalfLifeDays`、`portraitBudget`、`observationBudget`。披露（mention）默认值由 scope/type/sensitivity 派生。
 
 ## 成本与适用场景（v2.0.3）
 
@@ -65,7 +65,19 @@ node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 - `consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机验证：**`memory=on inject=on profile=unified sensitive=off, storage=durable`**。
 - `/dmem consent` 看状态；`/dmem consent on|off`（C1）、`inject on|off`（C2）、`sensitive on|off`（C4）、`profile unified|situational|off`（C3）；工具 action 可传 `consent={memory,inject,profile,sensitive}`。
 - C1 关闭时：不捕获、不注入、后台索引停；v2.2.1 起 `memory=off` 还会拒绝显式写入（`observe`/`learn`/`deepen`/`correct`），consent 行带 `schemaVersion=1`。
-- **仍未做**：说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、dsh-go 真机未测（仅静态校验）、多智能体记忆隔离 `memoryScope`（task-14 开发中，**不在 2.4.0 范围**）。
+- **仍未做**：说话者归属（`speaker`/`origin` 隔离）、situational 画像分组、dsh-go 真机未测（仅静态校验）。多智能体记忆隔离已在 v2.5.0 交付（见下节）。
+
+## 多智能体记忆隔离（v2.5.0）
+
+teammate/subagent 默认**读不到也写不进**用户记忆；一个 agent 的记忆不会串到另一个 agent。
+
+- **`memoryScope` 三档**：`owner`（默认，只有 root agent 用 owner 记忆，子 agent 注入空、写入被拒）、`agent`（每个 `agentId` 一个命名空间；root agent 仍可见升级前的旧行）、`shared`（旧行为，所有 agent 共用）。
+- **身份识别优先级**：`config.ownerAgentIds` > session header（`parentSession` / `origin=subagent` / `delegationDepth>0`）> `agents.roots()` vs `list()`；无法识别就 **fail-closed**（不读不写），并提示配置 `ownerAgentIds`。
+- **画像主键是 `scopeId`**（`owner` 或 `agent:<agentId>`），不是 sessionId；每条 exchange/observation/portrait 带 scopeId，旧数据视为 owner。
+- **归档 ≠ 删除**：`archive` 只归档 exchange，画像仍 active；会话真被删除才把对应画像标 `dormant`（不再注入，`stats.dormantFacets` 与 `/dmem scope` 可见），owner 画像永不受影响。
+- **`/dmem scope`**：看模式、身份来源、命名空间、读写权、dormant 画像；**`/dmem gc`**：默认 dry-run 不删，`/dmem gc confirm=true` 只删 dormant 画像，不碰 owner 与活跃 agent。
+- **实测**：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`、`dormantFacets=0`；gc dry-run 无删除。
+- **诚实限制**：Harness **没有独立持久 agentId**，同一个人换会话无法自动认回；删除会话后**只能 dormant 标记**（没有持久墓碑，新会话不继承旧画像）；**未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序。测试 52 + 236。
 
 ## 面板：Web 与 dsh-go 手机 App
 
@@ -78,9 +90,9 @@ node ui/verify-dshgo.mjs   # dsh-go 面板静态校验（46 PASS + 1 INFO）
 - **写路径**：toggle 只发 `/dmem consent …`——memory → `/dmem consent on|off`，inject → `/dmem consent inject on|off`，sensitive → `/dmem consent sensitive on|off`，profile 按 `unified → situational → off` 循环；不直接写 storage，与工具/Web 面板共用同一持久化。**不新增网络请求**，不读剪贴板/输入框（`wants: []`）。
 - **安装/生效**：清单改动自动重读；`index.js` 改动需在 App「引擎」页重启引擎。若桥接只扫 `$DSH_HOME/dsh-go/plugins/`，还需 `dsh plugin --profile web add <包目录>`（发现规则**未确认**）。
 - **卸载/回滚**：`dsh plugin --profile web remove @local/dynamic-memory` 后删包目录；记忆数据在 `$DSH_HOME/storages/dynamic_memory/`，不受影响。回滚面板 = 重装 2.3.0，或移除 `dshGo` 清单（App 入口消失、数据不动）。
-- **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测 52/170 不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
+- **未实测**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；dsh-go 仅有 `node ui/verify-dshgo.mjs` 静态 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**，含视图树 action 可达性断言），单测（当前 52/236）不含 dsh-go 断言。同包双身份、发现规则、`scope.sessionId` 三个接口待真机确认。
 
-## 评测（真实集，本机；v2.4.0 复跑）
+## 评测（真实集，本机；v2.5.0 复跑）
 
 - `node eval.mjs`：hit@3 **9/10**、MRR **0.750**（评测标签迁移后；标签迁移前 7/10、0.600）；
 - `node eval.mjs --min-coverage 0.6`：误报 **0/8**（无门控 1/8）；

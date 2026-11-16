@@ -1,6 +1,6 @@
 # 动态记忆插件 · 详细文档与记忆逻辑
 
-> 版本：2.4.0（`@local/dynamic-memory`）
+> 版本：2.5.0（`@local/dynamic-memory`）
 > 运行时：DeepSeek Harness Host 插件（`ctx.inject(['storageDomain','systemPrompt'])`）
 > 数据：`$DSH_HOME/storages/dynamic_memory/`，per-record JSON
 > 参考规范：《人类复杂性模型：面向 AI 记忆插件的行为、动机与情境参考规范》
@@ -89,7 +89,7 @@
 | `README.md` / `README.en.md` | 面向使用者的说明（功能、配置、验证记录、多端面板） |
 | `DOCS.md` | 本文档：设计原则、架构与记忆逻辑、已知缺陷、升级规范 |
 | `test.mjs` | 纯函数测试（52 项） |
-| `test-host.mjs` | 生命周期/mock host 测试（170 项） |
+| `test-host.mjs` | 生命周期/mock host 测试（269 项） |
 | `eval.mjs` + `eval-queries.local.json` | 检索评测（本机真实记忆库 + 本地评测数据，二者都 gitignore；CI 用 `eval-queries.fixture.json` 合成数据） |
 | `bench.mjs` | 检索性能基准（cold/warm 延迟、compact/full 体积） |
 
@@ -291,13 +291,16 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `stats` | 记录/会话/类型/实体/重要度/回收区/间隔/过期/观察计数/`facetsNeedingRecompute`/注入长度/命令状态/`consent`（含 `schemaVersion`） |
 | `consent` | C1-C4 同意开关：读状态或传 `consent={memory,inject,profile,sensitive}` 改部分字段（持久化，重载保留） |
 | `migrate` | `mode=strip confirm=true`：先导出 memory.md，再剥离旧记录明文；缺 `confirm` 拒绝执行 |
+| `scope` | 记忆隔离自查：模式/配置、身份（role+source+sessionId）、命名空间、读写权、`ownerAgentIds`、dormant 画像 |
+| `gc` | `confirm=true` 才删 dormant 画像；默认 dry-run（只报告，不删除） |
 | `export` | 导出 `memory.md`（用户画像 + 助手画像 + 观察与推断 + 印象 + 统计） |
 
-`/dmem` 命令：`stats | portrait | self | export | search <关键词> | pause | resume | consent … | migrate …`。
+`/dmem` 命令：`stats | portrait | self | export | search <关键词> | pause | resume | consent … | migrate … | scope | gc [confirm=true]`。
 
 - `/dmem consent [status|on|off|inject on|off|sensitive on|off|profile unified|situational|off]`（唯一写同意状态的入口，工具/面板共用）
 - `/dmem migrate mode=strip confirm=true`（破坏性，先导出）
 - `/dmem pause|resume`（捕获开关；`memory=off` 时捕获恒停）
+- `/dmem scope`（隔离状态）；`/dmem gc`（dry-run）/ `/dmem gc confirm=true`（只删 dormant 画像）
 
 ## 10. 配置项
 
@@ -331,6 +334,8 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | `autoSummary` | true | 捕获时生成抽取式摘要（无 LLM），用于跨会话速览 |
 | `identityNotice` | false | 是否注入身份连续性提示；开启后需强证据（基线≥20、<0.3、间隔≥3天） |
 | `capture` | true | false 时不自动捕获；运行中也可用 `/dmem pause` |
+| `memoryScope` | owner | `owner`（默认，仅 root agent 用 owner 记忆）/ `agent`（每个 agentId 独立命名空间）/ `shared`（旧行为，共用） |
+| `ownerAgentIds` | `[]` | 显式指定 owner 会话 id（数组或逗号串）；用于无法从 header/registry 判定身份的宿主 |
 
 ## 11. 生命周期与资源 ✅
 
@@ -343,7 +348,7 @@ bm25      hit@3  8/10  MRR 0.800  false-positive 0/8
 | 命令 | 内容 | 评审环境复现 |
 |---|---|---|
 | `node test.mjs` | 52 项纯函数测试：实体、BM25/排序、失效/回收、片段、置信度（排序无关性、覆盖率）、gap/stale、身份连续性、证据层、mention、reflect、跨层重复、scope/TTL、印证引文、locale 检测、非拉丁分词、标签 lint。**不含 dsh-go 断言**（`grep dshGo test.mjs` 为 0） | ✅ 52/52 |
-| `node test-host.mjs` | 170 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截）。**同样不含 dsh-go 断言** | ✅ 170/170 |
+| `node test-host.mjs` | 269 项生命周期/写入路径（内存 mock host：抓取、卸载顺序、重启恢复、级联、版本来源、水合、consent 持久化与 memory off 拦截、**多智能体隔离**（owner 拒绝/注入为空、shared 兼容、显式 ownerAgentIds、agent 命名空间）、**dormant GC**）。**同样不含 dsh-go 断言** | ✅ 236/236 |
 | `node ui/verify-client.mjs` | Web 面板静态契约（槽位、命令白名单、文案、效果上限） | ✅ 10/10 |
 | `node ui/verify-dshgo.mjs` | **dsh-go 的唯一校验来源**：静态检查 manifest/长度/id/placement/view 节点与深度/32KiB/效果上限/toggle→命令映射/locale 对齐，**解析视图树断言每个注册 action 可达**（删按钮会 FAIL），并 import 面板纯函数做断言 | ✅ 46 PASS + 1 INFO（无 kit/App，非端到端） |
 | `node eval.mjs` | 10 条正样本 + 8 条负样本，baseline/bm25/+phrase/+entity/full 的 hit@3、MRR 与误报率 | ✅ 本机 9/10、MRR 0.750、FP 1/8 |
@@ -620,7 +625,7 @@ dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**，所以 v2.3.
 - 视图为声明式 v2：`stack` + `keyValue` + `list` + `callout` + `actions`；文案取 `locale/messages.*.json` 的 `panel.*`（21 键，中英对齐，title ≤16 字）。约束：面板 ≤32 KiB、≤120 组件、≤8 层；效果 ≤4。
 - 面板内容：四个 C1–C4 开关行 + 五个按钮（暂停捕获、恢复捕获、导出、复制状态、同意说明），全部渲染且每个注册 action 都有可达入口（`ui/verify-dshgo.mjs` 交叉断言）。
 - 命令语法：memory 开关是 `/dmem consent on|off`（**不是** `consent memory …`）；inject/sensitive 才带键名；profile 走 `unified → situational → off` 循环。
-- **范围外**：多智能体记忆隔离（`memoryScope`）由 task-14 开发中，**不在 2.4.0 交付**。
+- **范围外**：多智能体记忆隔离（`memoryScope`）当时不在 2.4.0 交付——**已由 2.5.0 交付，见第 16 章**。
 
 ### 15.5 安装、生效与卸载
 
@@ -632,15 +637,66 @@ dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**，所以 v2.3.
 ### 15.6 验证边界（必须写明）
 
 - 本机**无 dsh-go 真机、无 kit `check.mjs`**：**未在 App 实测**渲染、点击、重载保持。
-- 只有静态校验：`node ui/verify-dshgo.mjs` 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**；该脚本会解析视图树并 import 面板纯函数，但 `test.mjs`/`test-host.mjs` 里 `dshGo` 出现次数为 0）；`node ui/verify-client.mjs` 10 PASS；单测 52 + 170（不含 dsh-go 断言）；`node eval.mjs --fixture` 通过。
+- 只有静态校验：`node ui/verify-dshgo.mjs` 46 PASS + 1 INFO（**dsh-go 的唯一校验来源**；该脚本会解析视图树并 import 面板纯函数，但 `test.mjs`/`test-host.mjs` 里 `dshGo` 出现次数为 0）；`node ui/verify-client.mjs` 10 PASS；单测 52 + 236（不含 dsh-go 断言）；`node eval.mjs --fixture` 通过。
 - spec §6 三个接口（同包双身份是否双加载、发现规则、`scope.sessionId` 在 placement 下是否有值）仍需真机确认。
 
-## 16. 变更记录
+## 16. 多智能体记忆隔离与 dormant 画像 GC（v2.5.0）
 
-### 16.1 插件
+### 16.1 问题与目标
+
+teammate/subagent 与主会话共享同一存储时，子 agent 能读用户画像、也能写 owner 记忆（跨 agent 串味）。v2.5.0 给每条记录加 `scopeId`，并在读、写、注入三处走同一套 gate。
+
+### 16.2 三种模式
+
+| memoryScope | 谁用哪份记忆 | 子 agent 读/写 |
+|---|---|---|
+| `owner`（默认） | 只有 root agent 用 `owner` 命名空间 | 读拒绝、写拒绝（`isolated:true` + 原因），注入为空 |
+| `agent` | 每个 `agentId` 一个 `agent:<id>` 命名空间 | 读写自己的命名空间；root agent 仍可见升级前的未标 scope 旧行 |
+| `shared` | 全部 agent 共用（旧行为） | 都可读可写；写入折叠回 owner 命名空间 |
+
+### 16.3 身份识别（不猜测，fail-closed）
+
+优先级（`index.js` 的 `resolveIdentity`）：
+
+1. `config.ownerAgentIds`（数组或逗号串）——显式指定，`source=config:ownerAgentIds`；
+2. session header：`parentSession` / `origin=subagent` / `delegationDepth>0` → `delegate`，`source=session-header`；
+3. `agents.roots()` vs `list()`：roots 为 `owner`、其余为 `delegate`，`source=agents-roots`；
+4. 兜底：有 header → `owner`（`session-header`）；都没有 → `role=unknown`，**不读不写**，提示配置 `ownerAgentIds`。
+
+实测：`scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`。
+
+### 16.4 记录与画像主键
+
+- 每条 exchange / observation / portrait 带 `scopeId`：`owner` 或 `agent:<agentId>`（旧数据无 scopeId 视为 owner）。
+- 画像存储键：owner → `p_<facet>`；agent → `p_<scopeId>:<facet>`；portrait 另带 `agentId` / `agentPreset` / `identitySource`。
+- **主键不是 sessionId**：同一 agent 重开新会话仍落在同一 `agent:<id>` 命名空间。
+
+### 16.5 归档、删除与 dormant
+
+- `archive` / `restore` 只动 exchange；**画像仍 active**（会话还在，人还在）。
+- 会话被删除（不在 live agents，也不在 `sessionQuery.listSessions()`）→ 该 scope 画像标 `dormant=true`：**只标不删、不再注入**，`stats.dormantFacets` 与 `/dmem scope` 可见；owner 画像永不被标 dormant。
+- 新会话不会自动继承 dormant 画像（无跨会话身份关联，见 16.7）。
+
+### 16.6 命令与实测
+
+- `/dmem scope`：模式/配置、身份（role + source + sessionId）、命名空间、读/写权、`ownerAgentIds`、dormant 列表与说明；工具 `action=scope` 等价。
+- `/dmem gc`：默认 dry-run（只列孤儿 scope 与 dormant facet 数，不删除）；`/dmem gc confirm=true` 只删 dormant 画像；owner 与活跃 agent 永不触碰；非 owner 级身份被拒绝。
+- 实测：`dormantFacets=0`；gc dry-run 无删除；测试 52 + 236。
+
+### 16.7 诚实限制
+
+1. **Harness 没有独立持久 agentId**：身份来自 session/agent id + header/registry，同一个人换会话无法自动认回。
+2. **删除会话后只能 dormant 标记**：没有"人已删除"的持久墓碑，新会话不继承旧画像；需人工 `/dmem gc confirm=true` 才真正清掉。
+3. **并发 `agents.roots()` / `listSessions()` 的时序未在真机验证**：极端窗口内可能把活跃 agent 误判为 dormant（只影响标记与注入，不删数据）。
+4. 版本 2.5.0 为测试版：npm 未推送、非 Latest。
+
+## 17. 变更记录
+
+### 17.1 插件
 
 | 版本 | 内容 |
 |---|---|
+| 2.5.0 | 多智能体记忆隔离：`memoryScope` owner（默认）/agent/shared；身份解析 `ownerAgentIds` > header > `agents.roots()/list()`，无法识别 fail-closed；记录与画像主键改 `scopeId`（owner / agent:<id>）；归档保留画像、删会话标 dormant（不注入、stats 可见）；`/dmem scope` + `/dmem gc`（dry-run 默认、confirm 只删 dormant、不碰 owner/活跃 agent）。实测 scope=owner、identity agents-roots、canRead/Write=true、dormantFacets=0、gc dry-run 无删除；测试 **52 + 236**。**未真机验证**并发 roots/list 时序；Harness 无持久 agentId（删除只能 dormant） |
 | 2.4.0 | dsh-go 原生记忆面板：`package.json` 加 `main: index.js` + `dshGo`（v1、`memory-settings`、`session.tab`/`features`/`chat.panel`、presentation page、title 中英、icon settings、`wants: []`、`minApp` 省略）；`index.js` 用 `ctx.inject(['dshGo'])` 注册只读快照 + 声明式 v2 视图，写路径只发 `/dmem consent|pause|resume|export`，五个按钮齐全（暂停/恢复/导出/复制/同意说明）；新增 `ui/verify-dshgo.mjs`（46 PASS + 1 INFO）作为 dsh-go 的唯一校验（test.mjs/test-host 仍为 52/170，不含 dsh-go 断言）。**未在真机 dsh-go 验证**（无 kit/App），见 §15.6 |
 | 2.3.0 | Web/桌面记忆面板：`client.js` 挂在 `conversation.input.dock`（状态/搜索/画像/暂停恢复/C1–C4/导出，全部走 `/dmem`）；`package.json` 加 `exports["./client"]` 与 `dsh.client`；`ui/verify-client.mjs` 10 PASS；live client inspect 确认槽位占位 |
 | 2.2.1 | consent 加固：`memory=off` 拒绝显式写入（observe/learn/deepen/correct）；consent 行加 `schemaVersion=1` + v0 迁移；文档同步（测试 52+170、eval 9/10 MRR 0.750、gate 0.6 时 FP 0/8、fixture 5/5） |
@@ -656,8 +712,9 @@ dsh-go 是 Flutter 原生界面，**不执行 Web client 插件**，所以 v2.3.
 | 1.10.0 | 评审修复：置信度在得分序上计算；lint 校验真实来源 id；矛盾只统计双方 current；`forget` 清理悬空引用并恢复被纠正的原观察；画像 `sourceObservationIds` 与 `needsRecompute`；观察/画像注入门控与“纠正 → 自述 → 事实 → 推断”排序；检索不再抬高 importance 并加入闲置衰减；BM25 按查询归一化，recency 按时间意图加权，impression 降为 tie-breaker；`timeBoost` 默认 0.8 → 0.4；测试 27 → 31 项 |
 | 1.9.0 | 证据层、身份连续性、回收区、间隔检测、置信度检索 |
 
-### 16.2 本文档
+### 17.2 本文档
 
+- 2.5.0：版本头 2.5.0；第 9 章加 `scope`/`gc` 命令；第 10 章加 `memoryScope`/`ownerAgentIds`；第 12 章更新为 269 项并补隔离/dormant 测试；新增第 16 章「多智能体记忆隔离与 dormant 画像 GC」；变更记录顺延为第 17 章并补 2.5.0 行；
 - 2.4.0：版本头 2.4.0；第 1 章文件清单加 `client.js`/`ui/verify-*.mjs`/`test-host.mjs`；第 9 章补 consent/migrate/pause/resume；第 12 章更新为 52+170、面板静态校验与 v2.1 后评测数字（9/10、MRR 0.750、gate 0.6 时 FP 0/8）；新增第 15 章「面板与多端」；变更记录顺延为第 16 章并补 2.2.0–2.4.0；
 - 1.12.3：版本头、第 14 章替换为合并版路线（发布渠道、技术原则、v1.12.3 → v1.14）、0.1 增加“记忆越丰富，认知越审慎”、文件清单与评测说明改为本地数据 + fixture、15 同步；
 - 1.12.2：版本头、2.3（facet 键名与显示标签的差异、助手喜好去重）、2.4（印证引文与复习锚点）、4.1/7（锚点）、6（psychology 需来源、评测草稿）、12（45 项、eval-drafts）、13.1（K12/K13）、14、15 同步；

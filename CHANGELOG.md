@@ -1,6 +1,20 @@
 # 变更记录
 
-版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.4.0**；**未发布**——无 Release、非 Latest、npm 未推送（`private: true`）。
+版本语义：`1.x.y`，`x` 增加能力，`y` 修复。`package.json` 当前为 **2.5.0**（测试版：tag `v2.5.0` 已推送；**npm 未推送**——`private: true`、非 Latest；GitHub Release 页面状态本机未核实，不猜测）。
+
+## 2.5.0 — 多智能体记忆隔离与 dormant 画像 GC
+
+**背景**：teammate/subagent 与主会话原先共享同一份记忆库，子 agent 能读到用户画像、也能写入 owner 记忆。2.5.0 引入显式命名空间：owner（用户）默认隔离，子 agent 注入为空、写入被拒。
+
+- **`memoryScope` 三档**：`owner`（默认）——只有顶层（root）agent 使用 owner 记忆，subagent/teammate 读不到也写不进（返回 `isolated:true` 与原因）；`agent`——每个 `agentId` 一个命名空间（root agent 仍可见升级前的未标 scope 旧行）；`shared`——保持旧行为，所有 agent 共用一份（兼容旧安装）。
+- **身份识别（不猜测，fail-closed）**：优先级 `config.ownerAgentIds`（数组或逗号串，显式指定）> session header（`parentSession` / `origin=subagent` / `delegationDepth>0` 判为 delegated）> `agents.roots()` vs `list()`（roots 为 owner，其余为非 root delegate）。仍无法识别 → `role=unknown`，**不读不写**，并提示配置 `ownerAgentIds`。实测 `scope=owner`、`identity source=agents-roots`、`canRead/canWrite=true`、`dormantFacets=0`。
+- **画像主键改用 scopeId**：`owner` 或 `agent:<agentId>`，**不是 sessionId**；每条 exchange/observation/portrait 都带 `scopeId`（旧数据无 scopeId 视为 owner）。存储键：owner 用 `p_<facet>`，agent 用 `p_<scopeId>:<facet>`；portrait 额外带 `agentId` / `agentPreset`。
+- **归档 vs 删除**：`archive` / `restore` 只动 exchange，**画像保持 active**；只有会话被删除（不在 live agents，也不在 session 列表）才把该 scope 的画像标 `dormant`——只标记、不删除、不再注入，`stats.dormantFacets` 与 `/dmem scope` 可见；owner 画像永不被标 dormant。
+- **`/dmem scope`**：输出模式（含 configured）、当前身份（role + source + sessionId）、命名空间、读/写权限、显式 `ownerAgentIds`、dormant 画像与说明；工具 `action=scope` 等价。
+- **`/dmem gc`**：默认 **dry-run**（只列孤儿 scope 与 dormant facet 数，不删任何东西）；`/dmem gc confirm=true`（工具 `action=gc` + `confirm=true`）**只删 dormant 画像**，不碰 owner、不碰活跃 agent；非 owner 级身份会被拒绝。实测 dry-run 无删除。
+- 测试：`test.mjs` **52**、`test-host.mjs` **236**（新增 owner 模式拒绝/注入为空、重载持久化、shared 兼容、显式 ownerAgentIds、agent 模式命名空间、归档保持 active、删除→dormant→不注入、gc dry-run/confirm、owner 不受影响）。
+- 评测（本机复跑，v2.5.0）：hit@3 **9/10**、MRR **0.750**（`--min-coverage 0.6` 时误报 **0/8**，无门控 1/8）；`--fixture` **5/5**。
+- **诚实限制**：① Harness **没有独立持久 agentId**——身份来自 session/agent id 与 header/registry，同一个人换会话无法自动认回；② 删除会话后**只能标 dormant**，没有"人已删除"的持久墓碑，新会话不会自动继承旧画像；③ **未在真机验证**并发 `agents.roots()` / `listSessions()` 的时序（极短窗口内可能误判 dormant）；④ 2.5.0 为测试版，npm 未推送。
 
 ## 2.4.0（未发布）— dsh-go 原生记忆面板
 
@@ -18,7 +32,7 @@
 - **自检**：`node ui/verify-dshgo.mjs` 静态 **46 PASS + 1 INFO**（manifest 字段/长度/id 语法/placement/view 节点与深度/≤32KiB/效果上限/四个 toggle→命令映射/中英 locale 对齐，并**解析视图树断言每个注册 action 可达**——删除按钮行会得到 8 FAIL，而不是假 PASS；**dsh-go 的唯一校验来源**），`node test.mjs` **52**、`node test-host.mjs` **170**（二者不含 dsh-go 断言，`grep dshGo test*.mjs` 为 0）。
 - **补丁**：`a1589e0 fix(go): render pause/resume buttons in the dsh-go memory panel` —— 补渲染暂停/恢复/同意说明按钮，并加固 `ui/verify-dshgo.mjs` 的 action 可达性检查。
 - **未验证（诚实边界）**：本机**无 dsh-go 真机、无 kit `check.mjs`**，**未在 App 实测**渲染、点击与重载保持；以上仅为静态校验 + 单测。`dshGo.minApp` 留空：本机无 kit/template，App 版本格式无法验证（bridge 0.4.0 是桥接版本，不是 App 版本号）。spec §6 三个接口（同包双身份是否双加载、发现规则、`panel.scope.sessionId` 是否有值）仍需真机确认。
-- **范围外（不属 2.4.0 交付）**：多智能体记忆隔离（`memoryScope`）由 task-14 开发中，未合入本版本。
+- **范围外（不属 2.4.0 交付）**：多智能体记忆隔离（`memoryScope`）当时由 task-14 开发中，未合入 2.4.0——**已由 2.5.0 交付，见上**。
 
 ## 2.3.0 — Web/桌面记忆面板（live slot 验证）
 

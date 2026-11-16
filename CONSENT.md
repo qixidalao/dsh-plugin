@@ -1,7 +1,7 @@
 # 记忆与画像的同意模型（CONSENT）
 
 > 目的：把"用户是否允许跨会话记忆 / 是否允许画像 / 是否允许敏感推断"变成显式、可撤回的同意，而不是默认全开。
-> 状态：**已实现（C1-C4 基础版，v2.2.0 真机验证）**。`consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机 `/dmem stats` 验证为 `memory=on inject=on profile=unified sensitive=off, storage=durable`。**未做**：面板 UI（§3 为设计稿）、说话者归属、situational 画像分组、真机移动端未测、memory off 时的显式写入硬拦截（正在修）。
+> 状态：**已实现（C1-C4 基础版，v2.2.0 真机验证）**。`consent.memory / inject / profile / sensitive` 持久化在 storage 的 `consent` 表，重载后保留；真机 `/dmem stats` 验证为 `memory=on inject=on profile=unified sensitive=off, storage=durable`。v2.2.1 起 `memory=off` 拒绝显式写入；v2.3/v2.4 面板（Web / dsh-go）可切换；v2.5.0 增加多智能体隔离（§7）。**未做**：`/dmem forget-session`、说话者归属、situational 画像分组、dsh-go 真机未测。
 
 ## 1. 必须单独同意的五件事
 
@@ -66,7 +66,14 @@
 
 工具 action 等价写法：`consent={memory, inject, profile, sensitive}`（可只传要改的字段）。状态写入 storage 的 `consent` 表，重载后保留。
 
-仍未实现：面板 UI；`/dmem forget-session`；说话者归属（`speaker`/`origin`）；situational 画像分组；memory off 时对工具显式写入的硬拦截（正在修）。
+仍未实现：`/dmem forget-session`；说话者归属（`speaker`/`origin`）；situational 画像分组；dsh-go 真机验证。（面板已可用：Web v2.3 / dsh-go v2.4；`memory=off` 的显式写入拦截 v2.2.1 已修。）
+
+## 7. 隔离与同意（v2.5.0）
+
+- 同意开关是**安装级（owner 命名空间）**状态；`memoryScope=owner`（默认）下 teammate/subagent 默认**读不到也写不进** owner 记忆，注入为空——它们不是"各自再同意"，而是根本拿不到。
+- 身份无法识别时 **fail-closed**（不读不写）；用 `/dmem scope` 查看 role/source/读写权，需要显式隔离的宿主配置 `ownerAgentIds`。
+- 删除会话只把对应画像标 `dormant`（不注入、stats 可见）；`/dmem gc confirm=true` 才真正删除 dormant 画像，**owner 画像永不被删**。
+- C1–C4 与隔离互不替代：隔离防跨 agent 串味，C1–C4 决定"记不记 / 注不注 / 画像 / 敏感"。
 
 ## 6. 验收
 
